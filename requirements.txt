@@ -1,0 +1,15 @@
+pre-commit
+black
+openai
+httpx
+pydantic
+pandas
+orjson
+networkx
+tqdm
+backoff
+python-dotenv
+pdfminer.six
+bs4
+readability-lxml
+tiktoken

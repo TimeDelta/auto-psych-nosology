@@ -1,0 +1,582 @@
+"""
+pip install openai httpx pydantic pandas orjson networkx tqdm backoff python-dotenv
+export OPENAI_API_KEY=sk-...
+python kg_pipeline.py --query '('RDoC' OR 'HiTOP' OR DSM OR psychopathology)' --max-pages 3 --model gpt-4.1-mini
+
+Notes:
+- Stays within OA abstracts via OpenAlex; respect ToS if you add full-text sources.
+- “Relation types” are flexible; start with: supports, contradicts, predicts, co_occurs, treats, biomarker_for, measure_of.
+- You can later feed the produced edge list(s) into SBM/HSBM, HDBSCAN, Louvain, etc.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import itertools
+import json
+import math
+import os
+import pathlib
+import re
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
+
+import backoff
+import httpx
+import networkx as nx
+import orjson
+import pandas as pd
+from bs4 import BeautifulSoup
+from pdfminer.high_level import extract_text as pdf_extract_text
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from readability import Document
+from tqdm import tqdm
+
+from chunking import chunk
+
+OPENALEX_ENDPOINT = "https://api.openalex.org/works"
+DEFAULT_FILTER = (
+    "from_publication_date:2010-01-01,primary_location.is_oa:true,language:en"
+)
+DATA_DIR = pathlib.Path("data")
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+
+NODE_TYPES = {
+    "Symptom",
+    "Diagnosis",
+    "RDoC_Construct",
+    "HiTOP_Component",
+    "Biomarker",
+    "Treatment",
+    "Task",
+    "Measure",
+}
+
+REL_TYPES = {
+    "supports",
+    "contradicts",
+    "predicts",
+    "co_occurs",
+    "treats",
+    "biomarker_for",
+    "measure_of",
+}
+
+try:
+    from openai import OpenAI
+
+    _OPENAI_AVAILABLE = True
+except Exception:
+    raise RuntimeError("openai>=1.0 not installed")
+
+
+def get_openai_client() -> OpenAI:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Set OPENAI_API_KEY")
+    return OpenAI()
+
+
+class NodeRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    canonical_name: str = Field(
+        ..., description="Primary name for the entity as used in the paper."
+    )
+    node_type: str = Field(..., description=f"One of {sorted(list(NODE_TYPES))}")
+    synonyms: List[str] = Field(default_factory=list)
+    # TODO: automate concept normalization
+    normalizations: Dict[str, str] = Field(
+        default_factory=dict, description='i.e. {"UMLS":"C0005586"}'
+    )
+
+
+class RelationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    subject: str = Field(..., description="Canonical name of subject node")
+    predicate: str = Field(..., description=f"One of {sorted(list(REL_TYPES))}")
+    obj: str = Field(..., alias="object", description="Canonical name of object node")
+    directionality: str = Field(default="directed", description="directed|undirected")
+    evidence_span: str = Field(
+        default="", description="Short quote from text supporting this"
+    )
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    qualifiers: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PaperExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    paper_id: str
+    doi: Optional[str] = None
+    title: str
+    year: Optional[int] = None
+    venue: Optional[str] = None
+    nodes: List[NodeRecord]
+    relations: List[RelationRecord]
+
+
+def extraction_json_schema() -> Dict[str, Any]:
+    # doesn't need input because Pydantic BaseModel class has a classmethod .model_json_schema()
+    # that generates a full JSON Schema describing its fields and nested models
+    return PaperExtraction.model_json_schema()
+
+
+EXTRACTION_SYSTEM_PROMPT = f"""You are an expert biomedical information extraction agent.
+Extract a compact, non-redundant set of domain entities (nodes) and typed relations (edges) from the provided FULL TEXT CHUNK.
+- Use canonical, human-readable names for nodes.
+- Node types: {sorted(list(NODE_TYPES))}
+- Predicates: {sorted(list(REL_TYPES))}
+- Provide brief evidence_span (short quote) for each relation if possible.
+- Do NOT invent facts; prefer 'supports' unless clear causal language exists.
+- If RDoC/HiTOP mapping is explicit, include it in 'normalizations'. Return ONLY JSON per schema.
+"""
+
+MERGE_SYSTEM_PROMPT = """You are consolidating chunk-level extractions for a single paper.
+Merge nodes and relations:
+- Deduplicate nodes by canonical_name (merge synonyms/normalizations).
+- Deduplicate relations by (subject, predicate, object); keep the highest confidence and concatenate distinct evidence_spans (up to 2 short snippets).
+Return JSON ONLY per schema.
+"""
+
+
+def uninvert_openalex_abstract(inv: Dict[str, List[int]]) -> str:
+    if not inv:
+        return ""
+    pos2tok = {}
+    for tok, idxs in inv.items():
+        for i in idxs:
+            pos2tok[i] = tok
+    return " ".join(pos2tok[i] for i in range(min(pos2tok), max(pos2tok) + 1))
+
+
+def fetch_openalex_page(
+    query: str, filters: str, cursor: str = "*", per_page: int = 50
+) -> Dict[str, Any]:
+    r = httpx.get(
+        OPENALEX_ENDPOINT,
+        params={
+            "search": query,
+            "filter": filters,
+            "per_page": per_page,
+            "cursor": cursor,
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def iter_openalex_results(query: str, filters: str, max_pages: int = 3):
+    cursor = "*"
+    for _ in range(max_pages):
+        page = fetch_openalex_page(query, filters, cursor)
+        for w in page.get("results", []):
+            abstract = uninvert_openalex_abstract(
+                w.get("abstract_inverted_index") or {}
+            )
+            yield {
+                "id": w.get("id"),
+                "doi": w.get("doi"),
+                "title": w.get("title"),
+                "year": w.get("publication_year"),
+                "venue": (w.get("host_venue") or {}).get("display_name"),
+                "abstract": abstract,
+                "best_oa_location": (w.get("best_oa_location") or {}),
+                "open_access": (w.get("open_access") or {}),
+                "primary_location": (w.get("primary_location") or {}),
+            }
+        cursor = page.get("meta", {}).get("next_cursor")
+        if not cursor:
+            break
+
+
+PMC_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+
+def try_pmc_fulltext(pmcid: str) -> Optional[str]:
+    params = {"db": "pmc", "id": pmcid, "retmode": "xml"}
+    r = httpx.get(PMC_EUTILS, params=params, timeout=60)
+    if r.status_code != 200 or not r.text:
+        return None
+    soup = BeautifulSoup(r.text, "lxml-xml")
+    parts = []
+    for tag in soup.find_all(["abstract", "p", "sec", "title"]):
+        txt = tag.get_text(separator=" ", strip=True)
+        if txt:
+            parts.append(txt)
+    return "\n\n".join(parts) if parts else None
+
+
+def extract_text_from_pdf_bytes(content: bytes) -> Optional[str]:
+    try:
+        text = pdf_extract_text(BytesIO(content))
+        text = re.sub(r"\s+\n", "\n", text)
+        return text.strip()
+    except Exception:
+        return None
+
+
+def extract_text_from_html_bytes(content: bytes, base_url: str = "") -> Optional[str]:
+    try:
+        html = content.decode("utf-8", errors="ignore")
+        doc = Document(html)
+        main_html = doc.summary(html_partial=True)
+        soup = BeautifulSoup(main_html, "lxml")
+        # remove scripts/styles
+        for bad in soup(["script", "style", "noscript"]):
+            bad.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+        return re.sub(r"\s+", " ", text).strip()
+    except Exception:
+        return None
+
+
+def resolve_text_and_download(rec: Dict[str, Any]) -> Optional[str]:
+    """Return full text string if available, else None."""
+    # try PMCID if present in any id-like field
+    joined = json.dumps(rec, ensure_ascii=False)
+    pmcid = re.search(r"PMCID[:\s]*PMC(\d+)", joined, flags=re.I)
+    if pmcid:
+        txt = try_pmc_fulltext("PMC" + pmcid.group(1))
+        if txt and len(txt) > 1000:
+            return txt
+
+    loc = rec.get("best_oa_location") or {}
+    pdf_url = loc.get("url_for_pdf")
+    html_url = loc.get("url")
+
+    if pdf_url:
+        try:
+            resp = httpx.get(pdf_url, timeout=90, follow_redirects=True)
+            if resp.status_code == 200 and (
+                "pdf" in resp.headers.get("content-type", "").lower()
+                or pdf_url.lower().endswith(".pdf")
+            ):
+                txt = extract_text_from_pdf_bytes(resp.content)
+                if txt and len(txt) > 1000:
+                    return txt
+        except Exception:
+            pass
+
+    if html_url:
+        try:
+            resp = httpx.get(html_url, timeout=90, follow_redirects=True)
+            if resp.status_code == 200 and (
+                "html" in resp.headers.get("content-type", "").lower()
+            ):
+                txt = extract_text_from_html_bytes(resp.content, html_url)
+                if txt and len(txt) > 1000:
+                    return txt
+        except Exception:
+            pass
+
+    prim = rec.get("primary_location") or {}
+    for key in ("pdf_url", "landing_page_url", "source_url", "url"):
+        url = prim.get(key)
+        if not url:
+            continue
+        try:
+            resp = httpx.get(url, timeout=90, follow_redirects=True)
+            ctype = resp.headers.get("content-type", "").lower()
+            if "pdf" in ctype or url.lower().endswith(".pdf"):
+                txt = extract_text_from_pdf_bytes(resp.content)
+                if txt and len(txt) > 1000:
+                    return txt
+            if "html" in ctype:
+                txt = extract_text_from_html_bytes(resp.content, url)
+                if txt and len(txt) > 1000:
+                    return txt
+        except Exception:
+            continue
+
+    return None  # full text not found
+
+
+def build_user_prompt_chunk(meta: Dict[str, Any], chunk_text: str) -> str:
+    return f"""Paper metadata:
+- openalex_id: {meta.get('id')}
+- title: {meta.get('title')}
+- doi: {meta.get('doi')}
+- year: {meta.get('year')}
+- venue: {meta.get('venue')}
+
+Full-text chunk:
+{chunk_text}
+"""
+
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=5, jitter=None)
+def llm_extract_chunk(
+    client: OpenAI, model: str, meta: Dict[str, Any], chunk: str
+) -> Optional[PaperExtraction]:
+    schema = extraction_json_schema()
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt_chunk(meta, chunk)},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "paper_extraction",
+                "schema": schema,
+                "strict": True,
+            },
+        },
+        max_output_tokens=2000,
+    )
+    try:
+        text = resp.output_text
+    except Exception:
+        parts = []
+        for item in getattr(resp, "output", []) or []:
+            if item.get("type") == "output_text":
+                parts.append(item.get("content", ""))
+        text = "".join(parts)
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+        return PaperExtraction.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError):
+        return None
+
+
+def merge_extractions(
+    client: OpenAI, model: str, meta: Dict[str, Any], chunks: List[PaperExtraction]
+) -> Optional[PaperExtraction]:
+    """Use an LLM reduce step to dedupe/merge, then validate."""
+    schema = extraction_json_schema()
+    chunk_payloads = [json.loads(c.model_dump_json()) for c in chunks]
+    merge_user = f"""Combine these chunk-level extractions for ONE paper into a single, deduplicated result (JSON list below).
+Paper metadata:
+- openalex_id: {meta.get('id')}
+- title: {meta.get('title')}
+- doi: {meta.get('doi')}
+- year: {meta.get('year')}
+- venue: {meta.get('venue')}
+
+Chunk-extractions (JSON list):
+{json.dumps(chunk_payloads, ensure_ascii=False)[:180000]}
+"""
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": MERGE_SYSTEM_PROMPT},
+            {"role": "user", "content": merge_user},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "paper_extraction",
+                "schema": schema,
+                "strict": True,
+            },
+        },
+        max_output_tokens=4000,
+    )
+    try:
+        text = resp.output_text  # type: ignore[attr-defined]
+    except Exception:
+        parts = []
+        for item in getattr(resp, "output", []) or []:
+            if item.get("type") == "output_text":
+                parts.append(item.get("content", ""))
+        text = "".join(parts)
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+        return PaperExtraction.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError):
+        return None
+
+
+@dataclass
+class PaperLite:
+    openalex_id: str
+    doi: Optional[str]
+    title: str
+    year: Optional[int]
+    venue: Optional[str]
+
+
+def normalize_name(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip())
+
+
+def accum_extractions(
+    extractions: List[PaperExtraction],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    node_rows, rel_rows, paper_rows = [], [], []
+    for extraction in extractions:
+        paper_rows.append(
+            {
+                "paper_id": extraction.paper_id,
+                "doi": extraction.doi,
+                "title": extraction.title,
+                "year": extraction.year,
+                "venue": extraction.venue,
+            }
+        )
+        for n in extraction.nodes:
+            node_rows.append(
+                {
+                    "paper_id": extraction.paper_id,
+                    "canonical_name": normalize_name(n.canonical_name),
+                    "node_type": n.node_type,
+                    "synonyms": json.dumps(n.synonyms, ensure_ascii=False),
+                    "normalizations": json.dumps(n.normalizations, ensure_ascii=False),
+                }
+            )
+        for r in extraction.relations:
+            rel_rows.append(
+                {
+                    "paper_id": extraction.paper_id,
+                    "subject": normalize_name(r.subject),
+                    "predicate": r.predicate,
+                    "object": normalize_name(r.obj),
+                    "directionality": r.directionality,
+                    "evidence_span": r.evidence_span,
+                    "confidence": r.confidence,
+                    "qualifiers": json.dumps(r.qualifiers, ensure_ascii=False),
+                }
+            )
+    nodes_df = pd.DataFrame(node_rows).drop_duplicates()
+    rels_df = pd.DataFrame(rel_rows).drop_duplicates()
+    papers_df = pd.DataFrame(paper_rows).drop_duplicates()
+    return nodes_df, rels_df, papers_df
+
+
+def build_multilayer_graph(
+    nodes_df: pd.DataFrame, rels_df: pd.DataFrame
+) -> nx.MultiDiGraph:
+    graph = nx.MultiDiGraph()
+    node_types = (
+        nodes_df.groupby(["canonical_name", "node_type"])
+        .size()
+        .reset_index(name="n")
+        .sort_values(["canonical_name", "n"], ascending=[True, False])
+    )
+    canonical_to_type = (
+        node_types.drop_duplicates("canonical_name")
+        .set_index("canonical_name")["node_type"]
+        .to_dict()
+    )
+    for name, ntype in canonical_to_type.items():
+        graph.add_node(name, node_type=ntype, synonyms=[], normalizations={})
+    for _, row in nodes_df.iterrows():
+        name = row["canonical_name"]
+        graph.nodes[name]["synonyms"] = sorted(
+            set(graph.nodes[name]["synonyms"]) | set(json.loads(row["synonyms"]))
+        )
+        graph.nodes[name]["normalizations"] = {
+            **graph.nodes[name]["normalizations"],
+            **json.loads(row["normalizations"]),
+        }
+    for _, row in rels_df.iterrows():
+        s, p, o = row["subject"], row["predicate"], row["object"]
+        if s not in graph or o not in graph:
+            continue
+        graph.add_edge(
+            s,
+            o,
+            key=p,
+            predicate=p,
+            paper_id=row["paper_id"],
+            directionality=row["directionality"],
+            evidence_span=row["evidence_span"],
+            confidence=float(row["confidence"]),
+            qualifiers=json.loads(row["qualifiers"]),
+        )
+    return graph
+
+
+def save_tables(nodes_df, rels_df, papers_df, graph: nx.MultiDiGraph, out_prefix: str):
+    base = DATA_DIR / out_prefix
+    nodes_df.to_parquet(base.with_suffix(".nodes.parquet"))
+    rels_df.to_parquet(base.with_suffix(".rels.parquet"))
+    papers_df.to_parquet(base.with_suffix(".papers.parquet"))
+    nx.write_graphml(graph, base.with_suffix(".graphml"))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--query",
+        type=str,
+        required=True,
+        help="OpenAlex search query (title/abstract)",
+    )
+    parser.add_argument("--filters", type=str, default=DEFAULT_FILTER)
+    parser.add_argument("--max-pages", type=int, default=2)
+    parser.add_argument("--model", type=str, default="gpt-4.1-mini")
+    parser.add_argument("--out-prefix", type=str, default="psych_kg_fulltext")
+    parser.add_argument(
+        "--chunk-chars", type=int, default=9000, help="approx chars per chunk"
+    )
+    parser.add_argument("--chunk-overlap", type=int, default=600)
+    args = parser.parse_args()
+
+    client = get_openai_client()
+    records: List[Dict[str, Any]] = []
+    print("[info] Fetching OpenAlex results...")
+    for rec in tqdm(
+        iter_openalex_results(args.query, args.filters, args.max_pages),
+        total=args.max_pages * 50,
+    ):
+        records.append(rec)
+
+    # for each paper: resolve full text, chunk, map, reduce
+    print("[info] Downloading full texts and extracting…")
+    paper_level: List[PaperExtraction] = []
+    for rec in tqdm(records):
+        meta = {
+            "id": rec.get("id"),
+            "doi": rec.get("doi"),
+            "title": rec.get("title"),
+            "year": rec.get("year"),
+            "venue": rec.get("venue"),
+        }
+
+        fulltext = resolve_text_and_download(rec)
+        text_for_ie = (
+            fulltext
+            if fulltext and len(fulltext) > 1000
+            else rec.get("abstract", "") or ""
+        )
+
+        if not text_for_ie.strip():
+            continue
+
+        chunks = list(
+            chunk(
+                text_for_ie,
+                max_tokens_chars=args.chunk_chars,
+                overlap=args.chunk_overlap,
+            )
+        )
+        chunk_extractions: List[PaperExtraction] = []
+        for ch in chunks:
+            ex = llm_extract_chunk(client, args.model, meta, ch)
+            if ex:
+                chunk_extractions.append(ex)
+
+        if not chunk_extractions:
+            continue
+
+        merged = merge_extractions(client, args.model, meta, chunk_extractions)
+        if merged:
+            paper_level.append(merged)
+
+    if not paper_level:
+        print("[warn] No extractions; exiting.")
+        raise SystemExit(0)
+
+    nodes_df, rels_df, papers_df = accum_extractions(paper_level)
+    print(
+        f"[info] {len(papers_df)} papers, {len(nodes_df)} node mentions, {len(rels_df)} relations"
+    )
+    G = build_multilayer_graph(nodes_df, rels_df)
+    save_tables(nodes_df, rels_df, papers_df, G, args.out_prefix)
+    print(f"[done] Saved under data/{args.out_prefix}.*")
