@@ -1,12 +1,12 @@
 """
 pip install openai httpx pydantic pandas orjson networkx tqdm backoff python-dotenv
 export OPENAI_API_KEY=sk-...
-python kg_pipeline.py --query '('RDoC' OR 'HiTOP' OR DSM OR psychopathology)' --max-pages 3 --model gpt-4.1-mini
+python kg_pipeline.py --query '('RDoC' OR 'HiTOP' OR DSM OR psychopathology)' --model gpt-4.1-mini
 
 Notes:
-- Stays within OA abstracts via OpenAlex; respect ToS if you add full-text sources.
+- Now pulls exactly N=first 250 top-cited + first 250 most-recent (configurable) from OpenAlex.
+- Extracts ONLY the Results section (falls back to abstract if Results not found).
 - “Relation types” are flexible; start with: supports, contradicts, predicts, co_occurs, treats, biomarker_for, measure_of.
-- You can later feed the produced edge list(s) into SBM/HSBM, HDBSCAN, Louvain, etc.
 """
 from __future__ import annotations
 
@@ -121,11 +121,11 @@ def extraction_json_schema() -> Dict[str, Any]:
 
 
 EXTRACTION_SYSTEM_PROMPT = f"""You are an expert biomedical information extraction agent.
-Extract a compact, non-redundant set of domain entities (nodes) and typed relations (edges) from the provided FULL TEXT CHUNK.
+Extract a compact, non-redundant set of domain entities (nodes) and typed relations (edges) from the provided FULL TEXT CHUNK, which is preferentially from the RESULTS section.
 - Use canonical, human-readable names for nodes.
 - Node types: {sorted(list(NODE_TYPES))}
 - Predicates: {sorted(list(REL_TYPES))}
-- Provide brief evidence_span (short quote) for each relation if possible.
+- Provide brief evidence_span (short quote) for each relation if possible (favor quotes from RESULTS language).
 - Do NOT invent facts; prefer 'supports' unless clear causal language exists.
 - If RDoC/HiTOP mapping is explicit, include it in 'normalizations'. Return ONLY JSON per schema.
 """
@@ -149,44 +149,60 @@ def uninvert_openalex_abstract(inv: Dict[str, List[int]]) -> str:
 
 
 def fetch_openalex_page(
-    query: str, filters: str, cursor: str = "*", per_page: int = 50
+    query: str,
+    filters: str,
+    cursor: str = "*",
+    per_page: int = 50,
+    sort: Optional[str] = None,  # >>> ADDED: sort
 ) -> Dict[str, Any]:
-    r = httpx.get(
-        OPENALEX_ENDPOINT,
-        params={
-            "search": query,
-            "filter": filters,
-            "per_page": per_page,
-            "cursor": cursor,
-        },
-        timeout=60,
-    )
+    params = {
+        "search": query,
+        "filter": filters,
+        "per_page": per_page,
+        "cursor": cursor,
+    }
+    if sort:
+        params["sort"] = sort
+    r = httpx.get(OPENALEX_ENDPOINT, params=params, timeout=60)
     r.raise_for_status()
     return r.json()
 
 
-def iter_openalex_results(query: str, filters: str, max_pages: int = 3):
+def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, Any]]:
+    """sort (cited_by_count:desc OR publication_date:desc)"""
+    out: List[Dict[str, Any]] = []
     cursor = "*"
-    for _ in range(max_pages):
-        page = fetch_openalex_page(query, filters, cursor)
-        for w in page.get("results", []):
+    per_page = min(200, max(25, n))
+    while len(out) < n:
+        page = fetch_openalex_page(query, filters, cursor, per_page=per_page, sort=sort)
+        results = page.get("results", [])
+        if not results:
+            break
+        for w in results:
             abstract = uninvert_openalex_abstract(
                 w.get("abstract_inverted_index") or {}
             )
-            yield {
-                "id": w.get("id"),
-                "doi": w.get("doi"),
-                "title": w.get("title"),
-                "year": w.get("publication_year"),
-                "venue": (w.get("host_venue") or {}).get("display_name"),
-                "abstract": abstract,
-                "best_oa_location": (w.get("best_oa_location") or {}),
-                "open_access": (w.get("open_access") or {}),
-                "primary_location": (w.get("primary_location") or {}),
-            }
+            out.append(
+                {
+                    "id": w.get("id"),
+                    "doi": w.get("doi"),
+                    "title": w.get("title"),
+                    "year": w.get("publication_year"),
+                    "venue": (w.get("host_venue") or {}).get("display_name"),
+                    "abstract": abstract,
+                    "best_oa_location": (w.get("best_oa_location") or {}),
+                    "open_access": (w.get("open_access") or {}),
+                    "primary_location": (w.get("primary_location") or {}),
+                    "cited_by_count": w.get("cited_by_count"),
+                    "publication_date": w.get("publication_date"),
+                }
+            )
+            if len(out) >= n:
+                break
         cursor = page.get("meta", {}).get("next_cursor")
         if not cursor:
             break
+    return out
 
 
 PMC_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -221,7 +237,6 @@ def extract_text_from_html_bytes(content: bytes, base_url: str = "") -> Optional
         doc = Document(html)
         main_html = doc.summary(html_partial=True)
         soup = BeautifulSoup(main_html, "lxml")
-        # remove scripts/styles
         for bad in soup(["script", "style", "noscript"]):
             bad.decompose()
         text = soup.get_text(separator=" ", strip=True)
@@ -232,7 +247,6 @@ def extract_text_from_html_bytes(content: bytes, base_url: str = "") -> Optional
 
 def resolve_text_and_download(rec: Dict[str, Any]) -> Optional[str]:
     """Return full text string if available, else None."""
-    # try PMCID if present in any id-like field
     joined = json.dumps(rec, ensure_ascii=False)
     pmcid = re.search(r"PMCID[:\s]*PMC(\d+)", joined, flags=re.I)
     if pmcid:
@@ -291,6 +305,35 @@ def resolve_text_and_download(rec: Dict[str, Any]) -> Optional[str]:
     return None  # full text not found
 
 
+RESULTS_HDR_RE = re.compile(
+    r"^\s*(results?|findings?|outcomes?)\s*[:\-]?\s*$", flags=re.I | re.M
+)
+NEXT_SECTION_RE = re.compile(
+    r"^\s*(discussion|conclusions?|limitations?|general discussion|overview|references?|acknowledg(e)?ments?|supplementary)\s*[:\-]?\s*$",
+    flags=re.I | re.M,
+)
+
+
+def extract_results_only(fulltext: str) -> Optional[str]:
+    """Heuristic: take the text from 'Results/Findings/Outcomes' to the next major section."""
+    if not fulltext:
+        return None
+    # normalize newlines and collapse spaces a bit
+    doc = re.sub(r"\r", "\n", fulltext)
+    doc = re.sub(r"[ \t]+", " ", doc)
+    # try to find RESULTS header
+    m = RESULTS_HDR_RE.search(doc)
+    if not m:
+        return None
+    start = m.start()
+    # find next section header after start
+    m2 = NEXT_SECTION_RE.search(doc, pos=start + 1)
+    end = m2.start() if m2 else len(doc)
+    chunk = doc[start:end].strip()
+    # avoid returning tiny noise
+    return chunk if len(chunk) > 400 else None
+
+
 def build_user_prompt_chunk(meta: Dict[str, Any], chunk_text: str) -> str:
     return f"""Paper metadata:
 - openalex_id: {meta.get('id')}
@@ -299,7 +342,7 @@ def build_user_prompt_chunk(meta: Dict[str, Any], chunk_text: str) -> str:
 - year: {meta.get('year')}
 - venue: {meta.get('venue')}
 
-Full-text chunk:
+Full-text chunk (RESULTS-preferred):
 {chunk_text}
 """
 
@@ -345,7 +388,6 @@ def llm_extract_chunk(
 def merge_extractions(
     client: OpenAI, model: str, meta: Dict[str, Any], chunks: List[PaperExtraction]
 ) -> Optional[PaperExtraction]:
-    """Use an LLM reduce step to dedupe/merge, then validate."""
     schema = extraction_json_schema()
     chunk_payloads = [json.loads(c.model_dump_json()) for c in chunks]
     merge_user = f"""Combine these chunk-level extractions for ONE paper into a single, deduplicated result (JSON list below).
@@ -509,26 +551,47 @@ if __name__ == "__main__":
         help="OpenAlex search query (title/abstract)",
     )
     parser.add_argument("--filters", type=str, default=DEFAULT_FILTER)
-    parser.add_argument("--max-pages", type=int, default=2)
     parser.add_argument("--model", type=str, default="gpt-4.1-mini")
-    parser.add_argument("--out-prefix", type=str, default="psych_kg_fulltext")
+    parser.add_argument("--out-prefix", type=str, default="psych_kg_results_only")
     parser.add_argument(
         "--chunk-chars", type=int, default=9000, help="approx chars per chunk"
     )
     parser.add_argument("--chunk-overlap", type=int, default=600)
+    parser.add_argument(
+        "--n-top-cited",
+        type=int,
+        default=250,
+        help="Number of top-cited OA papers to fetch",
+    )
+    parser.add_argument(
+        "--n-most-recent",
+        type=int,
+        default=250,
+        help="Number of most-recent OA papers to fetch",
+    )
     args = parser.parse_args()
 
     client = get_openai_client()
-    records: List[Dict[str, Any]] = []
-    print("[info] Fetching OpenAlex results...")
-    for rec in tqdm(
-        iter_openalex_results(args.query, args.filters, args.max_pages),
-        total=args.max_pages * 50,
-    ):
-        records.append(rec)
 
-    # for each paper: resolve full text, chunk, map, reduce
-    print("[info] Downloading full texts and extracting…")
+    # fetch exactly N per sort, then union by OpenAlex id
+    print("[info] Fetching OpenAlex (top-cited and most-recent)")
+    top_cited = fetch_top_n(
+        args.query, args.filters, sort="cited_by_count:desc", n=args.n_top_cited
+    )
+    most_recent = fetch_top_n(
+        args.query, args.filters, sort="publication_date:desc", n=args.n_most_recent
+    )
+
+    # dedupe by OpenAlex id
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for rec in itertools.chain(top_cited, most_recent):
+        if rec.get("id") and rec["id"] not in by_id:
+            by_id[rec["id"]] = rec
+    records = list(by_id.values())
+    print(f"[info] Candidate papers: {len(records)} (unique across both buckets)")
+
+    # for each paper: resolve full text, slice to RESULTS, chunk, map, reduce
+    print("[info] Downloading full texts and extracting (RESULTS-only)")
     paper_level: List[PaperExtraction] = []
     for rec in tqdm(records):
         meta = {
@@ -540,11 +603,9 @@ if __name__ == "__main__":
         }
 
         fulltext = resolve_text_and_download(rec)
-        text_for_ie = (
-            fulltext
-            if fulltext and len(fulltext) > 1000
-            else rec.get("abstract", "") or ""
-        )
+        results_only = extract_results_only(fulltext or "") if fulltext else None
+        # prefer RESULTS section; fallback to abstract
+        text_for_ie = results_only if results_only else (rec.get("abstract", "") or "")
 
         if not text_for_ie.strip():
             continue
