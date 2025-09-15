@@ -20,7 +20,7 @@ import pathlib
 import re
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import backoff
 import httpx
@@ -65,8 +65,6 @@ REL_TYPES = {
 
 try:
     from openai import OpenAI
-
-    _OPENAI_AVAILABLE = True
 except Exception:
     raise RuntimeError("openai>=1.0 not installed")
 
@@ -153,7 +151,7 @@ def fetch_openalex_page(
     filters: str,
     cursor: str = "*",
     per_page: int = 50,
-    sort: Optional[str] = None,  # >>> ADDED: sort
+    sort: Optional[str] = None,
 ) -> Dict[str, Any]:
     params = {
         "search": query,
@@ -170,7 +168,7 @@ def fetch_openalex_page(
 
 def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, Any]]:
     """sort (cited_by_count:desc OR publication_date:desc)"""
-    out: List[Dict[str, Any]] = []
+    out = []
     cursor = "*"
     per_page = min(200, max(25, n))
     while len(out) < n:
@@ -205,6 +203,7 @@ def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, A
     return out
 
 
+# for PMCID full‑text retrieval
 PMC_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 
@@ -301,8 +300,7 @@ def resolve_text_and_download(rec: Dict[str, Any]) -> Optional[str]:
                     return txt
         except Exception:
             continue
-
-    return None  # full text not found
+    return None
 
 
 RESULTS_HDR_RE = re.compile(
@@ -493,7 +491,15 @@ def accum_extractions(
 def build_multilayer_graph(
     nodes_df: pd.DataFrame, rels_df: pd.DataFrame
 ) -> nx.MultiDiGraph:
-    graph = nx.MultiDiGraph()
+    """
+    Construct a NetworkX MultiDiGraph from dataframes of nodes and relations.
+
+    Nodes are annotated with their most common node_type (by frequency of mentions), as well as merged synonyms and normalizations. Edges are
+    directed and store predicate, paper_id, directionality, evidence_span, confidence and qualifiers. Multiple edges between the same pair of
+    nodes are preserved by omitting an explicit key when calling ``add_edge``. NetworkX will assign unique keys automatically
+    """
+    graph: nx.MultiDiGraph = nx.MultiDiGraph()
+    # determine most frequent type per canonical name
     node_types = (
         nodes_df.groupby(["canonical_name", "node_type"])
         .size()
@@ -523,7 +529,6 @@ def build_multilayer_graph(
         graph.add_edge(
             s,
             o,
-            key=p,
             predicate=p,
             paper_id=row["paper_id"],
             directionality=row["directionality"],
@@ -534,12 +539,145 @@ def build_multilayer_graph(
     return graph
 
 
-def save_tables(nodes_df, rels_df, papers_df, graph: nx.MultiDiGraph, out_prefix: str):
+def project_to_weighted_graph(graph: nx.MultiDiGraph) -> nx.Graph:
+    """
+    Project a directed MultiDiGraph onto an undirected weighted Graph.
+
+    Each unique pair of nodes (u, v) will result in a single undirected edge
+    whose weight is the sum of the confidence scores of all edges (both
+    directions) between u and v.  Self‑loops are ignored.  Additional
+    attributes on the multigraph edges are not carried over.
+    """
+    graph = nx.Graph()
+    for u, v, data in graph.edges(data=True):
+        if u == v:
+            continue
+        w = float(data.get("confidence", 1.0))
+        if graph.has_edge(u, v):
+            graph[u][v]["weight"] += w
+        else:
+            graph.add_edge(u, v, weight=w)
+    return graph
+
+
+def save_tables(
+    nodes_df: pd.DataFrame,
+    rels_df: pd.DataFrame,
+    papers_df: pd.DataFrame,
+    graph: nx.MultiDiGraph,
+    out_prefix: str,
+    projected: Optional[nx.Graph] = None,
+) -> None:
     base = DATA_DIR / out_prefix
     nodes_df.to_parquet(base.with_suffix(".nodes.parquet"))
     rels_df.to_parquet(base.with_suffix(".rels.parquet"))
     papers_df.to_parquet(base.with_suffix(".papers.parquet"))
     nx.write_graphml(graph, base.with_suffix(".graphml"))
+    if projected is not None:
+        nx.write_graphml(projected, base.with_suffix(".weighted.graphml"))
+
+
+def load_lexicon(path: str) -> Set[str]:
+    """Load a lexicon of terms (one per line) into a lowercase set."""
+    terms: Set[str] = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            t = line.strip()
+            if t:
+                terms.add(t.lower())
+    return terms
+
+
+def mask_nodes(
+    nodes_df: pd.DataFrame, rels_df: pd.DataFrame, lexicon: Set[str]
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    mask = ~nodes_df["canonical_name"].str.lower().isin(lexicon)
+    nodes_filtered = nodes_df[mask].copy()
+    keep = set(nodes_filtered["canonical_name"].unique())
+    rels_filtered = rels_df[
+        rels_df["subject"].isin(keep) & rels_df["object"].isin(keep)
+    ].copy()
+    return nodes_filtered, rels_filtered
+
+
+def evaluate_nodes(
+    nodes_df: pd.DataFrame, gold_nodes: Iterable[str]
+) -> Dict[str, float]:
+    """Compute precision/recall/F1 for node extraction given a gold set."""
+    pred: Set[str] = set(nodes_df["canonical_name"].tolist())
+    gold: Set[str] = {normalize_name(s) for s in gold_nodes}
+    if not pred and not gold:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+    tp = len(pred & gold)
+    fp = len(pred - gold)
+    fn = len(gold - pred)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def evaluate_relations(
+    graph: nx.MultiDiGraph, gold_relations: Iterable[Tuple[str, str, str]]
+) -> Dict[str, float]:
+    gold_set: Set[Tuple[str, str, str]] = set(
+        (
+            normalize_name(s),
+            p,
+            normalize_name(o),
+        )
+        for (s, p, o) in gold_relations
+    )
+    pred_set: Set[Tuple[str, str, str]] = set()
+    for u, v, data in graph.edges(data=True):
+        subj = normalize_name(u)
+        obj = normalize_name(v)
+        pred = data.get("predicate")
+        # Note: directed/undirected handling – treat as directed here
+        pred_set.add((subj, pred, obj))
+    if not pred_set and not gold_set:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+    tp = len(pred_set & gold_set)
+    fp = len(pred_set - gold_set)
+    fn = len(gold_set - pred_set)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def load_gold_relations(path: str) -> List[Tuple[str, str, str]]:
+    """tab‑separated"""
+    triples: List[Tuple[str, str, str]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            triples.append((parts[0], parts[1], parts[2]))
+    return triples
+
+
+def load_gold_nodes(path: str) -> List[str]:
+    """Load a list of node canonical names (one per line)"""
+    nodes: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            ln = line.strip()
+            if ln:
+                nodes.append(ln)
+    return nodes
 
 
 if __name__ == "__main__":
@@ -568,6 +706,30 @@ if __name__ == "__main__":
         type=int,
         default=250,
         help="Number of most-recent OA papers to fetch",
+    )
+    parser.add_argument(
+        "--mask-lexicon",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to a newline‑separated list of nosology terms to mask out",
+    )
+    parser.add_argument(
+        "--project-to-weighted",
+        action="store_true",
+        help="If set, project the multigraph to a simple weighted graph and save it",
+    )
+    parser.add_argument(
+        "--eval-nodes",
+        type=str,
+        default=None,
+        help="Path to a gold standard node list (one canonical name per line)",
+    )
+    parser.add_argument(
+        "--eval-relations",
+        type=str,
+        default=None,
+        help="Path to a gold standard relation file (tab separated subject, predicate, object)",
     )
     args = parser.parse_args()
 
@@ -638,6 +800,28 @@ if __name__ == "__main__":
     print(
         f"[info] {len(papers_df)} papers, {len(nodes_df)} node mentions, {len(rels_df)} relations"
     )
-    G = build_multilayer_graph(nodes_df, rels_df)
-    save_tables(nodes_df, rels_df, papers_df, G, args.out_prefix)
+    lexicon = load_lexicon(args.mask_lexicon)
+    nodes_df, rels_df = mask_nodes(nodes_df, rels_df, lexicon)
+    print(
+        f"[info] After masking lexicon, {len(nodes_df)} node mentions, {len(rels_df)} relations"
+    )
+    graph = build_multilayer_graph(nodes_df, rels_df)
+    weighted_graph: Optional[nx.Graph] = None
+    if args.project_to_weighted:
+        weighted_G = project_to_weighted_graph(graph)
+    save_tables(
+        nodes_df, rels_df, papers_df, graph, args.out_prefix, projected=weighted_graph
+    )
+    if args.eval_nodes:
+        gold_nodes = load_gold_nodes(args.eval_nodes)
+        metrics = evaluate_nodes(nodes_df, gold_nodes)
+        print(
+            f"[eval-nodes] precision={metrics['precision']:.3f}, recall={metrics['recall']:.3f}, f1={metrics['f1']:.3f}"
+        )
+    if args.eval_relations:
+        gold_relations = load_gold_relations(args.eval_relations)
+        metrics = evaluate_relations(graph, gold_relations)
+        print(
+            f"[eval-relations] precision={metrics['precision']:.3f}, recall={metrics['recall']:.3f}, f1={metrics['f1']:.3f}"
+        )
     print(f"[done] Saved under data/{args.out_prefix}.*")
