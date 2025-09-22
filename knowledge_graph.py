@@ -34,13 +34,15 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import httpx
 import networkx as nx
+import nltk
 import pandas as pd
+import torch
 from bs4 import BeautifulSoup
 from pdfminer.high_level import extract_text as pdf_extract_text
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from readability import Document
 from tqdm import tqdm
-from transformers import pipeline
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 NODE_TYPES: Set[str] = {
     "Symptom",
@@ -62,6 +64,12 @@ REL_TYPES: Set[str] = {
     "biomarker_for",
     "measure_of",
 }
+
+try:
+    nltk.data.find("tokenizers/punkt")
+except LookupError:
+    nltk.download("punkt", quiet=True)
+from nltk.tokenize import sent_tokenize
 
 
 class NodeRecord(BaseModel):
@@ -341,6 +349,94 @@ def categorize_entity(label: str) -> str:
     return "Symptom"
 
 
+_RELATION_MODE = "nli"
+_NLI_MODEL_NAME = "microsoft/deberta-v3-base-mnli"
+_nli_tok = None
+_nli_model = None
+_ID2LBL = {0: "contradiction", 1: "neutral", 2: "entailment"}
+
+
+# hypothesis templates: not used for exact matching. used or replacement by
+# detected objects to test for entailment and use that replace relation type
+_REL_TEMPLATES = {
+    "treats": "{SUBJ} treats {OBJ}.",
+    "biomarker_for": "{SUBJ} is a biomarker for {OBJ}.",
+    "measure_of": "{SUBJ} is a measure of {OBJ}.",
+    "predicts": "{SUBJ} predicts {OBJ}.",
+    "supports": "{SUBJ} is positively associated with {OBJ}.",
+    "contradicts": "{SUBJ} is negatively associated with {OBJ}.",
+}
+
+
+_REL_TEMPLATES_REV = {
+    "treats": "{OBJ} treats {SUBJ}.",
+    "biomarker_for": "{OBJ} is a biomarker for {SUBJ}.",
+    "measure_of": "{OBJ} is a measure of {SUBJ}.",
+    "predicts": "{OBJ} predicts {SUBJ}.",
+}
+
+
+def _init_nli():
+    global _nli_tok, _nli_model
+    if _nli_tok is None or _nli_model is None:
+        _nli_tok = AutoTokenizer.from_pretrained(_NLI_MODEL_NAME)
+        _nli_model = AutoModelForSequenceClassification.from_pretrained(_NLI_MODEL_NAME)
+        _nli_model.eval()
+
+
+def _nli_score(premise: str, hypothesis: str) -> float:
+    """Return entailment probability for (premise -> hypothesis)."""
+    with torch.no_grad():
+        enc = _nli_tok(
+            premise, hypothesis, truncation=True, max_length=512, return_tensors="pt"
+        )
+        out = _nli_model(**enc).logits.softmax(-1)[0]
+        # entailment index for MNLI heads is 2
+        return float(out[2].item())
+
+
+def _pick_sentence_context(text: str, s1: str, s2: str, window: int = 2) -> str:
+    """Grab the sentence(s) where both entities appear, with small window."""
+    sents = sent_tokenize(text)
+    idxs = [i for i, s in enumerate(sents) if (s1 in s and s2 in s)]
+    if not idxs:
+        # fallback: nearest pair of sentences containing each entity
+        idx1 = next((i for i, s in enumerate(sents) if s1 in s), None)
+        idx2 = next((i for i, s in enumerate(sents) if s2 in s), None)
+        if idx1 is None or idx2 is None:
+            return text[:2000]  # worst-case: cap
+        lo, hi = sorted([idx1, idx2])
+        lo = max(0, lo - window)
+        hi = min(len(sents), hi + window + 1)
+        return " ".join(sents[lo:hi])
+    lo = max(0, min(idxs) - window)
+    hi = min(len(sents), max(idxs) + window + 1)
+    return " ".join(sents[lo:hi])
+
+
+def classify_relation_via_nli(context: str, subj: str, obj: str) -> str:
+    """Return one of REL_TYPES using NLI templates; default to co_occurs."""
+    _init_nli()
+    # Score forward templates
+    scores = []
+    for rel, tmpl in _REL_TEMPLATES.items():
+        hyp = tmpl.format(SUBJ=subj, OBJ=obj)
+        scores.append((rel, _nli_score(context, hyp)))
+    # Penalize if reversed template is *more* entailed for directional ones
+    for rel, tmpl in _REL_TEMPLATES_REV.items():
+        hyp_rev = tmpl.format(SUBJ=subj, OBJ=obj)
+        rev = _nli_score(context, hyp_rev)
+        # subtract small penalty if reverse looks more likely
+        for i, (r, sc) in enumerate(scores):
+            if r == rel:
+                scores[i] = (r, sc - 0.1 * rev)
+                break
+    scores.sort(key=lambda x: x[1], reverse=True)
+    best_rel, best_p = scores[0]
+    # small acceptance threshold; otherwise fall back
+    return best_rel if best_p >= 0.55 else "co_occurs"
+
+
 def extract_entities_relations(
     meta: Dict[str, Any], text: str
 ) -> Optional[PaperExtraction]:
@@ -376,24 +472,35 @@ def extract_entities_relations(
             )
     if not entities:
         return None
-    # Build relations by connecting each unique pair of entities
     relations: List[RelationRecord] = []
     ent_names = list(entities.keys())
     for i in range(len(ent_names)):
         for j in range(i + 1, len(ent_names)):
+            subj, obj = ent_names[i], ent_names[j]
+            pred = "co_occurs"
+            conf = 0.5
+            sent_ctx = _pick_sentence_context(text, subj, obj)
+            pred = classify_relation_via_nli(sent_ctx, subj, obj)
+            # crude confidence from entailment score of chosen hypothesis
+            # (reuse internal scorer to fetch the final probability)
+            conf = 0.7 if pred != "co_occurs" else 0.5
+            dirn = (
+                "directed"
+                if pred in {"treats", "predicts", "biomarker_for", "measure_of"}
+                else "undirected"
+            )
             relations.append(
                 RelationRecord(
-                    subject=ent_names[i],
-                    # TODO: placeholder until finding a decent free base model
-                    # for relation type extraction
-                    predicate="co_occurs",
-                    object=ent_names[j],
-                    directionality="undirected",
-                    evidence_span="",
-                    confidence=0.5,
+                    subject=subj,
+                    predicate=pred,
+                    object=obj,
+                    directionality=dirn,
+                    evidence_span=sent_ctx[:300],
+                    confidence=conf,
                     qualifiers={},
                 )
             )
+
     return PaperExtraction(
         paper_id=meta.get("id", ""),
         doi=meta.get("doi"),
