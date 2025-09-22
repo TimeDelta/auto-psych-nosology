@@ -65,6 +65,52 @@ REL_TYPES: Set[str] = {
     "measure_of",
 }
 
+DIAGNOSIS_MASK_LEXICON = {
+    "major depressive disorder": [
+        "MDD",
+        "major depression",
+        "unipolar depression",
+        "clinical depression",
+        "recurrent depression",
+    ],
+    "bipolar disorder": [
+        "BD",
+        "bipolar affective disorder",
+        "manic depression",
+        "bipolar I",
+        "bipolar II",
+    ],
+    "schizophrenia": [
+        "SCZ",
+        "schizophrenic psychosis",
+        "schizoaffective (if not separate)",
+        "chronic schizophrenia",
+    ],
+    "anxiety disorders": [
+        "GAD",
+        "generalized anxiety disorder",
+        "panic disorder",
+        "social anxiety disorder",
+        "social phobia",
+    ],
+    "PTSD": [
+        "posttraumatic stress disorder",
+        "post-traumatic stress",
+        "combat stress",
+        "traumatic stress disorder",
+    ],
+    "OCD": [
+        "obsessive compulsive disorder",
+        "obsessive–compulsive",
+        "OCD spectrum",
+    ],
+    "ADHD": [
+        "attention deficit hyperactivity disorder",
+        "ADD",
+        "attention-deficit disorder",
+    ],
+}
+
 try:
     nltk.data.find("tokenizers/punkt")
 except LookupError:
@@ -472,6 +518,10 @@ def extract_entities_relations(
             )
     if not entities:
         return None
+    entities = {k: v for k, v in entities.items() if v.node_type != "Diagnosis"}
+    if not entities:
+        return None
+
     relations: List[RelationRecord] = []
     ent_names = list(entities.keys())
     for i in range(len(ent_names)):
@@ -651,18 +701,6 @@ def load_lexicon(path: str) -> Set[str]:
     return terms
 
 
-def mask_nodes(
-    nodes_df: pd.DataFrame, rels_df: pd.DataFrame, lexicon: Set[str]
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    mask = ~nodes_df["canonical_name"].str.lower().isin(lexicon)
-    nodes_filtered = nodes_df[mask].copy()
-    keep: Set[str] = set(nodes_filtered["canonical_name"].unique())
-    rels_filtered = rels_df[
-        rels_df["subject"].isin(keep) & rels_df["object"].isin(keep)
-    ].copy()
-    return nodes_filtered, rels_filtered
-
-
 def evaluate_nodes(
     nodes_df: pd.DataFrame, gold_nodes: Iterable[str]
 ) -> Dict[str, float]:
@@ -775,13 +813,6 @@ if __name__ == "__main__":
         help="Number of most‑recent OA papers to fetch",
     )
     parser.add_argument(
-        "--mask-lexicon",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to a newline‑separated list of nosology terms to mask out",
-    )
-    parser.add_argument(
         "--eval-nodes",
         type=str,
         default=None,
@@ -841,11 +872,6 @@ if __name__ == "__main__":
     nodes_df, rels_df, papers_df = accum_extractions(paper_level)
     print(
         f"[info] {len(papers_df)} papers, {len(nodes_df)} node mentions, {len(rels_df)} relations"
-    )
-    lexicon = load_lexicon(args.mask_lexicon)
-    nodes_df, rels_df = mask_nodes(nodes_df, rels_df, lexicon)
-    print(
-        f"[info] After masking lexicon, {len(nodes_df)} node mentions, {len(rels_df)} relations"
     )
     graph = build_multilayer_graph(nodes_df, rels_df)
     weighted_graph: Optional[nx.Graph] = None
