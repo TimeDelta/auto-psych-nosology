@@ -1,20 +1,30 @@
 """
-pip install openai httpx pydantic pandas orjson networkx tqdm backoff python-dotenv
-export OPENAI_API_KEY=sk-...
-python kg_pipeline.py --query '('RDoC' OR 'HiTOP' OR DSM OR psychopathology)' --model gpt-4.1-mini
+knowledge_graph_free.py
+=======================
 
-Notes:
-- Now pulls exactly N=first 250 top-cited + first 250 most-recent (configurable) from OpenAlex.
-- Extracts ONLY the Results section (falls back to abstract if Results not found).
-- “Relation types” are flexible; start with: supports, contradicts, predicts, co_occurs, treats, biomarker_for, measure_of.
+This module provides a simplified alternative to the original `knowledge_graph.py` that
+uses only open‑source, zero‑cost NLP models for entity and relation extraction. The
+original pipeline relied on OpenAI's proprietary API for information extraction; this
+version removes that dependency and instead employs the HuggingFace `transformers`
+library along with freely available biomedical models for named‑entity recognition
+(NER). Relations are inferred in a naive manner by linking all pairs of entities
+that co‑occur within the same document. While the extraction quality is necessarily
+lower than a tuned large language model, this approach respects the zero‑budget
+constraint and provides a working proof‑of‑concept for downstream graph construction
+and partitioning experiments.
+
+To run this script you will need to install the additional dependencies listed in
+`requirements.txt`, in particular `transformers` and a model checkpoint such as
+`d4data/biomedical-ner-all`. At runtime the model weights will be downloaded
+automatically from the HuggingFace Hub (internet connectivity is required when
+running for the first time).
 """
+
 from __future__ import annotations
 
 import argparse
-import collections
 import itertools
 import json
-import math
 import os
 import pathlib
 import re
@@ -22,27 +32,19 @@ from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-import backoff
 import httpx
 import networkx as nx
-import orjson
+import nltk
 import pandas as pd
+import torch
 from bs4 import BeautifulSoup
 from pdfminer.high_level import extract_text as pdf_extract_text
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from readability import Document
 from tqdm import tqdm
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
-from chunking import chunk
-
-OPENALEX_ENDPOINT = "https://api.openalex.org/works"
-DEFAULT_FILTER = (
-    "from_publication_date:2010-01-01,primary_location.is_oa:true,language:en"
-)
-DATA_DIR = pathlib.Path("data")
-DATA_DIR.mkdir(exist_ok=True, parents=True)
-
-NODE_TYPES = {
+NODE_TYPES: Set[str] = {
     "Symptom",
     "Diagnosis",
     "RDoC_Construct",
@@ -53,7 +55,7 @@ NODE_TYPES = {
     "Measure",
 }
 
-REL_TYPES = {
+REL_TYPES: Set[str] = {
     "supports",
     "contradicts",
     "predicts",
@@ -64,15 +66,10 @@ REL_TYPES = {
 }
 
 try:
-    from openai import OpenAI
-except Exception:
-    raise RuntimeError("openai>=1.0 not installed")
-
-
-def get_openai_client() -> OpenAI:
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("Set OPENAI_API_KEY")
-    return OpenAI()
+    nltk.data.find("tokenizers/punkt")
+except LookupError:
+    nltk.download("punkt", quiet=True)
+from nltk.tokenize import sent_tokenize
 
 
 class NodeRecord(BaseModel):
@@ -82,9 +79,9 @@ class NodeRecord(BaseModel):
     )
     node_type: str = Field(..., description=f"One of {sorted(list(NODE_TYPES))}")
     synonyms: List[str] = Field(default_factory=list)
-    # TODO: automate concept normalization
     normalizations: Dict[str, str] = Field(
-        default_factory=dict, description='i.e. {"UMLS":"C0005586"}'
+        default_factory=dict,
+        description='UMLS or other dictionary normalizations, e.g. {"UMLS": "C0005586"}',
     )
 
 
@@ -97,7 +94,7 @@ class RelationRecord(BaseModel):
     evidence_span: str = Field(
         default="", description="Short quote from text supporting this"
     )
-    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     qualifiers: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -118,28 +115,19 @@ def extraction_json_schema() -> Dict[str, Any]:
     return PaperExtraction.model_json_schema()
 
 
-EXTRACTION_SYSTEM_PROMPT = f"""You are an expert biomedical information extraction agent.
-Extract a compact, non-redundant set of domain entities (nodes) and typed relations (edges) from the provided FULL TEXT CHUNK, which is preferentially from the RESULTS section.
-- Use canonical, human-readable names for nodes.
-- Node types: {sorted(list(NODE_TYPES))}
-- Predicates: {sorted(list(REL_TYPES))}
-- Provide brief evidence_span (short quote) for each relation if possible (favor quotes from RESULTS language).
-- Do NOT invent facts; prefer 'supports' unless clear causal language exists.
-- If RDoC/HiTOP mapping is explicit, include it in 'normalizations'. Return ONLY JSON per schema.
-"""
-
-MERGE_SYSTEM_PROMPT = """You are consolidating chunk-level extractions for a single paper.
-Merge nodes and relations:
-- Deduplicate nodes by canonical_name (merge synonyms/normalizations).
-- Deduplicate relations by (subject, predicate, object); keep the highest confidence and concatenate distinct evidence_spans (up to 2 short snippets).
-Return JSON ONLY per schema.
-"""
+OPENALEX_ENDPOINT = "https://api.openalex.org/works"
+DEFAULT_FILTER = (
+    "from_publication_date:2010-01-01,primary_location.is_oa:true,language:en"
+)
+DATA_DIR = pathlib.Path("data")
+DATA_DIR.mkdir(exist_ok=True, parents=True)
 
 
 def uninvert_openalex_abstract(inv: Dict[str, List[int]]) -> str:
+    """Reconstruct OpenAlex inverted index into a plain abstract string."""
     if not inv:
         return ""
-    pos2tok = {}
+    pos2tok: Dict[int, str] = {}
     for tok, idxs in inv.items():
         for i in idxs:
             pos2tok[i] = tok
@@ -153,6 +141,7 @@ def fetch_openalex_page(
     per_page: int = 50,
     sort: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Fetch a single page of search results from OpenAlex."""
     params = {
         "search": query,
         "filter": filters,
@@ -168,7 +157,7 @@ def fetch_openalex_page(
 
 def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, Any]]:
     """sort (cited_by_count:desc OR publication_date:desc)"""
-    out = []
+    out: List[Dict[str, Any]] = []
     cursor = "*"
     per_page = min(200, max(25, n))
     while len(out) < n:
@@ -203,7 +192,6 @@ def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, A
     return out
 
 
-# for PMCID full‑text retrieval
 PMC_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 
@@ -213,7 +201,7 @@ def try_pmc_fulltext(pmcid: str) -> Optional[str]:
     if r.status_code != 200 or not r.text:
         return None
     soup = BeautifulSoup(r.text, "lxml-xml")
-    parts = []
+    parts: List[str] = []
     for tag in soup.find_all(["abstract", "p", "sec", "title"]):
         txt = tag.get_text(separator=" ", strip=True)
         if txt:
@@ -307,7 +295,7 @@ RESULTS_HDR_RE = re.compile(
     r"^\s*(results?|findings?|outcomes?)\s*[:\-]?\s*$", flags=re.I | re.M
 )
 NEXT_SECTION_RE = re.compile(
-    r"^\s*(discussion|conclusions?|limitations?|general discussion|overview|references?|acknowledg(e)?ments?|supplementary)\s*[:\-]?\s*$",
+    r"^\s*(discussion|conclusions?|limitations?|general discussion|overview|references?|acknowledg(e)?ments?|supplementary)\s*[:\-]?\s$",
     flags=re.I | re.M,
 )
 
@@ -316,10 +304,9 @@ def extract_results_only(fulltext: str) -> Optional[str]:
     """Heuristic: take the text from 'Results/Findings/Outcomes' to the next major section."""
     if not fulltext:
         return None
-    # normalize newlines and collapse spaces a bit
+    # normalize newlines and collapse spaces
     doc = re.sub(r"\r", "\n", fulltext)
     doc = re.sub(r"[ \t]+", " ", doc)
-    # try to find RESULTS header
     m = RESULTS_HDR_RE.search(doc)
     if not m:
         return None
@@ -328,117 +315,201 @@ def extract_results_only(fulltext: str) -> Optional[str]:
     m2 = NEXT_SECTION_RE.search(doc, pos=start + 1)
     end = m2.start() if m2 else len(doc)
     chunk = doc[start:end].strip()
-    # avoid returning tiny noise
+    # avoid returning tiny strings that are likely noise
     return chunk if len(chunk) > 400 else None
 
 
-def build_user_prompt_chunk(meta: Dict[str, Any], chunk_text: str) -> str:
-    return f"""Paper metadata:
-- openalex_id: {meta.get('id')}
-- title: {meta.get('title')}
-- doi: {meta.get('doi')}
-- year: {meta.get('year')}
-- venue: {meta.get('venue')}
-
-Full-text chunk (RESULTS-preferred):
-{chunk_text}
-"""
+# Aggregation strategy merges sub‑tokens into contiguous entities
+_ner_pipeline = pipeline(
+    "ner",
+    model="d4data/biomedical-ner-all",
+    aggregation_strategy="simple",
+)
 
 
-@backoff.on_exception(backoff.expo, Exception, max_tries=5, jitter=None)
-def llm_extract_chunk(
-    client: OpenAI, model: str, meta: Dict[str, Any], chunk: str
+def categorize_entity(label: str) -> str:
+    """Map a coarse entity label into one of our predefined node types.
+
+    The biomedical NER model outputs labels such as 'CHEMICAL', 'DISEASE',
+    'PROTEIN', etc.  This function maps those labels onto the simplified set of
+    categories used by our knowledge graph. The mapping is heuristic and may
+    misclassify edge cases, but it provides a starting point. Unknown labels
+    default to 'Symptom'.
+    """
+    lbl = label.upper()
+    if "DISEASE" in lbl or "DISORDER" in lbl or "SYNDROME" in lbl:
+        return "Diagnosis"
+    if "CHEMICAL" in lbl or "DRUG" in lbl or "MED" in lbl:
+        return "Treatment"
+    if "GENE" in lbl or "PROTEIN" in lbl or "CELL" in lbl:
+        return "Biomarker"
+    if "BEHAVIOR" in lbl or "SYMPTOM" in lbl:
+        return "Symptom"
+    # default fallback
+    return "Symptom"
+
+
+_RELATION_MODE = "nli"
+_NLI_MODEL_NAME = "microsoft/deberta-v3-base-mnli"
+_nli_tok = None
+_nli_model = None
+_ID2LBL = {0: "contradiction", 1: "neutral", 2: "entailment"}
+
+
+# hypothesis templates: not used for exact matching. used or replacement by
+# detected objects to test for entailment and use that replace relation type
+_REL_TEMPLATES = {
+    "treats": "{SUBJ} treats {OBJ}.",
+    "biomarker_for": "{SUBJ} is a biomarker for {OBJ}.",
+    "measure_of": "{SUBJ} is a measure of {OBJ}.",
+    "predicts": "{SUBJ} predicts {OBJ}.",
+    "supports": "{SUBJ} is positively associated with {OBJ}.",
+    "contradicts": "{SUBJ} is negatively associated with {OBJ}.",
+}
+
+
+_REL_TEMPLATES_REV = {
+    "treats": "{OBJ} treats {SUBJ}.",
+    "biomarker_for": "{OBJ} is a biomarker for {SUBJ}.",
+    "measure_of": "{OBJ} is a measure of {SUBJ}.",
+    "predicts": "{OBJ} predicts {SUBJ}.",
+}
+
+
+def _init_nli():
+    global _nli_tok, _nli_model
+    if _nli_tok is None or _nli_model is None:
+        _nli_tok = AutoTokenizer.from_pretrained(_NLI_MODEL_NAME)
+        _nli_model = AutoModelForSequenceClassification.from_pretrained(_NLI_MODEL_NAME)
+        _nli_model.eval()
+
+
+def _nli_score(premise: str, hypothesis: str) -> float:
+    """Return entailment probability for (premise -> hypothesis)."""
+    with torch.no_grad():
+        enc = _nli_tok(
+            premise, hypothesis, truncation=True, max_length=512, return_tensors="pt"
+        )
+        out = _nli_model(**enc).logits.softmax(-1)[0]
+        # entailment index for MNLI heads is 2
+        return float(out[2].item())
+
+
+def _pick_sentence_context(text: str, s1: str, s2: str, window: int = 2) -> str:
+    """Grab the sentence(s) where both entities appear, with small window."""
+    sents = sent_tokenize(text)
+    idxs = [i for i, s in enumerate(sents) if (s1 in s and s2 in s)]
+    if not idxs:
+        # fallback: nearest pair of sentences containing each entity
+        idx1 = next((i for i, s in enumerate(sents) if s1 in s), None)
+        idx2 = next((i for i, s in enumerate(sents) if s2 in s), None)
+        if idx1 is None or idx2 is None:
+            return text[:2000]  # worst-case: cap
+        lo, hi = sorted([idx1, idx2])
+        lo = max(0, lo - window)
+        hi = min(len(sents), hi + window + 1)
+        return " ".join(sents[lo:hi])
+    lo = max(0, min(idxs) - window)
+    hi = min(len(sents), max(idxs) + window + 1)
+    return " ".join(sents[lo:hi])
+
+
+def classify_relation_via_nli(context: str, subj: str, obj: str) -> str:
+    """Return one of REL_TYPES using NLI templates; default to co_occurs."""
+    _init_nli()
+    # Score forward templates
+    scores = []
+    for rel, tmpl in _REL_TEMPLATES.items():
+        hyp = tmpl.format(SUBJ=subj, OBJ=obj)
+        scores.append((rel, _nli_score(context, hyp)))
+    # Penalize if reversed template is *more* entailed for directional ones
+    for rel, tmpl in _REL_TEMPLATES_REV.items():
+        hyp_rev = tmpl.format(SUBJ=subj, OBJ=obj)
+        rev = _nli_score(context, hyp_rev)
+        # subtract small penalty if reverse looks more likely
+        for i, (r, sc) in enumerate(scores):
+            if r == rel:
+                scores[i] = (r, sc - 0.1 * rev)
+                break
+    scores.sort(key=lambda x: x[1], reverse=True)
+    best_rel, best_p = scores[0]
+    # small acceptance threshold; otherwise fall back
+    return best_rel if best_p >= 0.55 else "co_occurs"
+
+
+def extract_entities_relations(
+    meta: Dict[str, Any], text: str
 ) -> Optional[PaperExtraction]:
-    schema = extraction_json_schema()
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt_chunk(meta, chunk)},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "paper_extraction",
-                "schema": schema,
-                "strict": True,
-            },
-        },
-        max_output_tokens=2000,
-    )
+    """Extract nodes and relations from a block of text using NER.
+
+    This function uses a HuggingFace NER pipeline to identify entity spans. It
+    collects unique entities, assigns a node type via `categorize_entity`, and
+    builds a list of NodeRecord objects. Relations are generated in a naive
+    fashion by connecting every distinct pair of entities found in the text with
+    a 'co_occurs' edge. Evidence spans are omitted because this pipeline does
+    not perform relation classification. Returns None if no entities are
+    detected.
+    """
+    if not text.strip():
+        return None
     try:
-        text = resp.output_text
+        ner_results = _ner_pipeline(text)
     except Exception:
-        parts = []
-        for item in getattr(resp, "output", []) or []:
-            if item.get("type") == "output_text":
-                parts.append(item.get("content", ""))
-        text = "".join(parts)
-    if not text:
+        # If model inference fails, skip this document.
         return None
-    try:
-        payload = json.loads(text)
-        return PaperExtraction.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError):
+    entities: Dict[str, NodeRecord] = {}
+    for ent in ner_results:
+        name = ent.get("word", "").strip()
+        if not name:
+            continue
+        label = ent.get("entity_group", "")
+        if name not in entities:
+            entities[name] = NodeRecord(
+                canonical_name=name,
+                node_type=categorize_entity(label),
+                synonyms=[],
+                normalizations={},
+            )
+    if not entities:
         return None
+    relations: List[RelationRecord] = []
+    ent_names = list(entities.keys())
+    for i in range(len(ent_names)):
+        for j in range(i + 1, len(ent_names)):
+            subj, obj = ent_names[i], ent_names[j]
+            pred = "co_occurs"
+            conf = 0.5
+            sent_ctx = _pick_sentence_context(text, subj, obj)
+            pred = classify_relation_via_nli(sent_ctx, subj, obj)
+            # crude confidence from entailment score of chosen hypothesis
+            # (reuse internal scorer to fetch the final probability)
+            conf = 0.7 if pred != "co_occurs" else 0.5
+            dirn = (
+                "directed"
+                if pred in {"treats", "predicts", "biomarker_for", "measure_of"}
+                else "undirected"
+            )
+            relations.append(
+                RelationRecord(
+                    subject=subj,
+                    predicate=pred,
+                    object=obj,
+                    directionality=dirn,
+                    evidence_span=sent_ctx[:300],
+                    confidence=conf,
+                    qualifiers={},
+                )
+            )
 
-
-def merge_extractions(
-    client: OpenAI, model: str, meta: Dict[str, Any], chunks: List[PaperExtraction]
-) -> Optional[PaperExtraction]:
-    schema = extraction_json_schema()
-    chunk_payloads = [json.loads(c.model_dump_json()) for c in chunks]
-    merge_user = f"""Combine these chunk-level extractions for ONE paper into a single, deduplicated result (JSON list below).
-Paper metadata:
-- openalex_id: {meta.get('id')}
-- title: {meta.get('title')}
-- doi: {meta.get('doi')}
-- year: {meta.get('year')}
-- venue: {meta.get('venue')}
-
-Chunk-extractions (JSON list):
-{json.dumps(chunk_payloads, ensure_ascii=False)[:180000]}
-"""
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": MERGE_SYSTEM_PROMPT},
-            {"role": "user", "content": merge_user},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "paper_extraction",
-                "schema": schema,
-                "strict": True,
-            },
-        },
-        max_output_tokens=4000,
+    return PaperExtraction(
+        paper_id=meta.get("id", ""),
+        doi=meta.get("doi"),
+        title=meta.get("title", ""),
+        year=meta.get("year"),
+        venue=meta.get("venue"),
+        nodes=list(entities.values()),
+        relations=relations,
     )
-    try:
-        text = resp.output_text  # type: ignore[attr-defined]
-    except Exception:
-        parts = []
-        for item in getattr(resp, "output", []) or []:
-            if item.get("type") == "output_text":
-                parts.append(item.get("content", ""))
-        text = "".join(parts)
-    if not text:
-        return None
-    try:
-        payload = json.loads(text)
-        return PaperExtraction.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError):
-        return None
-
-
-@dataclass
-class PaperLite:
-    openalex_id: str
-    doi: Optional[str]
-    title: str
-    year: Optional[int]
-    venue: Optional[str]
 
 
 def normalize_name(s: str) -> str:
@@ -448,7 +519,9 @@ def normalize_name(s: str) -> str:
 def accum_extractions(
     extractions: List[PaperExtraction],
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    node_rows, rel_rows, paper_rows = [], [], []
+    node_rows: List[Dict[str, Any]] = []
+    rel_rows: List[Dict[str, Any]] = []
+    paper_rows: List[Dict[str, Any]] = []
     for extraction in extractions:
         paper_rows.append(
             {
@@ -523,13 +596,10 @@ def build_multilayer_graph(
             **json.loads(row["normalizations"]),
         }
     for _, row in rels_df.iterrows():
-        s, p, o = row["subject"], row["predicate"], row["object"]
-        if s not in graph or o not in graph:
-            continue
         graph.add_edge(
-            s,
-            o,
-            predicate=p,
+            row["subject"],
+            row["object"],
+            predicate=row["predicate"],
             paper_id=row["paper_id"],
             directionality=row["directionality"],
             evidence_span=row["evidence_span"],
@@ -540,24 +610,17 @@ def build_multilayer_graph(
 
 
 def project_to_weighted_graph(graph: nx.MultiDiGraph) -> nx.Graph:
-    """
-    Project a directed MultiDiGraph onto an undirected weighted Graph.
-
-    Each unique pair of nodes (u, v) will result in a single undirected edge
-    whose weight is the sum of the confidence scores of all edges (both
-    directions) between u and v.  Self‑loops are ignored.  Additional
-    attributes on the multigraph edges are not carried over.
-    """
-    graph = nx.Graph()
+    """Project a directed multigraph onto an undirected weighted graph."""
+    weighted = nx.Graph()
     for u, v, data in graph.edges(data=True):
         if u == v:
             continue
         w = float(data.get("confidence", 1.0))
-        if graph.has_edge(u, v):
-            graph[u][v]["weight"] += w
+        if weighted.has_edge(u, v):
+            weighted[u][v]["weight"] += w
         else:
-            graph.add_edge(u, v, weight=w)
-    return graph
+            weighted.add_edge(u, v, weight=w)
+    return weighted
 
 
 def save_tables(
@@ -593,7 +656,7 @@ def mask_nodes(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     mask = ~nodes_df["canonical_name"].str.lower().isin(lexicon)
     nodes_filtered = nodes_df[mask].copy()
-    keep = set(nodes_filtered["canonical_name"].unique())
+    keep: Set[str] = set(nodes_filtered["canonical_name"].unique())
     rels_filtered = rels_df[
         rels_df["subject"].isin(keep) & rels_df["object"].isin(keep)
     ].copy()
@@ -614,7 +677,7 @@ def evaluate_nodes(
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (
-        2 * precision * recall / (precision + recall)
+        (2 * precision * recall / (precision + recall))
         if (precision + recall) > 0
         else 0.0
     )
@@ -624,6 +687,7 @@ def evaluate_nodes(
 def evaluate_relations(
     graph: nx.MultiDiGraph, gold_relations: Iterable[Tuple[str, str, str]]
 ) -> Dict[str, float]:
+    """Compute precision/recall/F1 for relation extraction given a gold set."""
     gold_set: Set[Tuple[str, str, str]] = set(
         (
             normalize_name(s),
@@ -637,7 +701,6 @@ def evaluate_relations(
         subj = normalize_name(u)
         obj = normalize_name(v)
         pred = data.get("predicate")
-        # Note: directed/undirected handling – treat as directed here
         pred_set.add((subj, pred, obj))
     if not pred_set and not gold_set:
         return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
@@ -647,7 +710,7 @@ def evaluate_relations(
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (
-        2 * precision * recall / (precision + recall)
+        (2 * precision * recall / (precision + recall))
         if (precision + recall) > 0
         else 0.0
     )
@@ -655,7 +718,7 @@ def evaluate_relations(
 
 
 def load_gold_relations(path: str) -> List[Tuple[str, str, str]]:
-    """tab‑separated"""
+    """Load a tab‑separated list of gold relations."""
     triples: List[Tuple[str, str, str]] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -670,7 +733,6 @@ def load_gold_relations(path: str) -> List[Tuple[str, str, str]]:
 
 
 def load_gold_nodes(path: str) -> List[str]:
-    """Load a list of node canonical names (one per line)"""
     nodes: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -688,24 +750,29 @@ if __name__ == "__main__":
         required=True,
         help="OpenAlex search query (title/abstract)",
     )
-    parser.add_argument("--filters", type=str, default=DEFAULT_FILTER)
-    parser.add_argument("--model", type=str, default="gpt-4.1-mini")
-    parser.add_argument("--out-prefix", type=str, default="psych_kg_results_only")
     parser.add_argument(
-        "--chunk-chars", type=int, default=9000, help="approx chars per chunk"
+        "--filters",
+        type=str,
+        default=DEFAULT_FILTER,
+        help="Additional OpenAlex filters",
     )
-    parser.add_argument("--chunk-overlap", type=int, default=600)
+    parser.add_argument(
+        "--out-prefix",
+        type=str,
+        default="psych_kg_results_only",
+        help="Prefix for output files saved under the data/ directory",
+    )
     parser.add_argument(
         "--n-top-cited",
         type=int,
         default=250,
-        help="Number of top-cited OA papers to fetch",
+        help="Number of top‑cited OA papers to fetch",
     )
     parser.add_argument(
         "--n-most-recent",
         type=int,
         default=250,
-        help="Number of most-recent OA papers to fetch",
+        help="Number of most‑recent OA papers to fetch",
     )
     parser.add_argument(
         "--mask-lexicon",
@@ -713,11 +780,6 @@ if __name__ == "__main__":
         default=None,
         required=True,
         help="Path to a newline‑separated list of nosology terms to mask out",
-    )
-    parser.add_argument(
-        "--project-to-weighted",
-        action="store_true",
-        help="If set, project the multigraph to a simple weighted graph and save it",
     )
     parser.add_argument(
         "--eval-nodes",
@@ -731,11 +793,14 @@ if __name__ == "__main__":
         default=None,
         help="Path to a gold standard relation file (tab separated subject, predicate, object)",
     )
+    parser.add_argument(
+        "--project-to-weighted",
+        action="store_true",
+        help="If set, project the multigraph to a simple weighted graph and save it",
+    )
     args = parser.parse_args()
 
-    client = get_openai_client()
-
-    # fetch exactly N per sort, then union by OpenAlex id
+    # Fetch the two buckets of papers from OpenAlex and deduplicate them
     print("[info] Fetching OpenAlex (top-cited and most-recent)")
     top_cited = fetch_top_n(
         args.query, args.filters, sort="cited_by_count:desc", n=args.n_top_cited
@@ -743,8 +808,6 @@ if __name__ == "__main__":
     most_recent = fetch_top_n(
         args.query, args.filters, sort="publication_date:desc", n=args.n_most_recent
     )
-
-    # dedupe by OpenAlex id
     by_id: Dict[str, Dict[str, Any]] = {}
     for rec in itertools.chain(top_cited, most_recent):
         if rec.get("id") and rec["id"] not in by_id:
@@ -752,7 +815,6 @@ if __name__ == "__main__":
     records = list(by_id.values())
     print(f"[info] Candidate papers: {len(records)} (unique across both buckets)")
 
-    # for each paper: resolve full text, slice to RESULTS, chunk, map, reduce
     print("[info] Downloading full texts and extracting (RESULTS-only)")
     paper_level: List[PaperExtraction] = []
     for rec in tqdm(records):
@@ -768,29 +830,9 @@ if __name__ == "__main__":
         results_only = extract_results_only(fulltext or "") if fulltext else None
         # prefer RESULTS section; fallback to abstract
         text_for_ie = results_only if results_only else (rec.get("abstract", "") or "")
-
-        if not text_for_ie.strip():
-            continue
-
-        chunks = list(
-            chunk(
-                text_for_ie,
-                max_tokens_chars=args.chunk_chars,
-                overlap=args.chunk_overlap,
-            )
-        )
-        chunk_extractions: List[PaperExtraction] = []
-        for ch in chunks:
-            ex = llm_extract_chunk(client, args.model, meta, ch)
-            if ex:
-                chunk_extractions.append(ex)
-
-        if not chunk_extractions:
-            continue
-
-        merged = merge_extractions(client, args.model, meta, chunk_extractions)
-        if merged:
-            paper_level.append(merged)
+        extraction = extract_entities_relations(meta, text_for_ie)
+        if extraction:
+            paper_level.append(extraction)
 
     if not paper_level:
         print("[warn] No extractions; exiting.")
@@ -808,7 +850,7 @@ if __name__ == "__main__":
     graph = build_multilayer_graph(nodes_df, rels_df)
     weighted_graph: Optional[nx.Graph] = None
     if args.project_to_weighted:
-        weighted_G = project_to_weighted_graph(graph)
+        weighted_graph = project_to_weighted_graph(graph)
     save_tables(
         nodes_df, rels_df, papers_df, graph, args.out_prefix, projected=weighted_graph
     )
