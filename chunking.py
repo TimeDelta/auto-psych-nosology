@@ -1,7 +1,8 @@
 # chunking.py
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
 
 import tiktoken
 
@@ -13,6 +14,51 @@ class TextChunk:
     start_char: int
     end_char: int
     est_tokens: int
+
+
+# Compact default that delivers strong instruction-following quality while
+# staying runnable on 16 GB machines.
+DEFAULT_MODEL = "microsoft/Phi-3-mini-4k-instruct"
+
+FREE_MODEL_ENCODINGS: Dict[str, str] = {
+    DEFAULT_MODEL: "cl100k_base",
+    "google/gemma-2-2b-it": "cl100k_base",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": "cl100k_base",
+    "meta-llama/Meta-Llama-3.1-70B-Instruct": "cl100k_base",
+    "mistralai/Mistral-7B-Instruct-v0.2": "cl100k_base",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": "cl100k_base",
+    "Qwen/Qwen2.5-7B-Instruct": "cl100k_base",
+    "Qwen/Qwen2.5-72B-Instruct": "cl100k_base",
+}
+
+MODEL_CONTEXT_LIMITS: Dict[str, int] = {
+    "microsoft/Phi-3-mini-4k-instruct": 4096,
+    "google/gemma-2-2b-it": 8192,
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": 8192,
+    "meta-llama/Meta-Llama-3.1-70B-Instruct": 8192,
+    "mistralai/Mistral-7B-Instruct-v0.2": 8192,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 32768,
+    "Qwen/Qwen2.5-7B-Instruct": 32768,
+    "Qwen/Qwen2.5-72B-Instruct": 32768,
+}
+
+MODEL_ALIASES: Dict[str, str] = {k.lower(): k for k in FREE_MODEL_ENCODINGS}
+MODEL_ALIASES.update(
+    {
+        "phi-3-mini-4k-instruct": DEFAULT_MODEL,
+        "phi-3-mini": DEFAULT_MODEL,
+        "microsoft-phi-3-mini": DEFAULT_MODEL,
+        "llama-3.1-8b-instruct": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "llama-3.1-70b-instruct": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        "meta-llama-3.1-8b-instruct": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "meta-llama-3.1-70b-instruct": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        "gemma-2-2b-it": "google/gemma-2-2b-it",
+        "mistral-7b-instruct": "mistralai/Mistral-7B-Instruct-v0.2",
+        "mixtral-8x7b-instruct": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        "qwen2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
+        "qwen2.5-72b-instruct": "Qwen/Qwen2.5-72B-Instruct",
+    }
+)
 
 
 IMRAD_HEADINGS = [
@@ -35,12 +81,38 @@ SECTION_RE = re.compile("|".join(IMRAD_HEADINGS), flags=re.I | re.M)
 SENTENCE_RE = re.compile(r"(?<=\S[.!?])\s+(?=[A-Z(])")
 
 
-def estimate_tokens(s: str, model: str = "gpt-4.1-mini") -> int:
-    enc = (
-        tiktoken.encoding_for_model(model)
-        if hasattr(tiktoken, "encoding_for_model")
-        else tiktoken.get_encoding("cl100k_base")
-    )
+def resolve_model_name(model: Optional[str]) -> str:
+    """Return the canonical free model name, enforcing the allowlist."""
+
+    if not model:
+        return DEFAULT_MODEL
+    key = model.strip().lower()
+    if key in MODEL_ALIASES:
+        return MODEL_ALIASES[key]
+    supported = ", ".join(sorted(FREE_MODEL_ENCODINGS))
+    raise ValueError(f"Unsupported model '{model}'. Choose from: {supported}")
+
+
+@lru_cache(maxsize=None)
+def _load_encoder(canonical_model: str):
+    """Load and cache the tokenizer for one of the supported free models."""
+
+    encoding_name = FREE_MODEL_ENCODINGS[canonical_model]
+    if hasattr(tiktoken, "encoding_for_model"):
+        try:
+            return tiktoken.encoding_for_model(canonical_model)
+        except (KeyError, ValueError):
+            pass
+    return tiktoken.get_encoding(encoding_name)
+
+
+def get_tokenizer(model: Optional[str] = None):
+    canonical = resolve_model_name(model or DEFAULT_MODEL)
+    return _load_encoder(canonical)
+
+
+def estimate_tokens(s: str, model: str = DEFAULT_MODEL) -> int:
+    enc = get_tokenizer(model)
     return len(enc.encode(s))
 
 
@@ -65,13 +137,14 @@ def split_into_sections(full_text: str) -> List[Tuple[str, int, int]]:
 def pack_sentences(
     text: str,
     max_tokens: int,
-    model: str,
+    model: str = DEFAULT_MODEL,
     min_chunk_tokens: int = 300,
     overlap_sentences: int = 1,
 ) -> List[str]:
     """
     Sentence-bounded packing up to max_tokens, with sentence overlap.
     """
+    model = resolve_model_name(model)
     sents = SENTENCE_RE.split(text)
     chunks = []
     i = 0
@@ -96,7 +169,7 @@ def pack_sentences(
 
 def chunk(
     full_text: str,
-    model: str = "gpt-4.1-mini",
+    model: str = DEFAULT_MODEL,
     hard_token_limit: int = 7500,
     target_chunk_tokens: int = 2800,
 ) -> List[TextChunk]:
@@ -104,6 +177,16 @@ def chunk(
     Section-aware, sentence-bounded, token-aware chunking.
     Skips references/acknowledgments by default.
     """
+    canonical_model = resolve_model_name(model)
+    model_limit = MODEL_CONTEXT_LIMITS.get(canonical_model, hard_token_limit)
+    hard_limit = min(hard_token_limit, model_limit)
+    buffer_tokens = min(1000, max(200, hard_limit // 5))
+    if hard_limit <= buffer_tokens:
+        buffer_tokens = max(50, hard_limit // 10)
+    max_chunk_by_context = min(
+        max(200, hard_limit - buffer_tokens), max(50, hard_limit - 50)
+    )
+
     # normalize whitespace
     doc = re.sub(r"[ \t]+", " ", re.sub(r"\s+\n", "\n", full_text)).strip()
 
@@ -127,12 +210,15 @@ def chunk(
             tgt = int(target_chunk_tokens * 0.8)
 
         # never exceed model context
-        tgt = min(tgt, hard_token_limit - 1000)
+        tgt = min(tgt, max_chunk_by_context)
 
         for sub in pack_sentences(
-            sect_text, max_tokens=tgt, model=model, min_chunk_tokens=int(0.4 * tgt)
+            sect_text,
+            max_tokens=tgt,
+            model=canonical_model,
+            min_chunk_tokens=int(0.4 * tgt),
         ):
-            est = estimate_tokens(sub, model)
+            est = estimate_tokens(sub, canonical_model)
             # skip ultra-short noise
             if est < 120:
                 continue
@@ -156,7 +242,7 @@ def chunk(
                 text=doc[: min(len(doc), 15000)],
                 start_char=0,
                 end_char=min(len(doc), 15000),
-                est_tokens=estimate_tokens(doc[:15000], model),
+                est_tokens=estimate_tokens(doc[:15000], canonical_model),
             )
         ]
     return chunks
