@@ -400,7 +400,7 @@ def categorize_entity(label: str) -> str:
 
 
 _RELATION_MODE = "nli"
-_NLI_MODEL_NAME = "microsoft/deberta-base-mnli"
+_NLI_MODEL_NAME = "pritamdeka/PubMedBERT-MNLI-MedNLI"
 _nli_tok = None
 _nli_model = None
 _ID2LBL = {0: "contradiction", 1: "neutral", 2: "entailment"}
@@ -433,7 +433,7 @@ def _init_nli():
             _NLI_MODEL_NAME, token=None, local_files_only=False
         )
         _nli_model = AutoModelForSequenceClassification.from_pretrained(
-            _NLI_MODEL_NAME, token=None, local_files_only=False
+            _NLI_MODEL_NAME, token=None, use_safetensors=True
         )
         _nli_model.eval()
 
