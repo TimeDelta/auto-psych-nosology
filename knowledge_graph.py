@@ -114,7 +114,11 @@ DIAGNOSIS_MASK_LEXICON = {
 try:
     nltk.data.find("tokenizers/punkt")
 except LookupError:
-    nltk.download("punkt", quiet=True)
+    nltk.download("punkt")
+try:
+    nltk.data.find("punkt_tab")
+except:
+    nltk.download("punkt_tab")
 from nltk.tokenize import sent_tokenize
 
 
