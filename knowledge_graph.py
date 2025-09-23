@@ -400,7 +400,7 @@ def categorize_entity(label: str) -> str:
 
 
 _RELATION_MODE = "nli"
-_NLI_MODEL_NAME = "microsoft/deberta-v3-base-mnli"
+_NLI_MODEL_NAME = "microsoft/deberta-base-mnli"
 _nli_tok = None
 _nli_model = None
 _ID2LBL = {0: "contradiction", 1: "neutral", 2: "entailment"}
@@ -429,8 +429,12 @@ _REL_TEMPLATES_REV = {
 def _init_nli():
     global _nli_tok, _nli_model
     if _nli_tok is None or _nli_model is None:
-        _nli_tok = AutoTokenizer.from_pretrained(_NLI_MODEL_NAME)
-        _nli_model = AutoModelForSequenceClassification.from_pretrained(_NLI_MODEL_NAME)
+        _nli_tok = AutoTokenizer.from_pretrained(
+            _NLI_MODEL_NAME, token=None, local_files_only=False
+        )
+        _nli_model = AutoModelForSequenceClassification.from_pretrained(
+            _NLI_MODEL_NAME, token=None, local_files_only=False
+        )
         _nli_model.eval()
 
 
