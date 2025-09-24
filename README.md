@@ -1,10 +1,5 @@
 # Automated Psychiatric Nosology via Partitioning of Multiplex Graph Generated from Mining Scientific Papers for Findings
-A novel method for automating nosology creation (alternative to DSM, HiTOP and RDoC) based on mining findings from scientific papers into a multiplex graph then partitioning in a way that minimizes the number of bits required to represent the partitioning to create the dimensional classification scheme.
 
-Multiplex Graph Design
-- Node Types: symptoms, diagnoses, treatments, metrics and biomarkers
-- Edge Types: support for / against, prediction, co-occurrence, etc.
-- Edge property for the number of relevant papers
 
 ## Background / Literature Review
 Psychiatric nosology has long been dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM-5) and the International Classification of Diseases (ICD). These frameworks define discrete diagnostic entities and draw strict boundaries between normal and pathological states. However, their limitations are well established, including high comorbidity rates, arbitrary thresholds, and limited biological validity [1], [2]. Categorical standards such as DSM-5 impose rigid yes/no decisions regarding diagnosis [3], despite evidence from meta-analytic research indicating that most psychiatric disorders are better conceptualized as continuous spectra rather than binary categories [4]. These concerns have motivated the development of dimensional alternatives, notably the Hierarchical Taxonomy of Psychopathology (HiTOP) [3] and the Research Domain Criteria (RDoC) [5]. Each represents a unique effort to reconceptualize psychiatric nosology: HiTOP is symptom-driven and data-based, while RDoC is neuroscience-driven and theory-based. This review examines evidence from biomarkers, transdiagnostic dimensions, and computational models. Findings converge on the theme that psychiatric disorders are not discrete entities but reflect shared, transdiagnostic mechanisms with disorder-specific features sometimes co-occurring and thus are best represented dimensionally.
@@ -29,6 +24,11 @@ A clear gap remains. Despite converging evidence that categorical systems are in
 
 ## Methods
 By mining the scientific literature into a multiplex graph and partitioning it with information-theoretic methods, this project draws inspiration from generative modeling’s emphasis on latent structure while also addressing the critiques of purely data-driven ML. Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction. Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
+
+Multiplex Graph Design
+- Node Types: symptoms, diagnoses (will be ignored in partitioning), treatments, metrics and biomarkers
+- Edge Types: support for / against, prediction, co-occurrence, etc.
+- Edge property for the number of relevant papers
 
 ### Preventing Biased Alignment
 Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input data and the target taxonomies, terms are explicitly removed from the existing nosological systems before graph construction. A lexicon of DSM, ICD, RDoC and HiTOP terms is used to mask those tokens from the text prior to keyphrase extraction and edge formation. Nodes are then defined purely by content nouns and predicates extracted from scientific findings, and relation types are induced without any pre‑defined nosology labels. Only after the final partitioning is complete will the alignment metrics be computed such as normalized mutual information and adjusted rand index against HiTOP and RDoC categories. This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
