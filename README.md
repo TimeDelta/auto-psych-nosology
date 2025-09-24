@@ -35,6 +35,12 @@ Across biomarkers, dimensional models, and computational frameworks, a consisten
 
 A clear gap remains. Despite converging evidence that categorical systems are insufficient, there is currently no unified diagnostic standard that integrates biomarkers, dimensional constructs, and computational frameworks. Existing studies tend to focus on isolated modalities or conceptual frameworks, underscoring the need for integrative approaches that are biologically valid, clinically useful, and transdiagnostic in scope. This highlights the need for continued research into models that combine these strands into a biologically valid, parsimonious, and widely applicable classification system.
 
+## Research Question
+Can a proof-of-concept dimensional psychiatric nosology be developed in an automated way by mining the scientific literature into a multiplex knowledge graph and partitioning it using information-theoretic methods, and how does its structure compare with HiTOP and RDoC in terms of parsimony, stability, and alignment?
+
+## Hypothesis
+It can be developed in this way and the resulting nosology will roughly have parsimony (as measured by minimum description length) within 95% or better of, stability (as measured by bootstrapped variation of information and bootstrapped adjusted rand index) >= 85% of and alignment (as measured by normalized mutual information and adjusted rand index) >= 75% of HiTOP and RDoC. The parsimony will be so close to or better than HiTOP and RDoC due to the use of information-theoretic algorithms in the partitioning to optimize for compression. The stability will be high due to the large volume of papers expected to be parsed. The alignment will be reasonably high but not exact due to the vastly different methods in producing the final output (RDoC is mechanistically focused while HiTOP is focused on symptoms and this novel method will be automated).
+
 ## Methods
 By mining the scientific literature into a multiplex graph and partitioning it with information-theoretic methods, this project draws inspiration from generative modeling’s emphasis on latent structure while also addressing the critiques of purely data-driven ML. Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction. Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
@@ -45,12 +51,6 @@ Multiplex Graph Design
 
 ### Preventing Biased Alignment
 Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input data and the target taxonomies, terms are explicitly removed from the existing nosological systems before graph construction. A lexicon of DSM, ICD, RDoC and HiTOP terms is used to mask those tokens from the text prior to keyphrase extraction and edge formation. Nodes are then defined purely by content nouns and predicates extracted from scientific findings, and relation types are induced without any pre‑defined nosology labels. Only after the final partitioning is complete will the alignment metrics be computed such as normalized mutual information and adjusted rand index against HiTOP and RDoC categories. This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
-
-## Research Question
-Can a proof-of-concept dimensional psychiatric nosology be developed in an automated way by mining the scientific literature into a multiplex knowledge graph and partitioning it using information-theoretic methods, and how does its structure compare with HiTOP and RDoC in terms of parsimony, stability, and alignment?
-
-## Hypothesis
-It can be developed in this way and the resulting nosology will roughly have parsimony (as measured by minimum description length) within 95% or better of, stability (as measured by bootstrapped variation of information and bootstrapped adjusted rand index) >= 85% of and alignment (as measured by normalized mutual information and adjusted rand index) >= 75% of HiTOP and RDoC. The parsimony will be so close to or better than HiTOP and RDoC due to the use of information-theoretic algorithms in the partitioning to optimize for compression. The stability will be high due to the large volume of papers expected to be parsed. The alignment will be reasonably high but not exact due to the vastly different methods in producing the final output (RDoC is mechanistically focused while HiTOP is focused on symptoms and this novel method will be automated).
 
 ## Unanswered Questions
 - Which partitioning algorithms to test
