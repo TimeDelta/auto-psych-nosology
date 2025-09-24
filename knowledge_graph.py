@@ -35,6 +35,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import httpx
 import networkx as nx
 import nltk
+import numpy as np
 import pandas as pd
 import torch
 from bs4 import BeautifulSoup
@@ -667,6 +668,66 @@ def build_multilayer_graph(
     return graph
 
 
+PRIMITIVES = (str, int, float, bool)
+
+
+def coerce_for_graphml(v):
+    if v is None:
+        return ""
+    if isinstance(v, PRIMITIVES):
+        return v
+    if isinstance(v, (np.integer, np.floating, np.bool_)):
+        return v.item()
+    if isinstance(v, (list, tuple, set)):
+        try:
+            return json.dumps(list(v), ensure_ascii=False)
+        except Exception:
+            return ", ".join(map(str, v))
+    if isinstance(v, dict):
+        try:
+            return json.dumps(v, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(v)
+    if isinstance(v, type):  # classes / callables
+        return v.__name__
+    return str(v)
+
+
+def sanitize_graph_for_graphml(graph: nx.Graph) -> None:
+    # nodes
+    for _, data in graph.nodes(data=True):
+        for k in list(data.keys()):
+            data[k] = coerce_for_graphml(data[k])
+    # edges (multi or not)
+    if graph.is_multigraph():
+        for _, _, _, data in graph.edges(keys=True, data=True):
+            for k in list(data.keys()):
+                data[k] = coerce_for_graphml(data[k])
+    else:
+        for _, _, data in graph.edges(data=True):
+            for k in list(data.keys()):
+                data[k] = coerce_for_graphml(data[k])
+
+
+def find_non_primitive_attrs(graph: nx.Graph):
+    bad = []
+    for n, d in graph.nodes(data=True):
+        for k, v in d.items():
+            if not isinstance(v, PRIMITIVES) and v is not None:
+                bad.append(("node", n, k, type(v).__name__))
+    if graph.is_multigraph():
+        for u, v, key, d in graph.edges(keys=True, data=True):
+            for k, val in d.items():
+                if not isinstance(val, PRIMITIVES) and val is not None:
+                    bad.append(("edge", (u, v, key), k, type(val).__name__))
+    else:
+        for u, v, d in graph.edges(data=True):
+            for k, val in d.items():
+                if not isinstance(val, PRIMITIVES) and val is not None:
+                    bad.append(("edge", (u, v), k, type(val).__name__))
+    return bad
+
+
 def project_to_weighted_graph(graph: nx.MultiDiGraph) -> nx.Graph:
     """Project a directed multigraph onto an undirected weighted graph."""
     weighted = nx.Graph()
@@ -693,8 +754,10 @@ def save_tables(
     nodes_df.to_parquet(base.with_suffix(".nodes.parquet"))
     rels_df.to_parquet(base.with_suffix(".rels.parquet"))
     papers_df.to_parquet(base.with_suffix(".papers.parquet"))
+    sanitize_graph_for_graphml(graph)
     nx.write_graphml(graph, base.with_suffix(".graphml"))
     if projected is not None:
+        sanitize_graph_for_graphml(projected)
         nx.write_graphml(projected, base.with_suffix(".weighted.graphml"))
 
 
