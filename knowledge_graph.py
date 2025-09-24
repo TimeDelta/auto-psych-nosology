@@ -626,9 +626,12 @@ def build_multilayer_graph(
     """
     Construct a NetworkX MultiDiGraph from dataframes of nodes and relations.
 
-    Nodes are annotated with their most common node_type (by frequency of mentions), as well as merged synonyms and normalizations. Edges are
-    directed and store predicate, paper_id, directionality, evidence_span, confidence and qualifiers. Multiple edges between the same pair of
-    nodes are preserved by omitting an explicit key when calling ``add_edge``. NetworkX will assign unique keys automatically
+    Nodes are annotated with their most common node_type (by frequency of mentions),
+    as well as merged synonyms and normalizations. Edges are directed and store
+    predicate, paper_id, directionality, evidence_span, confidence and qualifiers.
+    Multiple edges between the same pair of nodes are preserved by omitting an
+    explicit key when calling ``add_edge``. NetworkX will assign unique keys
+    automatically
     """
     graph: nx.MultiDiGraph = nx.MultiDiGraph()
     # determine most frequent type per canonical name
