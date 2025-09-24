@@ -617,6 +617,17 @@ def accum_extractions(
     nodes_df = pd.DataFrame(node_rows).drop_duplicates()
     rels_df = pd.DataFrame(rel_rows).drop_duplicates()
     papers_df = pd.DataFrame(paper_rows).drop_duplicates()
+
+    if not rels_df.empty:
+        support = rels_df.groupby(
+            ["subject", "predicate", "object"], as_index=False
+        ).agg(
+            paper_ids=("paper_id", lambda s: sorted(set(s))),
+            n_papers=("paper_id", "nunique"),
+        )
+        rels_df = rels_df.merge(
+            support, on=["subject", "predicate", "object"], how="left"
+        )
     return nodes_df, rels_df, papers_df
 
 
@@ -667,6 +678,14 @@ def build_multilayer_graph(
             evidence_span=row["evidence_span"],
             confidence=float(row["confidence"]),
             qualifiers=json.loads(row["qualifiers"]),
+            n_papers=int(row.get("n_papers", 1) or 1),
+            paper_ids=(
+                row["paper_ids"]
+                if isinstance(row["paper_ids"], list)
+                else json.loads(row["paper_ids"])
+                if isinstance(row["paper_ids"], str)
+                else []
+            ),
         )
     return graph
 
