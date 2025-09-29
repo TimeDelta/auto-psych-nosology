@@ -54,7 +54,14 @@ Because the alignment metrics used to compare the emergent nosology with establi
 
 ## Unanswered Questions
 - Which partitioning algorithms to test
+    - hierarchical stochastic block model
     - If time allows, try to do something with self-compressing auto-encoders like my learning-to-learn project
+        - still use rGCN structure with latent dimensions #Nodes x #Communities (start w/ #Nodes)
+        - add Louizos et al. 2018 style L0 regularization
+        - add community gates to decide how many clusters survive
+        - add inter-cluster gates to decide which inter-cluster connections matter
+        - learn separate inter-cluster matrix per edge type
+        - maybe also model absent edges in order to help prevent trivial solutions like collapse of communities to all of one node type to one community for each node type
 
 ## References
 1. R. Kotov et al., “The Hierarchical Taxonomy of Psychopathology (HiTOP): A dimensional alternative to traditional nosologies,” J. Abnorm. Psychol., vol. 126, no. 4, pp. 454–477, 2017.
