@@ -691,6 +691,11 @@ def build_multilayer_graph(
 
 
 PRIMITIVES = (str, int, float, bool)
+_XML10_BAD = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+
+def _clean_str(s: str) -> str:
+    return _XML10_BAD.sub("", s)
 
 
 def coerce_for_graphml(v):
@@ -702,20 +707,27 @@ def coerce_for_graphml(v):
         return v.item()
     if isinstance(v, (list, tuple, set)):
         try:
-            return json.dumps(list(v), ensure_ascii=False)
+            return _clean_str(json.dumps(list(v), ensure_ascii=False, default=str))
         except Exception:
-            return ", ".join(map(str, v))
+            return _clean_str(", ".join(map(str, v)))
     if isinstance(v, dict):
         try:
             return json.dumps(v, ensure_ascii=False, sort_keys=True)
         except Exception:
-            return str(v)
+            return _clean_str(v)
     if isinstance(v, type):  # classes / callables
         return v.__name__
-    return str(v)
+    return _clean_str(v)
 
 
 def sanitize_graph_for_graphml(graph: nx.Graph) -> None:
+    # graph-level attributes
+    for k, v in list(graph.graph.items()):
+        new_k = _clean_str(str(k))
+        new_v = _coerce_for_graphml(v)
+        del graph.graph[k]
+        if new_v is not None:
+            graph.graph[new_k] = new_v
     # nodes
     for _, data in graph.nodes(data=True):
         for k in list(data.keys()):
