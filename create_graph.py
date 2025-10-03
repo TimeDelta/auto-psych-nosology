@@ -207,7 +207,7 @@ def fetch_openalex_page(
 ) -> Dict[str, Any]:
     """Fetch a single page of search results from OpenAlex."""
     params = {
-        "title_and_abstract.search": query,
+        "search": query,
         "filter": filters,
         "per_page": per_page,
         "cursor": cursor,
