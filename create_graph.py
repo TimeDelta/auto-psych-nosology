@@ -25,9 +25,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import os
 import pathlib
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -166,9 +168,20 @@ def extraction_json_schema() -> Dict[str, Any]:
     return PaperExtraction.model_json_schema()
 
 
-OPENALEX_ENDPOINT = "https://api.openalex.org/works"
+OPENALEX = "https://api.openalex.org"
 DEFAULT_FILTER = (
-    "from_publication_date:2010-01-01,primary_location.is_oa:true,language:en"
+    "from_publication_date:2015-10-03,"
+    "open_access.is_oa:true,"
+    "language:en,"
+    "concepts.id:C61535369"  # biological psychiatry
+)
+_CLIENT = httpx.Client(
+    base_url=OPENALEX,
+    headers={
+        "User-Agent": f"auto-psych-nosology/0.1",
+        "Accept": "application/json",
+    },
+    timeout=60.0,
 )
 DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -194,14 +207,18 @@ def fetch_openalex_page(
 ) -> Dict[str, Any]:
     """Fetch a single page of search results from OpenAlex."""
     params = {
-        "search": query,
+        "title_and_abstract.search": query,
         "filter": filters,
         "per_page": per_page,
         "cursor": cursor,
     }
     if sort:
         params["sort"] = sort
-    r = httpx.get(OPENALEX_ENDPOINT, params=params, timeout=60)
+    r = _CLIENT.get("/works", params=params)
+    if r.status_code != 200:
+        print("Status:", r.status_code)
+        print("Reason:", r.reason_phrase)
+        print("Body:", r.text)
     r.raise_for_status()
     return r.json()
 
@@ -690,75 +707,101 @@ def build_multilayer_graph(
     return graph
 
 
-PRIMITIVES = (str, int, float, bool)
-_XML10_BAD = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+PRIMITIVES = (int, float, bool)  # NOTE: str handled separately so we always clean it
+_XML10_BAD = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\uFFFE\uFFFF]")
 
 
 def _clean_str(s: str) -> str:
-    return _XML10_BAD.sub("", s)
+    if not isinstance(s, str):
+        s = str(s)
+    s = _XML10_BAD.sub(" ", s)
+    # re-encode to drop any stray surrogates
+    return s.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
 
-def coerce_for_graphml(v):
+def _json_clean(obj) -> str:
+    return _clean_str(json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str))
+
+
+def _coerce_for_graphml(v):
     if v is None:
         return ""
+    if isinstance(v, str):
+        return _clean_str(v)
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return ""
+    try:
+        import numpy as np
+
+        if isinstance(v, np.generic):
+            v = v.item()
+    except Exception:
+        pass
     if isinstance(v, PRIMITIVES):
         return v
-    if isinstance(v, (np.integer, np.floating, np.bool_)):
-        return v.item()
-    if isinstance(v, (list, tuple, set)):
-        try:
-            return _clean_str(json.dumps(list(v), ensure_ascii=False, default=str))
-        except Exception:
-            return _clean_str(", ".join(map(str, v)))
-    if isinstance(v, dict):
-        try:
-            return json.dumps(v, ensure_ascii=False, sort_keys=True)
-        except Exception:
-            return _clean_str(v)
-    if isinstance(v, type):  # classes / callables
+    if isinstance(v, (bytes, bytearray)):
+        return _clean_str(v.decode("utf-8", "ignore"))
+    if isinstance(v, (list, tuple, set, frozenset, Sequence)) and not isinstance(
+        v, (str, bytes, bytearray)
+    ):
+        return _json_clean(list(v))
+    if isinstance(v, Mapping):
+        return _json_clean(v)
+    if isinstance(v, type):
         return v.__name__
-    return _clean_str(v)
+    return _clean_str(str(v))
 
 
-def sanitize_graph_for_graphml(graph: nx.Graph) -> None:
+def sanitize_graph_for_graphml(graph):
     # graph-level attributes
     for k, v in list(graph.graph.items()):
         new_k = _clean_str(str(k))
         new_v = _coerce_for_graphml(v)
-        del graph.graph[k]
         if new_v is not None:
+            del graph.graph[k]
             graph.graph[new_k] = new_v
+
     # nodes
     for _, data in graph.nodes(data=True):
         for k in list(data.keys()):
-            data[k] = coerce_for_graphml(data[k])
+            data[_clean_str(str(k))] = _coerce_for_graphml(data[k])
+
     # edges (multi or not)
     if graph.is_multigraph():
         for _, _, _, data in graph.edges(keys=True, data=True):
             for k in list(data.keys()):
-                data[k] = coerce_for_graphml(data[k])
+                data[_clean_str(str(k))] = _coerce_for_graphml(data[k])
     else:
         for _, _, data in graph.edges(data=True):
             for k in list(data.keys()):
-                data[k] = coerce_for_graphml(data[k])
+                data[_clean_str(str(k))] = _coerce_for_graphml(data[k])
 
 
 def find_non_primitive_attrs(graph: nx.Graph):
     bad = []
+
+    def has_bad(s):
+        return isinstance(s, str) and _XML10_BAD.search(s) is not None
+
+    # graph attrs
+    for k, v in graph.graph.items():
+        if has_bad(k) or has_bad(v):
+            bad.append(("graph", k))
+    # node attrs
     for n, d in graph.nodes(data=True):
         for k, v in d.items():
-            if not isinstance(v, PRIMITIVES) and v is not None:
-                bad.append(("node", n, k, type(v).__name__))
-    if graph.is_multigraph():
-        for u, v, key, d in graph.edges(keys=True, data=True):
-            for k, val in d.items():
-                if not isinstance(val, PRIMITIVES) and val is not None:
-                    bad.append(("edge", (u, v, key), k, type(val).__name__))
-    else:
-        for u, v, d in graph.edges(data=True):
-            for k, val in d.items():
-                if not isinstance(val, PRIMITIVES) and val is not None:
-                    bad.append(("edge", (u, v), k, type(val).__name__))
+            if has_bad(k) or has_bad(v):
+                bad.append(("node", n, k))
+    # edge attrs
+    es = (
+        graph.edges(keys=True, data=True)
+        if graph.is_multigraph()
+        else graph.edges(data=True)
+    )
+    for *ends, d in es:
+        for k, v in d.items():
+            if has_bad(k) or has_bad(v):
+                bad.append(("edge", tuple(ends), k))
     return bad
 
 
