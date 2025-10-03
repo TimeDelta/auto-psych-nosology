@@ -413,8 +413,7 @@ def categorize_entity(label: str) -> str:
         return "Biomarker"
     if "BEHAVIOR" in lbl or "SYMPTOM" in lbl:
         return "Symptom"
-    # default fallback
-    return "Symptom"
+    return None
 
 
 _RELATION_MODE = "nli"
@@ -536,9 +535,12 @@ def extract_entities_relations(
             continue
         label = ent.get("entity_group", "")
         if name not in entities:
+            node_type = categorize_entity(label)
+            if not node_type:
+                continue
             entities[name] = NodeRecord(
                 canonical_name=name,
-                node_type=categorize_entity(label),
+                node_type=node_type,
                 synonyms=[],
                 normalizations={},
             )
