@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import logging
 import math
 import os
 import pathlib
@@ -301,6 +302,7 @@ def try_pmc_fulltext(pmcid: str) -> Optional[str]:
 
 
 def extract_text_from_pdf_bytes(content: bytes) -> Optional[str]:
+    _quiet_pdfminer_logs()
     try:
         text = pdf_extract_text(BytesIO(content))
         text = re.sub(r"\s+\n", "\n", text)
@@ -467,6 +469,22 @@ def _build_stanza_package_candidates() -> List[Any]:
 
 _STANZA_PIPELINES: List[Tuple[str, "stanza.Pipeline"]] = []
 _STANZA_PACKAGE_CANDIDATES = _build_stanza_package_candidates()
+_NER_EXCLUDE_TERMS = {
+    term.strip().lower()
+    for term in os.getenv(
+        "NER_EXCLUDE_TERMS",
+        "patient,patients,control,controls,participant,participants,subject,subjects",
+    ).split(",")
+    if term.strip()
+}
+
+
+def _quiet_pdfminer_logs() -> None:
+    """Mute noisy pdfminer warnings that clutter stderr."""
+    for name in ["pdfminer", "pdfminer.pdfcolor", "pdfminer.pdfinterp"]:
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
 
 
 def _stanza_use_gpu() -> bool:
@@ -774,6 +792,9 @@ def extract_entities_relations(
         else:
             name = ent.get("word", "").strip()
         if not name:
+            continue
+        name_low = name.lower().strip()
+        if name_low in _NER_EXCLUDE_TERMS:
             continue
         label = ent.get("entity_group", "")
         if name not in entities:
@@ -1214,7 +1235,13 @@ if __name__ == "__main__":
         "--n-most-recent",
         type=int,
         default=250,
-        help="Number of most‑recent OA papers to fetch",
+        help="Number of most-recent OA papers to fetch",
+    )
+    parser.add_argument(
+        "--fetch-buffer",
+        type=int,
+        default=5,
+        help="Extra works to over-fetch per bucket to compensate for duplicates",
     )
     parser.add_argument(
         "--eval-nodes",
@@ -1237,17 +1264,51 @@ if __name__ == "__main__":
 
     # Fetch the two buckets of papers from OpenAlex and deduplicate them
     print("[info] Fetching OpenAlex (top-cited and most-recent)")
-    top_cited = fetch_top_n(
-        args.query, args.filters, sort="cited_by_count:desc", n=args.n_top_cited
+    fetch_buffer = max(0, args.fetch_buffer)
+
+    def _fetch_bucket(
+        sort: str, base_n: int
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        full = fetch_top_n(
+            args.query,
+            args.filters,
+            sort=sort,
+            n=base_n + fetch_buffer,
+        )
+        return full[:base_n], full[base_n:]
+
+    top_primary, top_extra = _fetch_bucket("cited_by_count:desc", args.n_top_cited)
+    recent_primary, recent_extra = _fetch_bucket(
+        "publication_date:desc", args.n_most_recent
     )
-    most_recent = fetch_top_n(
-        args.query, args.filters, sort="publication_date:desc", n=args.n_most_recent
-    )
-    by_id: Dict[str, Dict[str, Any]] = {}
-    for rec in itertools.chain(top_cited, most_recent):
-        if rec.get("id") and rec["id"] not in by_id:
-            by_id[rec["id"]] = rec
-    records = list(by_id.values())
+
+    target_total = args.n_top_cited + args.n_most_recent
+    records: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+
+    def add_candidates(candidates: Iterable[Dict[str, Any]]) -> None:
+        for rec in candidates:
+            rid = rec.get("id")
+            if not rid or rid in seen_ids:
+                continue
+            records.append(rec)
+            seen_ids.add(rid)
+            if len(records) >= target_total:
+                return
+
+    add_candidates(top_primary)
+    add_candidates(recent_primary)
+    if len(records) < target_total:
+        add_candidates(top_extra)
+    if len(records) < target_total:
+        add_candidates(recent_extra)
+
+    if len(records) < target_total:
+        deficit = target_total - len(records)
+        print(
+            f"[warn] Only {len(records)} unique works found (short by {deficit}). "
+            "Increase --fetch-buffer or relax filters to retrieve more."
+        )
     print(f"[info] Candidate papers: {len(records)} (unique across both buckets)")
 
     print("[info] Downloading full texts and extracting (RESULTS-only)")
