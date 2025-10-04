@@ -1,5 +1,4 @@
 import argparse
-import html
 import json
 import pathlib
 from typing import Any, Dict, Iterable, Tuple
@@ -140,14 +139,11 @@ def export_visnetwork_html(
         label = str(attrs.get(node_label_attr, n))
         ntype = str(attrs.get(node_type_attr, "node"))
         color = pick_color(ntype, node_colors, DEFAULT_NODE_PALETTE)
-        title = "<br>".join(
-            [f"<b>{html.escape(str(label))}</b>"]
-            + [
-                f"<b>{html.escape(str(k))}</b>: {html.escape(str(v))}"
-                for k, v in sorted(attrs.items())
-                if k != node_label_attr
-            ]
+        title_lines = [str(label)]
+        title_lines.extend(
+            f"{k}: {v}" for k, v in sorted(attrs.items()) if k != node_label_attr
         )
+        title = "\n".join(title_lines)
         nodes.append(
             {
                 "id": str(n),
@@ -164,15 +160,8 @@ def export_visnetwork_html(
         for u, v, k, attrs in graph.edges(keys=True, data=True):
             etype = str(attrs.get(edge_type_attr, "edge"))
             color = pick_color(etype, edge_colors, DEFAULT_EDGE_PALETTE)
-            title = (
-                "<br>".join(
-                    [
-                        f"<b>{html.escape(str(kk))}</b>: {html.escape(str(vv))}"
-                        for kk, vv in sorted(attrs.items())
-                    ]
-                )
-                or etype
-            )
+            title_lines = [f"{kk}: {vv}" for kk, vv in sorted(attrs.items())]
+            title = "\n".join(title_lines) if title_lines else etype
             edges.append(
                 {
                     "id": f"{u}->{v}#{k}",
@@ -187,15 +176,8 @@ def export_visnetwork_html(
         for u, v, attrs in graph.edges(data=True):
             etype = str(attrs.get(edge_type_attr, "edge"))
             color = pick_color(etype, edge_colors, DEFAULT_EDGE_PALETTE)
-            title = (
-                "<br>".join(
-                    [
-                        f"<b>{html.escape(str(kk))}</b>: {html.escape(str(vv))}"
-                        for kk, vv in sorted(attrs.items())
-                    ]
-                )
-                or etype
-            )
+            title_lines = [f"{kk}: {vv}" for kk, vv in sorted(attrs.items())]
+            title = "\n".join(title_lines) if title_lines else etype
             edges.append(
                 {
                     "from": str(u),
