@@ -380,6 +380,7 @@ def extract_results_only(fulltext: str) -> Optional[str]:
         return None
     start = m.start()
     # find next section header after start
+    # TODO: probably good to include discussion, conclusion as well
     m2 = NEXT_SECTION_RE.search(doc, pos=start + 1)
     end = m2.start() if m2 else len(doc)
     chunk = doc[start:end].strip()
@@ -530,7 +531,15 @@ def extract_entities_relations(
         return None
     entities: Dict[str, NodeRecord] = {}
     for ent in ner_results:
-        name = ent.get("word", "").strip()
+        if (
+            "start" in ent
+            and "end" in ent
+            and ent["start"] is not None
+            and ent["end"] is not None
+        ):
+            name = text[ent["start"] : ent["end"]]
+        else:
+            name = ent.get("word", "").strip()
         if not name:
             continue
         label = ent.get("entity_group", "")
