@@ -14,6 +14,7 @@ readability-lxml
 scispacy
 spacy
 sentence-transformers
+stanza>=1.7.0
 torch
 tqdm
 transformers

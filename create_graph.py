@@ -39,13 +39,14 @@ import networkx as nx
 import nltk
 import numpy as np
 import pandas as pd
+import stanza
 import torch
 from bs4 import BeautifulSoup
 from pdfminer.high_level import extract_text as pdf_extract_text
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from readability import Document
 from tqdm import tqdm
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 NODE_TYPES: Set[str] = {
     "Symptom",
@@ -388,12 +389,59 @@ def extract_results_only(fulltext: str) -> Optional[str]:
     return chunk if len(chunk) > 400 else None
 
 
-# Aggregation strategy merges sub‑tokens into contiguous entities
-_ner_pipeline = pipeline(
-    "ner",
-    model="d4data/biomedical-ner-all",
-    aggregation_strategy="simple",
-)
+_STANZA_PIPELINE = None
+
+
+def _stanza_use_gpu() -> bool:
+    """Determine whether to enable GPU for Stanza based on availability and env."""
+    if os.getenv("STANZA_USE_GPU", "").strip() == "0":
+        return False
+    return torch.cuda.is_available()
+
+
+def _ensure_stanza_pipeline() -> "stanza.Pipeline":
+    """Build and cache a Stanza pipeline for English NER."""
+    global _STANZA_PIPELINE
+    if _STANZA_PIPELINE is not None:
+        return _STANZA_PIPELINE
+    lang = os.getenv("STANZA_LANG", "en")
+    processors = os.getenv("STANZA_PROCESSORS", "tokenize,ner")
+    package = os.getenv("STANZA_PACKAGE", "mimic")
+    download_kwargs = {"processors": processors, "verbose": False}
+    if package:
+        download_kwargs["package"] = package
+    try:
+        stanza.download(lang, **download_kwargs)
+    except Exception:
+        # Assume resources are already present or fall back silently.
+        pass
+    pipeline_kwargs = {
+        "processors": processors,
+        "use_gpu": _stanza_use_gpu(),
+        "verbose": False,
+    }
+    if package:
+        pipeline_kwargs["package"] = package
+    _STANZA_PIPELINE = stanza.Pipeline(lang, **pipeline_kwargs)
+    return _STANZA_PIPELINE
+
+
+def _ner_pipeline(text: str) -> List[Dict[str, Any]]:
+    doc = _ensure_stanza_pipeline()(text)
+    ents = getattr(doc, "ents", None)
+    if ents is None:
+        ents = getattr(doc, "entities", [])
+    results: List[Dict[str, Any]] = []
+    for ent in ents:
+        results.append(
+            {
+                "start": getattr(ent, "start_char", None),
+                "end": getattr(ent, "end_char", None),
+                "entity_group": getattr(ent, "type", ""),
+                "word": getattr(ent, "text", ""),
+            }
+        )
+    return results
 
 
 def categorize_entity(label: str) -> str:
@@ -514,7 +562,7 @@ def extract_entities_relations(
 ) -> Optional[PaperExtraction]:
     """Extract nodes and relations from a block of text using NER.
 
-    This function uses a HuggingFace NER pipeline to identify entity spans. It
+    This function uses a Stanza NER pipeline to identify entity spans. It
     collects unique entities, assigns a node type via `categorize_entity`, and
     builds a list of NodeRecord objects. Relations are generated in a naive
     fashion by connecting every distinct pair of entities found in the text with
