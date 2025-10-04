@@ -29,6 +29,7 @@ import math
 import os
 import pathlib
 import re
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
@@ -161,6 +162,27 @@ class PaperExtraction(BaseModel):
     venue: Optional[str] = None
     nodes: List[NodeRecord]
     relations: List[RelationRecord]
+
+
+@dataclass
+class NliScores:
+    entailment: float
+    neutral: float
+    contradiction: float
+
+    @property
+    def signal(self) -> float:
+        """Heuristic score favouring entailment while penalizing contradiction."""
+        return self.entailment - self.contradiction
+
+
+@dataclass
+class RelationInference:
+    label: str
+    entailment: float
+    score: float
+    margin: float
+    reverse_entailment: float = 0.0
 
 
 def extraction_json_schema() -> Dict[str, Any]:
@@ -389,7 +411,62 @@ def extract_results_only(fulltext: str) -> Optional[str]:
     return chunk if len(chunk) > 400 else None
 
 
-_STANZA_PIPELINE = None
+def _parse_stanza_package_spec(spec: str) -> Optional[Any]:
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    if any(ch in spec for ch in "=;,"):
+        cfg: Dict[str, str] = {}
+        for part in re.split(r"[;,]", spec):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            key, val = part.split("=", 1)
+            cfg[key.strip()] = val.strip()
+        return cfg or None
+    return spec
+
+
+def _build_stanza_package_candidates() -> List[Any]:
+    forced = os.getenv("STANZA_FORCE_PACKAGE", "").strip()
+    if forced:
+        parsed = _parse_stanza_package_spec(forced)
+        return [parsed] if parsed else []
+
+    tok_pkg = os.getenv("STANZA_TOKENIZE_PACKAGE", "").strip() or "default"
+    primary_ner = os.getenv("STANZA_NER_PACKAGE", "").strip() or "bc5cdr"
+    candidates: List[Any] = [{"tokenize": tok_pkg, "ner": primary_ner}]
+
+    extra_biomedical = [
+        pkg.strip()
+        for pkg in os.getenv(
+            "STANZA_BIOMED_PACKAGES",
+            "anatem|bc4chemd|bionlp13cg|jnlpba|linnaeus|ncbi_disease",
+        ).split("|")
+        if pkg.strip()
+    ]
+    for extra_pkg in extra_biomedical:
+        candidates.append({"tokenize": tok_pkg, "ner": extra_pkg})
+
+    extras = [
+        p.strip()
+        for p in os.getenv("STANZA_EXTRA_PACKAGES", "").split("|")
+        if p.strip()
+    ]
+    for extra in extras:
+        parsed = _parse_stanza_package_spec(extra)
+        if parsed and parsed not in candidates:
+            candidates.append(parsed)
+
+    # fallbacks to known biomedical-friendly packages
+    for fallback in ("craft", "mimic"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return candidates
+
+
+_STANZA_PIPELINES: List[Tuple[str, "stanza.Pipeline"]] = []
+_STANZA_PACKAGE_CANDIDATES = _build_stanza_package_candidates()
 
 
 def _stanza_use_gpu() -> bool:
@@ -399,49 +476,90 @@ def _stanza_use_gpu() -> bool:
     return torch.cuda.is_available()
 
 
-def _ensure_stanza_pipeline() -> "stanza.Pipeline":
-    """Build and cache a Stanza pipeline for English NER."""
-    global _STANZA_PIPELINE
-    if _STANZA_PIPELINE is not None:
-        return _STANZA_PIPELINE
+def _ensure_stanza_pipelines() -> List[Tuple[str, "stanza.Pipeline"]]:
+    """Build and cache Stanza pipelines for each biomedical NER package."""
+    global _STANZA_PIPELINES
+    if _STANZA_PIPELINES:
+        return _STANZA_PIPELINES
     lang = os.getenv("STANZA_LANG", "en")
     processors = os.getenv("STANZA_PROCESSORS", "tokenize,ner")
-    package = os.getenv("STANZA_PACKAGE", "mimic")
-    download_kwargs = {"processors": processors, "verbose": False}
-    if package:
-        download_kwargs["package"] = package
-    try:
-        stanza.download(lang, **download_kwargs)
-    except Exception:
-        # Assume resources are already present or fall back silently.
-        pass
-    pipeline_kwargs = {
-        "processors": processors,
-        "use_gpu": _stanza_use_gpu(),
-        "verbose": False,
-    }
-    if package:
-        pipeline_kwargs["package"] = package
-    _STANZA_PIPELINE = stanza.Pipeline(lang, **pipeline_kwargs)
-    return _STANZA_PIPELINE
+    for package in _STANZA_PACKAGE_CANDIDATES:
+        pkg_display = (
+            package
+            if isinstance(package, str)
+            else ", ".join(f"{k}={v}" for k, v in package.items())
+        )
+        download_kwargs = {"processors": processors, "verbose": False}
+        try:
+            if package:
+                download_kwargs["package"] = package
+            stanza.download(lang, **download_kwargs)
+        except Exception:
+            # some of the biomedical packages are bundled with the default
+            # Stanza distribution, the download step often raises even when
+            # the resources are already present locally
+            pass
+
+        pipeline_kwargs = {
+            "processors": processors,
+            "use_gpu": _stanza_use_gpu(),
+            "verbose": False,
+        }
+        if package:
+            pipeline_kwargs["package"] = package
+        try:
+            pipeline = stanza.Pipeline(lang, **pipeline_kwargs)
+            _STANZA_PIPELINES.append((pkg_display, pipeline))
+            warnings.warn(f"Using Stanza biomedical NER package {pkg_display}.")
+        except Exception as exc:
+            warnings.warn(
+                f"Stanza package {pkg_display} unavailable ({exc!r}); trying fallback."
+            )
+            continue
+
+    if not _STANZA_PIPELINES:
+        warnings.warn(
+            "Unable to initialise any Stanza biomedical NER package; extractions will be empty."
+        )
+    return _STANZA_PIPELINES
+
+
+def _stanza_entities(text: str) -> List[Dict[str, Any]]:
+    pipelines = _ensure_stanza_pipelines()
+    if not pipelines:
+        return []
+    results: List[Dict[str, Any]] = []
+    seen_spans: Set[Tuple[int, int, str]] = set()
+    for pkg_display, pipeline in pipelines:
+        doc = pipeline(text)
+        ents = getattr(doc, "ents", None)
+        if ents is None:
+            ents = getattr(doc, "entities", [])
+        for ent in ents:
+            start = getattr(ent, "start_char", None)
+            end = getattr(ent, "end_char", None)
+            label = getattr(ent, "type", "")
+            if start is not None and end is not None:
+                key = (start, end, label)
+                if key in seen_spans:
+                    continue
+                seen_spans.add(key)
+            results.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "entity_group": label,
+                    "word": getattr(ent, "text", ""),
+                    "source_package": pkg_display,
+                }
+            )
+    return results
 
 
 def _ner_pipeline(text: str) -> List[Dict[str, Any]]:
-    doc = _ensure_stanza_pipeline()(text)
-    ents = getattr(doc, "ents", None)
-    if ents is None:
-        ents = getattr(doc, "entities", [])
-    results: List[Dict[str, Any]] = []
-    for ent in ents:
-        results.append(
-            {
-                "start": getattr(ent, "start_char", None),
-                "end": getattr(ent, "end_char", None),
-                "entity_group": getattr(ent, "type", ""),
-                "word": getattr(ent, "text", ""),
-            }
-        )
-    return results
+    if not text.strip():
+        return []
+    return _stanza_entities(text)
 
 
 def categorize_entity(label: str) -> str:
@@ -454,15 +572,37 @@ def categorize_entity(label: str) -> str:
     default to 'Symptom'.
     """
     lbl = label.upper()
+    direct_map = {
+        "PROBLEM": "Symptom",
+        "FINDING": "Symptom",
+        "SIGN": "Symptom",
+        "DIAGNOSIS": "Diagnosis",
+        "TEST": "Measure",
+        "MEASUREMENT": "Measure",
+        "MEASURE": "Measure",
+        "ASSESSMENT": "Measure",
+        "LAB": "Measure",
+        "TREATMENT": "Treatment",
+        "PROCEDURE": "Treatment",
+        "THERAPY": "Treatment",
+        "MEDICATION": "Treatment",
+        "DEVICE": "Measure",
+        "ANATOMY": "Biomarker",
+        "ANATOMICAL": "Biomarker",
+    }
+    if lbl in direct_map:
+        return direct_map[lbl]
     if "DISEASE" in lbl or "DISORDER" in lbl or "SYNDROME" in lbl:
         return "Diagnosis"
     if "CHEMICAL" in lbl or "DRUG" in lbl or "MED" in lbl:
         return "Treatment"
-    if "GENE" in lbl or "PROTEIN" in lbl or "CELL" in lbl:
+    if "GENE" in lbl or "PROTEIN" in lbl or "CELL" in lbl or "BIOMARKER" in lbl:
         return "Biomarker"
     if "BEHAVIOR" in lbl or "SYMPTOM" in lbl:
         return "Symptom"
-    return None
+    if lbl in {"PERSON", "ORG", "ORGANIZATION", "LOCATION", "EVENT"}:
+        return None
+    return "Symptom"
 
 
 _RELATION_MODE = "nli"
@@ -492,6 +632,13 @@ _REL_TEMPLATES_REV = {
 }
 
 
+_REL_DIRECTION_PENALTY = float(os.getenv("RELATION_NLI_REVERSE_PENALTY", "0.5"))
+_REL_SCORE_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_SCORE", "0.05"))
+_REL_MARGIN_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_MARGIN", "0.04"))
+_REL_ENTAILMENT_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_ENT", "0.6"))
+_REL_REVERSE_GAP = float(os.getenv("RELATION_NLI_REVERSE_GAP", "0.05"))
+
+
 def _init_nli():
     global _nli_tok, _nli_model
     if _nli_tok is None or _nli_model is None:
@@ -504,15 +651,18 @@ def _init_nli():
         _nli_model.eval()
 
 
-def _nli_score(premise: str, hypothesis: str) -> float:
-    """Return entailment probability for (premise -> hypothesis)."""
+def _nli_probs(premise: str, hypothesis: str) -> NliScores:
+    """Return softmax probabilities over contradiction/neutral/entailment."""
     with torch.no_grad():
         enc = _nli_tok(
             premise, hypothesis, truncation=True, max_length=512, return_tensors="pt"
         )
-        out = _nli_model(**enc).logits.softmax(-1)[0]
-        # entailment index for MNLI heads is 2
-        return float(out[2].item())
+        probs = _nli_model(**enc).logits.softmax(-1)[0]
+    return NliScores(
+        entailment=float(probs[2].item()),
+        neutral=float(probs[1].item()),
+        contradiction=float(probs[0].item()),
+    )
 
 
 def _pick_sentence_context(text: str, s1: str, s2: str, window: int = 2) -> str:
@@ -534,27 +684,62 @@ def _pick_sentence_context(text: str, s1: str, s2: str, window: int = 2) -> str:
     return " ".join(sents[lo:hi])
 
 
-def classify_relation_via_nli(context: str, subj: str, obj: str) -> str:
-    """Return one of REL_TYPES using NLI templates; default to co_occurs."""
+def classify_relation_via_nli(context: str, subj: str, obj: str) -> RelationInference:
+    """Return relation prediction with metadata using NLI templates."""
     _init_nli()
-    # Score forward templates
-    scores = []
+    norm_context = context.strip()
+    if not norm_context:
+        return RelationInference(
+            label="co_occurs", entailment=0.0, score=0.0, margin=0.0
+        )
+
+    scored: List[Tuple[str, float, NliScores, Optional[NliScores]]] = []
     for rel, tmpl in _REL_TEMPLATES.items():
-        hyp = tmpl.format(SUBJ=subj, OBJ=obj)
-        scores.append((rel, _nli_score(context, hyp)))
-    # Penalize if reversed template is *more* entailed for directional ones
-    for rel, tmpl in _REL_TEMPLATES_REV.items():
-        hyp_rev = tmpl.format(SUBJ=subj, OBJ=obj)
-        rev = _nli_score(context, hyp_rev)
-        # subtract small penalty if reverse looks more likely
-        for i, (r, sc) in enumerate(scores):
-            if r == rel:
-                scores[i] = (r, sc - 0.1 * rev)
-                break
-    scores.sort(key=lambda x: x[1], reverse=True)
-    best_rel, best_p = scores[0]
-    # small acceptance threshold; otherwise fall back
-    return best_rel if best_p >= 0.55 else "co_occurs"
+        forward = _nli_probs(norm_context, tmpl.format(SUBJ=subj, OBJ=obj))
+        reverse: Optional[NliScores] = None
+        if rel in _REL_TEMPLATES_REV:
+            reverse = _nli_probs(
+                norm_context, _REL_TEMPLATES_REV[rel].format(SUBJ=subj, OBJ=obj)
+            )
+        score = forward.signal
+        if reverse is not None:
+            penalty = max(0.0, reverse.signal)
+            score -= _REL_DIRECTION_PENALTY * penalty
+        scored.append((rel, score, forward, reverse))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_rel, best_score, best_forward, best_reverse = scored[0]
+    runner_score = scored[1][1] if len(scored) > 1 else -1.0
+    margin = best_score - runner_score
+
+    reverse_entail = best_reverse.entailment if best_reverse else 0.0
+    directional_conflict = (
+        best_rel in _REL_TEMPLATES_REV
+        and best_reverse is not None
+        and (reverse_entail - best_forward.entailment) >= _REL_REVERSE_GAP
+    )
+
+    if (
+        best_forward.entailment < _REL_ENTAILMENT_THRESHOLD
+        or best_score < _REL_SCORE_THRESHOLD
+        or margin < _REL_MARGIN_THRESHOLD
+        or directional_conflict
+    ):
+        return RelationInference(
+            label="co_occurs",
+            entailment=best_forward.entailment,
+            score=best_score,
+            margin=max(0.0, margin),
+            reverse_entailment=reverse_entail,
+        )
+
+    return RelationInference(
+        label=best_rel,
+        entailment=best_forward.entailment,
+        score=best_score,
+        margin=margin,
+        reverse_entailment=reverse_entail,
+    )
 
 
 def extract_entities_relations(
@@ -615,10 +800,15 @@ def extract_entities_relations(
             pred = "co_occurs"
             conf = 0.5
             sent_ctx = _pick_sentence_context(text, subj, obj)
-            pred = classify_relation_via_nli(sent_ctx, subj, obj)
-            # crude confidence from entailment score of chosen hypothesis
-            # (reuse internal scorer to fetch the final probability)
-            conf = 0.7 if pred != "co_occurs" else 0.5
+            inference = classify_relation_via_nli(sent_ctx, subj, obj)
+            pred = inference.label
+            if pred == "co_occurs":
+                conf = 0.45
+            else:
+                conf = max(
+                    0.55,
+                    min(0.95, inference.entailment + 0.1 * inference.margin),
+                )
             dirn = (
                 "directed"
                 if pred in {"treats", "predicts", "biomarker_for", "measure_of"}
@@ -632,7 +822,14 @@ def extract_entities_relations(
                     directionality=dirn,
                     evidence_span=sent_ctx[:300],
                     confidence=conf,
-                    qualifiers={},
+                    qualifiers={
+                        "nli_entailment": round(inference.entailment, 4),
+                        "nli_margin": round(inference.margin, 4),
+                        "nli_reverse_entailment": round(
+                            inference.reverse_entailment, 4
+                        ),
+                        "nli_score": round(inference.score, 4),
+                    },
                 )
             )
 
