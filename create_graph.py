@@ -473,7 +473,7 @@ _NER_EXCLUDE_TERMS = {
     term.strip().lower()
     for term in os.getenv(
         "NER_EXCLUDE_TERMS",
-        "patient,patients,control,controls,participant,participants,subject,subjects",
+        "patient,patients,control,controls,participant,participants,subject,subjects,human,humans,donor,donors",
     ).split(",")
     if term.strip()
 }
