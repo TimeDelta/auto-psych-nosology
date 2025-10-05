@@ -773,12 +773,17 @@ def extract_entities_relations(
     not perform relation classification. Returns None if no entities are
     detected.
     """
+    paper_label = meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
     if not text.strip():
+        print(
+            f"[warn] Skipping paper {paper_label}: no text available after preprocessing."
+        )
         return None
     try:
         ner_results = _ner_pipeline(text)
-    except Exception:
+    except Exception as exc:
         # If model inference fails, skip this document.
+        print(f"[warn] Skipping paper {paper_label}: NER pipeline failed ({exc!r}).")
         return None
     entities: Dict[str, NodeRecord] = {}
     for ent in ner_results:
@@ -808,9 +813,11 @@ def extract_entities_relations(
                 normalizations={},
             )
     if not entities:
+        print(f"[warn] Skipping paper {paper_label}: no entities detected.")
         return None
     entities = {k: v for k, v in entities.items() if v.node_type != "Diagnosis"}
     if not entities:
+        print(f"[warn] Skipping paper {paper_label}: only Diagnosis entities detected.")
         return None
 
     relations: List[RelationRecord] = []
