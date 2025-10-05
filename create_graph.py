@@ -23,6 +23,7 @@ running for the first time).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import logging
@@ -32,7 +33,8 @@ import pathlib
 import re
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -178,6 +180,160 @@ class PaperExtraction(BaseModel):
     venue: Optional[str] = None
     nodes: List[NodeRecord]
     relations: List[RelationRecord]
+
+
+CHECKPOINT_ARG_KEYS = [
+    "query",
+    "filters",
+    "out_prefix",
+    "n_top_cited",
+    "n_most_recent",
+    "fetch_buffer",
+    "project_to_weighted",
+]
+
+
+@dataclass
+class CheckpointState:
+    records: Optional[List[Dict[str, Any]]] = None
+    extractions: List[PaperExtraction] = field(default_factory=list)
+    completed_ids: Set[str] = field(default_factory=set)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def _identifier_from_values(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+        elif value not in (None, ""):
+            candidate = str(value).strip()
+            if candidate:
+                return candidate
+    return ""
+
+
+def normalize_for_checkpoint(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [normalize_for_checkpoint(v) for v in value]
+    if isinstance(value, list):
+        return [normalize_for_checkpoint(v) for v in value]
+    if isinstance(value, pathlib.Path):
+        return str(value)
+    return value
+
+
+def checkpoint_record_id(meta: Mapping[str, Any]) -> str:
+    base = _identifier_from_values(
+        meta.get("id"),
+        meta.get("paper_id"),
+        meta.get("doi"),
+        meta.get("title"),
+    )
+    if base:
+        return base
+    try:
+        fallback = json.dumps(meta, sort_keys=True, default=str)
+    except TypeError:
+        fallback = repr(meta)
+    return hashlib.sha1(fallback.encode("utf-8")).hexdigest()
+
+
+def checkpoint_extraction_id(extraction: PaperExtraction) -> str:
+    base = _identifier_from_values(
+        extraction.paper_id,
+        extraction.doi,
+        extraction.title,
+    )
+    if base:
+        return base
+    fallback = json.dumps(
+        extraction.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha1(fallback.encode("utf-8")).hexdigest()
+
+
+def _coerce_relation_aliases(relations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    coerced: List[Dict[str, Any]] = []
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        if "object" not in rel and "obj" in rel:
+            rel = dict(rel)
+            rel["object"] = rel.pop("obj")
+        coerced.append(rel)
+    return coerced
+
+
+def load_checkpoint_state(path: pathlib.Path) -> Optional[CheckpointState]:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        print(f"[warn] Failed to read checkpoint at {path}: {exc}.")
+        return None
+
+    extractions: List[PaperExtraction] = []
+    raw_extractions = payload.get("extractions") or []
+    for idx, data in enumerate(raw_extractions):
+        try:
+            extractions.append(PaperExtraction.model_validate(data))
+        except ValidationError as exc:
+            if isinstance(data, dict) and "relations" in data:
+                fixed = dict(data)
+                try:
+                    fixed_relations = _coerce_relation_aliases(
+                        list(fixed.get("relations") or [])
+                    )
+                    fixed["relations"] = fixed_relations
+                    extractions.append(PaperExtraction.model_validate(fixed))
+                    continue
+                except Exception:
+                    pass
+            print(
+                f"[warn] Skipping extraction #{idx} in checkpoint due to validation error: {exc}"  # noqa: E501
+            )
+
+    completed_ids = set(payload.get("completed_ids") or [])
+    for extraction in extractions:
+        completed_ids.add(checkpoint_extraction_id(extraction))
+
+    records_obj = payload.get("records")
+    records: Optional[List[Dict[str, Any]]] = None
+    if isinstance(records_obj, list):
+        records = records_obj  # type: ignore[assignment]
+
+    metadata = payload.get("metadata") or {}
+    return CheckpointState(
+        records=records,
+        extractions=extractions,
+        completed_ids=completed_ids,
+        metadata=metadata,
+    )
+
+
+def save_checkpoint_state(path: pathlib.Path, state: CheckpointState) -> None:
+    metadata = dict(state.metadata or {})
+    metadata["last_saved"] = datetime.utcnow().isoformat() + "Z"
+    payload = {
+        "metadata": metadata,
+        "records": state.records,
+        "extractions": [
+            extraction.model_dump(mode="json", by_alias=True)
+            for extraction in state.extractions
+        ],
+        "completed_ids": sorted(state.completed_ids),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, default=str)
+    os.replace(tmp_path, path)
 
 
 @dataclass
@@ -1507,60 +1663,165 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, project the multigraph to a simple weighted graph and save it",
     )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to persist incremental extraction checkpoints. Defaults to "
+            "data/<out_prefix>_checkpoint.json."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=25,
+        help=(
+            "Save a checkpoint after this many new papers are attempted. "
+            "Set to 0 to disable periodic saves."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing checkpoint if available.",
+    )
     args = parser.parse_args()
 
-    # Fetch the two buckets of papers from OpenAlex and deduplicate them
-    print("[info] Fetching OpenAlex (top-cited and most-recent)")
-    fetch_buffer = max(0, args.fetch_buffer)
-
-    def _fetch_bucket(
-        sort: str, base_n: int
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        full = fetch_top_n(
-            args.query,
-            args.filters,
-            sort=sort,
-            n=base_n + fetch_buffer,
-        )
-        return full[:base_n], full[base_n:]
-
-    top_primary, top_extra = _fetch_bucket("cited_by_count:desc", args.n_top_cited)
-    recent_primary, recent_extra = _fetch_bucket(
-        "publication_date:desc", args.n_most_recent
+    checkpoint_path = (
+        pathlib.Path(args.checkpoint_path)
+        if args.checkpoint_path
+        else DATA_DIR / f"{args.out_prefix}_checkpoint.json"
     )
+    resume_state = load_checkpoint_state(checkpoint_path) if args.resume else None
+    if args.resume and resume_state is None:
+        print(f"[warn] No checkpoint found at {checkpoint_path}; starting fresh.")
 
-    target_total = args.n_top_cited + args.n_most_recent
-    records: List[Dict[str, Any]] = []
-    seen_ids: Set[str] = set()
-
-    def add_candidates(candidates: Iterable[Dict[str, Any]]) -> None:
-        for rec in candidates:
-            rid = rec.get("id")
-            if not rid or rid in seen_ids:
-                continue
-            records.append(rec)
-            seen_ids.add(rid)
-            if len(records) >= target_total:
-                return
-
-    add_candidates(top_primary)
-    add_candidates(recent_primary)
-    if len(records) < target_total:
-        add_candidates(top_extra)
-    if len(records) < target_total:
-        add_candidates(recent_extra)
-
-    if len(records) < target_total:
-        deficit = target_total - len(records)
-        print(
-            f"[warn] Only {len(records)} unique works found (short by {deficit}). "
-            "Increase --fetch-buffer or relax filters to retrieve more."
+    paper_level: List[PaperExtraction] = (
+        list(resume_state.extractions) if resume_state else []
+    )
+    completed_ids: Set[str] = set(resume_state.completed_ids) if resume_state else set()
+    records_from_checkpoint: Optional[List[Dict[str, Any]]] = (
+        resume_state.records if resume_state else None
+    )
+    if paper_level:
+        completed_ids.update(
+            checkpoint_extraction_id(extraction) for extraction in paper_level
         )
-    print(f"[info] Candidate papers: {len(records)} (unique across both buckets)")
+    if resume_state:
+        print(f"[info] Loaded {len(paper_level)} extracted papers from checkpoint.")
 
-    print("[info] Downloading full texts and extracting (RESULTS-only)")
-    paper_level: List[PaperExtraction] = []
+    checkpoint_metadata = (
+        dict(resume_state.metadata) if resume_state and resume_state.metadata else {}
+    )
+    checkpoint_metadata.setdefault("created_at", datetime.utcnow().isoformat() + "Z")
+    checkpoint_metadata["version"] = checkpoint_metadata.get("version", 1)
+    args_snapshot = {
+        key: normalize_for_checkpoint(getattr(args, key, None))
+        for key in CHECKPOINT_ARG_KEYS
+    }
+    checkpoint_metadata["args_snapshot"] = args_snapshot
+    checkpoint_metadata["checkpoint_interval"] = args.checkpoint_interval
+
+    if resume_state and resume_state.metadata:
+        prev_snapshot = resume_state.metadata.get("args_snapshot")
+        if prev_snapshot:
+            mismatched = [
+                key
+                for key in CHECKPOINT_ARG_KEYS
+                if normalize_for_checkpoint(prev_snapshot.get(key))
+                != args_snapshot.get(key)
+            ]
+            if mismatched:
+                print(
+                    "[warn] Checkpoint parameters differ for: "
+                    + ", ".join(sorted(mismatched))
+                    + ". Proceeding with current arguments."
+                )
+
+    checkpoint_interval = max(0, args.checkpoint_interval)
+    periodic_enabled = checkpoint_interval > 0
+
+    records: List[Dict[str, Any]]
+    if records_from_checkpoint is not None:
+        records = records_from_checkpoint
+        print(f"[info] Using {len(records)} candidate papers loaded from checkpoint.")
+    else:
+        print("[info] Fetching OpenAlex (top-cited and most-recent)")
+        fetch_buffer = max(0, args.fetch_buffer)
+
+        def _fetch_bucket(
+            sort: str, base_n: int
+        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            full = fetch_top_n(
+                args.query,
+                args.filters,
+                sort=sort,
+                n=base_n + fetch_buffer,
+            )
+            return full[:base_n], full[base_n:]
+
+        top_primary, top_extra = _fetch_bucket("cited_by_count:desc", args.n_top_cited)
+        recent_primary, recent_extra = _fetch_bucket(
+            "publication_date:desc", args.n_most_recent
+        )
+
+        target_total = args.n_top_cited + args.n_most_recent
+        records = []
+        seen_ids: Set[str] = set()
+
+        def add_candidates(candidates: Iterable[Dict[str, Any]]) -> None:
+            for rec in candidates:
+                rid = rec.get("id")
+                if not rid or rid in seen_ids:
+                    continue
+                records.append(rec)
+                seen_ids.add(rid)
+                if len(records) >= target_total:
+                    return
+
+        add_candidates(top_primary)
+        add_candidates(recent_primary)
+        if len(records) < target_total:
+            add_candidates(top_extra)
+        if len(records) < target_total:
+            add_candidates(recent_extra)
+
+        if len(records) < target_total:
+            deficit = target_total - len(records)
+            print(
+                f"[warn] Only {len(records)} unique works found (short by {deficit}). "
+                "Increase --fetch-buffer or relax filters to retrieve more."
+            )
+        print(f"[info] Candidate papers: {len(records)} (unique across both buckets)")
+
+    def persist_checkpoint(status: Optional[str] = None) -> None:
+        metadata = dict(checkpoint_metadata)
+        if status is not None:
+            metadata["status"] = status
+        save_checkpoint_state(
+            checkpoint_path,
+            CheckpointState(
+                records=list(records),
+                extractions=list(paper_level),
+                completed_ids=set(completed_ids),
+                metadata=metadata,
+            ),
+        )
+
+    if periodic_enabled or resume_state:
+        persist_checkpoint(status="resumed" if resume_state else "initialized")
+
+    print("[info] Downloading full texts and extracting (RESULTS and DISCUSSION only)")
+    attempted_since_checkpoint = 0
+    processed_new = 0
+    skipped_existing = 0
+
     for rec in tqdm(records):
+        rec_id = checkpoint_record_id(rec)
+        if rec_id in completed_ids:
+            skipped_existing += 1
+            continue
         meta = {
             "id": rec.get("id"),
             "doi": rec.get("doi"),
@@ -1568,20 +1829,46 @@ if __name__ == "__main__":
             "year": rec.get("year"),
             "venue": rec.get("venue"),
         }
+        try:
+            fulltext = resolve_text_and_download(rec)
+            study_sections = (
+                extract_results_and_discussion(fulltext or "") if fulltext else None
+            )
+            text_for_ie = (
+                study_sections if study_sections else (rec.get("abstract", "") or "")
+            )
+            extraction = extract_entities_relations(meta, text_for_ie)
+            if extraction:
+                paper_level.append(extraction)
+                processed_new += 1
+        except KeyboardInterrupt:
+            print("[warn] Interrupted by user; saving checkpoint before exit.")
+            persist_checkpoint(status="interrupted")
+            raise
+        except Exception as exc:
+            label = meta.get("title") or meta.get("id") or rec_id
+            print(
+                f"[error] Unexpected failure while processing '{label}': {exc}. Skipping."
+            )
+        finally:
+            completed_ids.add(rec_id)
+            attempted_since_checkpoint += 1
+            if periodic_enabled and attempted_since_checkpoint >= checkpoint_interval:
+                persist_checkpoint(status="running")
+                attempted_since_checkpoint = 0
 
-        fulltext = resolve_text_and_download(rec)
-        study_sections = (
-            extract_results_and_discussion(fulltext or "") if fulltext else None
+    if periodic_enabled and attempted_since_checkpoint > 0:
+        persist_checkpoint(status="running")
+
+    if skipped_existing:
+        print(
+            f"[info] Skipped {skipped_existing} papers already recorded in checkpoint."
         )
-        # prefer Results/Discussion sections; fallback to abstract
-        text_for_ie = (
-            study_sections if study_sections else (rec.get("abstract", "") or "")
-        )
-        extraction = extract_entities_relations(meta, text_for_ie)
-        if extraction:
-            paper_level.append(extraction)
+    if processed_new:
+        print(f"[info] Processed {processed_new} new papers in this run.")
 
     if not paper_level:
+        persist_checkpoint(status="empty")
         print("[warn] No extractions; exiting.")
         raise SystemExit(0)
 
@@ -1596,6 +1883,7 @@ if __name__ == "__main__":
     save_tables(
         nodes_df, rels_df, papers_df, graph, args.out_prefix, projected=weighted_graph
     )
+    persist_checkpoint(status="complete")
     if args.eval_nodes:
         gold_nodes = load_gold_nodes(args.eval_nodes)
         metrics = evaluate_nodes(nodes_df, gold_nodes)
