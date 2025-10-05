@@ -125,7 +125,19 @@ try:
     nltk.data.find("punkt_tab")
 except:
     nltk.download("punkt_tab")
+from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import sent_tokenize
+
+try:
+    nltk.data.find("corpora/wordnet")
+except LookupError:
+    nltk.download("wordnet")
+try:
+    nltk.data.find("corpora/omw-1.4")
+except LookupError:
+    nltk.download("omw-1.4")
+
+_LEMMATIZER = WordNetLemmatizer()
 
 
 class NodeRecord(BaseModel):
@@ -133,9 +145,12 @@ class NodeRecord(BaseModel):
     canonical_name: str = Field(
         ..., description="Primary name for the entity as used in the paper."
     )
+    lemma: str = Field(
+        ..., description="Singular, lowercase canonical key used for deduplication."
+    )
     node_type: str = Field(..., description=f"One of {sorted(list(NODE_TYPES))}")
     synonyms: List[str] = Field(default_factory=list)
-    normalizations: Dict[str, str] = Field(
+    normalizations: Dict[str, Any] = Field(
         default_factory=dict,
         description='UMLS or other dictionary normalizations, e.g. {"UMLS": "C0005586"}',
     )
@@ -793,41 +808,63 @@ def extract_entities_relations(
             and ent["start"] is not None
             and ent["end"] is not None
         ):
-            name = text[ent["start"] : ent["end"]]
+            raw_name = text[ent["start"] : ent["end"]]
         else:
-            name = ent.get("word", "").strip()
-        if not name:
+            raw_name = ent.get("word", "")
+        raw_name = _clean_entity_surface(raw_name)
+        if not raw_name:
             continue
-        name_low = name.lower().strip()
-        if name_low in _NER_EXCLUDE_TERMS:
+        if raw_name.lower() in _NER_EXCLUDE_TERMS:
             continue
-        label = ent.get("entity_group", "")
-        if name not in entities:
+        canonical_key = canonical_entity_key(raw_name)
+        if not canonical_key:
+            continue
+        canonical_display = canonical_entity_display(raw_name) or raw_name
+        record = entities.get(canonical_key)
+        if record is None:
+            label = ent.get("entity_group", "")
             node_type = categorize_entity(label)
             if not node_type:
                 continue
-            entities[name] = NodeRecord(
-                canonical_name=name,
+            record = NodeRecord(
+                canonical_name=canonical_display,
+                lemma=canonical_key,
                 node_type=node_type,
                 synonyms=[],
                 normalizations={},
             )
+            entities[canonical_key] = record
+        _update_record_forms(record, [raw_name, canonical_display])
     if not entities:
         print(f"[warn] Skipping paper {paper_label}: no entities detected.")
         return None
-    entities = {k: v for k, v in entities.items() if v.node_type != "Diagnosis"}
-    if not entities:
+    node_records = [rec for rec in entities.values() if rec.node_type != "Diagnosis"]
+    if not node_records:
         print(f"[warn] Skipping paper {paper_label}: only Diagnosis entities detected.")
         return None
 
+    node_records.sort(key=lambda r: r.canonical_name.lower())
+
+    def _surface_form(record: NodeRecord) -> str:
+        forms = record.normalizations.get("surface_forms", [])
+        if isinstance(forms, list):
+            for form in forms:
+                if form and form in text:
+                    return form
+        return record.canonical_name
+
+    surface_lookup = {rec.canonical_name: _surface_form(rec) for rec in node_records}
+
     relations: List[RelationRecord] = []
-    ent_names = list(entities.keys())
-    for i in range(len(ent_names)):
-        for j in range(i + 1, len(ent_names)):
-            subj, obj = ent_names[i], ent_names[j]
+    for i in range(len(node_records)):
+        for j in range(i + 1, len(node_records)):
+            subj = node_records[i].canonical_name
+            obj = node_records[j].canonical_name
             pred = "co_occurs"
             conf = 0.5
-            sent_ctx = _pick_sentence_context(text, subj, obj)
+            sent_ctx = _pick_sentence_context(
+                text, surface_lookup[subj], surface_lookup[obj]
+            )
             inference = classify_relation_via_nli(sent_ctx, subj, obj)
             pred = inference.label
             if pred == "co_occurs":
@@ -867,13 +904,112 @@ def extract_entities_relations(
         title=meta.get("title", ""),
         year=meta.get("year"),
         venue=meta.get("venue"),
-        nodes=list(entities.values()),
+        nodes=node_records,
         relations=relations,
     )
 
 
+_LEMMA_OVERRIDES = {
+    "antipsychotics": "antipsychotic",
+    "bacteria": "bacterium",
+    "criteria": "criterion",
+    "data": "data",
+    "diagnoses": "diagnosis",
+    "news": "news",
+    "research": "research",
+    "series": "series",
+    "species": "species",
+    "tumours": "tumor",
+    "tumors": "tumor",
+}
+
+_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _clean_entity_surface(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip())
+
+
+def _apply_case_pattern(original: str, base_lower: str) -> str:
+    if original.isupper():
+        return base_lower.upper()
+    if original.islower():
+        return base_lower
+    if original.istitle():
+        return base_lower.title()
+    return base_lower
+
+
+def _lemmatize_word(word: str) -> str:
+    if not word:
+        return word
+    lower = word.lower()
+    if word.isupper() and len(word) <= 4:
+        return word
+    if lower in _LEMMA_OVERRIDES:
+        return _apply_case_pattern(word, _LEMMA_OVERRIDES[lower])
+    noun = _LEMMATIZER.lemmatize(lower, pos="n")
+    verb = _LEMMATIZER.lemmatize(lower, pos="v")
+    adj = _LEMMATIZER.lemmatize(lower, pos="a")
+    candidates = [c for c in (noun, verb, adj) if c]
+    base = min(candidates, key=len, default=lower)
+    return _apply_case_pattern(word, base)
+
+
+def _lemmatize_text(text: str) -> str:
+    return _WORD_RE.sub(lambda m: _lemmatize_word(m.group(0)), text)
+
+
+def canonical_entity_key(name: str) -> str:
+    cleaned = _clean_entity_surface(name)
+    if not cleaned:
+        return ""
+    lemma = _lemmatize_text(cleaned.lower())
+    return re.sub(r"\s+", " ", lemma).strip()
+
+
+def canonical_entity_display(name: str) -> str:
+    cleaned = _clean_entity_surface(name)
+    if not cleaned:
+        return ""
+    lemma = _lemmatize_text(cleaned)
+    lemma = re.sub(r"\s+", " ", lemma).strip()
+    if not lemma:
+        return None
+    if lemma.islower() and re.search(r"[a-z]", lemma):
+        lemma = lemma[0].upper() + lemma[1:]
+    return lemma
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for item in items:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _update_record_forms(record: NodeRecord, candidates: Iterable[str]) -> None:
+    existing_forms = record.normalizations.get("surface_forms")
+    if isinstance(existing_forms, list):
+        forms = list(existing_forms)
+    else:
+        forms = [record.canonical_name]
+    forms.extend(candidates)
+    forms.append(record.canonical_name)
+    normalized_forms = _dedupe_preserve_order(forms)
+    record.normalizations["surface_forms"] = normalized_forms
+    record.synonyms = _dedupe_preserve_order(
+        list(record.synonyms)
+        + [f for f in normalized_forms if f != record.canonical_name]
+    )
+
+
 def normalize_name(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip())
+    return _clean_entity_surface(s)
 
 
 def accum_extractions(
@@ -896,6 +1032,7 @@ def accum_extractions(
             node_rows.append(
                 {
                     "paper_id": extraction.paper_id,
+                    "lemma": n.lemma,
                     "canonical_name": normalize_name(n.canonical_name),
                     "node_type": n.node_type,
                     "synonyms": json.dumps(n.synonyms, ensure_ascii=False),
@@ -969,6 +1106,8 @@ def build_multilayer_graph(
             **graph.nodes[name]["normalizations"],
             **json.loads(row["normalizations"]),
         }
+        if "lemma" in row and isinstance(row["lemma"], str) and row["lemma"]:
+            graph.nodes[name]["lemma"] = row["lemma"]
     for _, row in rels_df.iterrows():
         graph.add_edge(
             row["subject"],
