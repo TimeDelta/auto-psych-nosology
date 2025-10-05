@@ -943,11 +943,7 @@ def extract_entities_relations(
     if not entities:
         print(f"[warn] Skipping paper {paper_label}: no entities detected.")
         return None
-    node_records = [rec for rec in entities.values() if rec.node_type != "Diagnosis"]
-    if not node_records:
-        print(f"[warn] Skipping paper {paper_label}: only Diagnosis entities detected.")
-        return None
-
+    node_records = list(entities.values())
     node_records.sort(key=lambda r: r.canonical_name.lower())
 
     def _surface_form(record: NodeRecord) -> str:

@@ -118,13 +118,10 @@ Multiplex Graph Design
     1. Entailment (only Hugging Face part) for relations
 
 ### Preventing Biased Alignment
-Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input data and the target taxonomies, terms are explicitly removed from the existing nosological systems before graph construction.
-To prevent lexical bias from predefined diagnostic systems, this masking process operates after biomedical named-entity recognition.
-Entities identified as belonging to excluded categories—particularly Diagnosis—or matching known DSM, ICD, HiTOP, or RDoC terms are removed entirely before graph formation.
-This preserves semantically coherent nodes (e.g., symptoms, biomarkers, treatments) while ensuring that the resulting graph structure emerges independently of existing nosological vocabularies.
-This entity-level masking substantially reduces over-masking and yields more biologically meaningful connectivity patterns than a simple token-level method.
-Only after the final partitioning is complete will the alignment metrics be computed such as normalized mutual information and adjusted rand index against HiTOP and RDoC categories.
-This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
+Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input graph and the target taxonomies, nodes corresponding to existing nosological systems are explicitly removed from the graph before partitioning.
+They are left in the original graph in order to make alignment caluclations easier.
+This preserves semantically coherent nodes (symptoms, biomarkers, treatments, etc.) while keeping diagnostic labels available for later alignment checks and ensuring that the resulting graph structure emerges independently of existing nosological vocabularies.
+Only after the final partitioning is complete will alignment metrics such as normalized mutual information and adjusted Rand index be computed against HiTOP and RDoC categories, ensuring that any observed alignment reflects genuine structural similarity rather than trivial lexical overlap.
 
 ## Unanswered Questions
 - Which partitioning algorithms to test

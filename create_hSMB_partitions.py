@@ -108,10 +108,31 @@ def _extract_hierarchy(state: gt.NestedBlockState) -> Dict[str, Any]:
 
 
 def run_hsbm(
-    graph_path: Path, state_path: Path | None = None, deg_corr: bool = True
+    graph_path: Path,
+    state_path: Path | None = None,
+    deg_corr: bool = True,
+    ignore_node_types: set[str] | None = None,
 ) -> Dict[str, Any]:
     """Run hierarchical SBM inference and optionally persist the full state."""
     nx_graph = _load_graph(graph_path)
+    if ignore_node_types:
+        to_remove = [
+            node
+            for node, data in nx_graph.nodes(data=True)
+            if data.get("node_type") in ignore_node_types
+        ]
+        if to_remove:
+            LOGGER.info(
+                "Ignoring %d nodes with types: %s",
+                len(to_remove),
+                ", ".join(sorted(ignore_node_types)),
+            )
+            nx_graph.remove_nodes_from(to_remove)
+        if not nx_graph:
+            raise ValueError(
+                "All nodes were filtered out prior to partitioning. "
+                "Relax the ignore_node_types setting."
+            )
     g = _networkx_to_graphtool(nx_graph)
     state_args: Dict[str, Any] = {}
     if "weight" in g.edge_properties:
@@ -151,12 +172,25 @@ if __name__ == "__main__":
         default="INFO",
         help="Python logging level (default: INFO)",
     )
+    parser.add_argument(
+        "--keep-diagnoses",
+        action="store_true",
+        help="Include nodes labelled as Diagnosis when partitioning (ignored by default)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
 
     LOGGER.info("Running hierarchical SBM on %s", args.graph)
-    result = run_hsbm(args.graph, args.state_path, deg_corr=not args.no_deg_corr)
+    ignore_types = set()
+    if not args.keep_diagnoses:
+        ignore_types.add("Diagnosis")
+    result = run_hsbm(
+        args.graph,
+        args.state_path,
+        deg_corr=not args.no_deg_corr,
+        ignore_node_types=ignore_types or None,
+    )
     args.output.write_text(json.dumps(result, indent=2))
     LOGGER.info(
         "Saved hierarchy with %d levels to %s", len(result["levels"]), args.output
