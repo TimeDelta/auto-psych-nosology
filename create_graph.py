@@ -34,7 +34,7 @@ import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import httpx
 import networkx as nx
@@ -262,8 +262,17 @@ def fetch_openalex_page(
     return r.json()
 
 
-def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, Any]]:
-    """sort (cited_by_count:desc OR publication_date:desc)"""
+def _normalize_queries(query: Union[str, Sequence[str]]) -> List[str]:
+    if isinstance(query, str):
+        items = [q.strip() for q in query.split(";")]
+    else:
+        items = [str(q).strip() for q in query]
+    return [q for q in items if q]
+
+
+def _fetch_top_n_single(
+    query: str, filters: str, sort: str, n: int
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     cursor = "*"
     per_page = min(200, max(25, n))
@@ -289,6 +298,7 @@ def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, A
                     "primary_location": (w.get("primary_location") or {}),
                     "cited_by_count": w.get("cited_by_count"),
                     "publication_date": w.get("publication_date"),
+                    "search_query": query,
                 }
             )
             if len(out) >= n:
@@ -297,6 +307,19 @@ def fetch_top_n(query: str, filters: str, sort: str, n: int) -> List[Dict[str, A
         if not cursor:
             break
     return out
+
+
+def fetch_top_n(
+    query: Union[str, Sequence[str]], filters: str, sort: str, n: int
+) -> List[Dict[str, Any]]:
+    """Fetch up to ``n`` works for each search term and concatenate results."""
+    queries = _normalize_queries(query)
+    if not queries:
+        return []
+    results: List[Dict[str, Any]] = []
+    for term in queries:
+        results.extend(_fetch_top_n_single(term, filters, sort, n))
+    return results
 
 
 PMC_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -1413,7 +1436,7 @@ if __name__ == "__main__":
         "--query",
         type=str,
         required=True,
-        help="OpenAlex search query (title/abstract)",
+        help="OpenAlex search query (title/abstract). Use ';' to provide multiple terms",
     )
     parser.add_argument(
         "--filters",
