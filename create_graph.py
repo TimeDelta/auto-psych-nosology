@@ -425,30 +425,56 @@ def resolve_text_and_download(rec: Dict[str, Any]) -> Optional[str]:
 RESULTS_HDR_RE = re.compile(
     r"^\s*(results?|findings?|outcomes?)\s*[:\-]?\s*$", flags=re.I | re.M
 )
-NEXT_SECTION_RE = re.compile(
-    r"^\s*(discussion|conclusions?|limitations?|general discussion|overview|references?|acknowledg(e)?ments?|supplementary)\s*[:\-]?\s$",
+DISCUSSION_HDR_RE = re.compile(
+    r"^\s*(discussion|general discussion|discussion and conclusions?)\s*[:\-]?\s*$",
+    flags=re.I | re.M,
+)
+RESULTS_STOP_RE = re.compile(
+    r"^\s*(discussion|general discussion|conclusions?|limitations?|implications?|future directions?|overview|references?|acknowledg(e)?ments?|supplementary|appendix|materials?)\s*[:\-]?\s*$",
+    flags=re.I | re.M,
+)
+DISCUSSION_STOP_RE = re.compile(
+    r"^\s*(conclusions?|limitations?|implications?|future directions?|overview|references?|acknowledg(e)?ments?|supplementary|appendix|materials?)\s*[:\-]?\s*$",
     flags=re.I | re.M,
 )
 
 
-def extract_results_only(fulltext: str) -> Optional[str]:
-    """Heuristic: take the text from 'Results/Findings/Outcomes' to the next major section."""
+def _normalise_fulltext(text: str) -> str:
+    doc = re.sub(r"\r", "\n", text)
+    doc = re.sub(r"[ \t]+", " ", doc)
+    return doc
+
+
+def _extract_section(
+    doc: str, header_re: re.Pattern, stop_re: re.Pattern
+) -> Optional[str]:
+    match = header_re.search(doc)
+    if not match:
+        return None
+    start = match.start()
+    stop = stop_re.search(doc, pos=match.end())
+    while stop and stop.start() <= start:
+        stop = stop_re.search(doc, pos=stop.end())
+    end = stop.start() if stop else len(doc)
+    chunk = doc[start:end].strip()
+    return chunk if len(chunk) > 400 else None
+
+
+def extract_results_and_discussion(fulltext: str) -> Optional[str]:
+    """Heuristic: gather Results and Discussion sections when available."""
     if not fulltext:
         return None
-    # normalize newlines and collapse spaces
-    doc = re.sub(r"\r", "\n", fulltext)
-    doc = re.sub(r"[ \t]+", " ", doc)
-    m = RESULTS_HDR_RE.search(doc)
-    if not m:
-        return None
-    start = m.start()
-    # find next section header after start
-    # TODO: probably good to include discussion, conclusion as well
-    m2 = NEXT_SECTION_RE.search(doc, pos=start + 1)
-    end = m2.start() if m2 else len(doc)
-    chunk = doc[start:end].strip()
-    # avoid returning tiny strings that are likely noise
-    return chunk if len(chunk) > 400 else None
+    doc = _normalise_fulltext(fulltext)
+    sections: List[str] = []
+    results = _extract_section(doc, RESULTS_HDR_RE, RESULTS_STOP_RE)
+    if results:
+        sections.append(results)
+    discussion = _extract_section(doc, DISCUSSION_HDR_RE, DISCUSSION_STOP_RE)
+    if discussion:
+        sections.append(discussion)
+    if sections:
+        return "\n\n".join(sections)
+    return None
 
 
 def _parse_stanza_package_spec(spec: str) -> Optional[Any]:
@@ -1548,9 +1574,13 @@ if __name__ == "__main__":
         }
 
         fulltext = resolve_text_and_download(rec)
-        results_only = extract_results_only(fulltext or "") if fulltext else None
-        # prefer RESULTS section; fallback to abstract
-        text_for_ie = results_only if results_only else (rec.get("abstract", "") or "")
+        study_sections = (
+            extract_results_and_discussion(fulltext or "") if fulltext else None
+        )
+        # prefer Results/Discussion sections; fallback to abstract
+        text_for_ie = (
+            study_sections if study_sections else (rec.get("abstract", "") or "")
+        )
         extraction = extract_entities_relations(meta, text_for_ie)
         if extraction:
             paper_level.append(extraction)
