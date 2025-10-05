@@ -44,13 +44,24 @@ It can be developed in this way and the resulting nosology will roughly have par
 ## Methods
 By mining the scientific literature into a multiplex graph and partitioning it with information-theoretic methods, this project draws inspiration from generative modeling’s emphasis on latent structure while also addressing the critiques of purely data-driven ML. Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction. Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
+### Graph Creation
 Multiplex Graph Design
 - Node Types: symptoms, diagnoses (will be ignored in partitioning), treatments, metrics and biomarkers
 - Edge Types: support for / against, prediction, co-occurrence, etc.
 - Edge property for the number of relevant papers
 
+1. Specify queries (“bipolar disorder”, “major depressive disorder”, “schizoaffective disorder”, “anxiety disorder”, “PTSD”, “OCD”, “OCPD")
+1. Fetch text from OpenAlex (falling back to PMC) for top M most cited and N most recent papers for each query
+1. Pull out only results and discussion section
+1. Extraction process (via Biomedical Stanza and Hugging Face)
+    1. Tokenization
+    1. POS
+    1. NER for Nodes - NER exclusion terms
+    1. Lemmatization of found NER terms to ensure canonicalization of nodes
+    1. Entailment (only Hugging Face part) for relations
+
 ### Preventing Biased Alignment
-Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input data and the target taxonomies, terms are explicitly removed from the existing nosological systems before graph construction. To prevent lexical bias from predefined diagnostic systems, the masking process operates after biomedical named-entity recognition. Entities identified as belonging to excluded categories—particularly Diagnosis—or matching known DSM, ICD, HiTOP, or RDoC terms are removed entirely before graph formation. This preserves semantically coherent nodes (e.g., symptoms, biomarkers, treatments) while ensuring that the resulting graph structure emerges independently of existing nosological vocabularies. This entity-level masking substantially reduces over-masking and yields more biologically meaningful connectivity patterns than a simple token-level method. Only after the final partitioning is complete will the alignment metrics be computed such as normalized mutual information and adjusted rand index against HiTOP and RDoC categories. This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
+Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input data and the target taxonomies, terms are explicitly removed from the existing nosological systems before graph construction. To prevent lexical bias from predefined diagnostic systems, this masking process operates after biomedical named-entity recognition. Entities identified as belonging to excluded categories—particularly Diagnosis—or matching known DSM, ICD, HiTOP, or RDoC terms are removed entirely before graph formation. This preserves semantically coherent nodes (e.g., symptoms, biomarkers, treatments) while ensuring that the resulting graph structure emerges independently of existing nosological vocabularies. This entity-level masking substantially reduces over-masking and yields more biologically meaningful connectivity patterns than a simple token-level method. Only after the final partitioning is complete will the alignment metrics be computed such as normalized mutual information and adjusted rand index against HiTOP and RDoC categories. This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
 
 ## Unanswered Questions
 - Which partitioning algorithms to test
