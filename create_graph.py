@@ -25,10 +25,12 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import logging
 import math
 import os
 import pathlib
 import re
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
@@ -39,13 +41,14 @@ import networkx as nx
 import nltk
 import numpy as np
 import pandas as pd
+import stanza
 import torch
 from bs4 import BeautifulSoup
 from pdfminer.high_level import extract_text as pdf_extract_text
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from readability import Document
 from tqdm import tqdm
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 NODE_TYPES: Set[str] = {
     "Symptom",
@@ -122,7 +125,19 @@ try:
     nltk.data.find("punkt_tab")
 except:
     nltk.download("punkt_tab")
+from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import sent_tokenize
+
+try:
+    nltk.data.find("corpora/wordnet")
+except LookupError:
+    nltk.download("wordnet")
+try:
+    nltk.data.find("corpora/omw-1.4")
+except LookupError:
+    nltk.download("omw-1.4")
+
+_LEMMATIZER = WordNetLemmatizer()
 
 
 class NodeRecord(BaseModel):
@@ -130,9 +145,12 @@ class NodeRecord(BaseModel):
     canonical_name: str = Field(
         ..., description="Primary name for the entity as used in the paper."
     )
+    lemma: str = Field(
+        ..., description="Singular, lowercase canonical key used for deduplication."
+    )
     node_type: str = Field(..., description=f"One of {sorted(list(NODE_TYPES))}")
     synonyms: List[str] = Field(default_factory=list)
-    normalizations: Dict[str, str] = Field(
+    normalizations: Dict[str, Any] = Field(
         default_factory=dict,
         description='UMLS or other dictionary normalizations, e.g. {"UMLS": "C0005586"}',
     )
@@ -160,6 +178,27 @@ class PaperExtraction(BaseModel):
     venue: Optional[str] = None
     nodes: List[NodeRecord]
     relations: List[RelationRecord]
+
+
+@dataclass
+class NliScores:
+    entailment: float
+    neutral: float
+    contradiction: float
+
+    @property
+    def signal(self) -> float:
+        """Heuristic score favouring entailment while penalizing contradiction."""
+        return self.entailment - self.contradiction
+
+
+@dataclass
+class RelationInference:
+    label: str
+    entailment: float
+    score: float
+    margin: float
+    reverse_entailment: float = 0.0
 
 
 def extraction_json_schema() -> Dict[str, Any]:
@@ -278,6 +317,7 @@ def try_pmc_fulltext(pmcid: str) -> Optional[str]:
 
 
 def extract_text_from_pdf_bytes(content: bytes) -> Optional[str]:
+    _quiet_pdfminer_logs()
     try:
         text = pdf_extract_text(BytesIO(content))
         text = re.sub(r"\s+\n", "\n", text)
@@ -388,12 +428,171 @@ def extract_results_only(fulltext: str) -> Optional[str]:
     return chunk if len(chunk) > 400 else None
 
 
-# Aggregation strategy merges sub‑tokens into contiguous entities
-_ner_pipeline = pipeline(
-    "ner",
-    model="d4data/biomedical-ner-all",
-    aggregation_strategy="simple",
-)
+def _parse_stanza_package_spec(spec: str) -> Optional[Any]:
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    if any(ch in spec for ch in "=;,"):
+        cfg: Dict[str, str] = {}
+        for part in re.split(r"[;,]", spec):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            key, val = part.split("=", 1)
+            cfg[key.strip()] = val.strip()
+        return cfg or None
+    return spec
+
+
+def _build_stanza_package_candidates() -> List[Any]:
+    forced = os.getenv("STANZA_FORCE_PACKAGE", "").strip()
+    if forced:
+        parsed = _parse_stanza_package_spec(forced)
+        return [parsed] if parsed else []
+
+    tok_pkg = os.getenv("STANZA_TOKENIZE_PACKAGE", "").strip() or "default"
+    primary_ner = os.getenv("STANZA_NER_PACKAGE", "").strip() or "bc5cdr"
+    candidates: List[Any] = [{"tokenize": tok_pkg, "ner": primary_ner}]
+
+    extra_biomedical = [
+        pkg.strip()
+        for pkg in os.getenv(
+            "STANZA_BIOMED_PACKAGES",
+            "anatem|bc4chemd|bionlp13cg|jnlpba|linnaeus|ncbi_disease",
+        ).split("|")
+        if pkg.strip()
+    ]
+    for extra_pkg in extra_biomedical:
+        candidates.append({"tokenize": tok_pkg, "ner": extra_pkg})
+
+    extras = [
+        p.strip()
+        for p in os.getenv("STANZA_EXTRA_PACKAGES", "").split("|")
+        if p.strip()
+    ]
+    for extra in extras:
+        parsed = _parse_stanza_package_spec(extra)
+        if parsed and parsed not in candidates:
+            candidates.append(parsed)
+
+    # fallbacks to known biomedical-friendly packages
+    for fallback in ("craft", "mimic"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return candidates
+
+
+_STANZA_PIPELINES: List[Tuple[str, "stanza.Pipeline"]] = []
+_STANZA_PACKAGE_CANDIDATES = _build_stanza_package_candidates()
+_NER_EXCLUDE_TERMS = {
+    term.strip().lower()
+    for term in os.getenv(
+        "NER_EXCLUDE_TERMS",
+        "patient,patients,control,controls,participant,participants,subject,subjects,human,humans,donor,donors",
+    ).split(",")
+    if term.strip()
+}
+
+
+def _quiet_pdfminer_logs() -> None:
+    """Mute noisy pdfminer warnings that clutter stderr."""
+    for name in ["pdfminer", "pdfminer.pdfcolor", "pdfminer.pdfinterp"]:
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+
+
+def _stanza_use_gpu() -> bool:
+    """Determine whether to enable GPU for Stanza based on availability and env."""
+    if os.getenv("STANZA_USE_GPU", "").strip() == "0":
+        return False
+    return torch.cuda.is_available()
+
+
+def _ensure_stanza_pipelines() -> List[Tuple[str, "stanza.Pipeline"]]:
+    """Build and cache Stanza pipelines for each biomedical NER package."""
+    global _STANZA_PIPELINES
+    if _STANZA_PIPELINES:
+        return _STANZA_PIPELINES
+    lang = os.getenv("STANZA_LANG", "en")
+    processors = os.getenv("STANZA_PROCESSORS", "tokenize,ner")
+    for package in _STANZA_PACKAGE_CANDIDATES:
+        pkg_display = (
+            package
+            if isinstance(package, str)
+            else ", ".join(f"{k}={v}" for k, v in package.items())
+        )
+        download_kwargs = {"processors": processors, "verbose": False}
+        try:
+            if package:
+                download_kwargs["package"] = package
+            stanza.download(lang, **download_kwargs)
+        except Exception:
+            # some of the biomedical packages are bundled with the default
+            # Stanza distribution, the download step often raises even when
+            # the resources are already present locally
+            pass
+
+        pipeline_kwargs = {
+            "processors": processors,
+            "use_gpu": _stanza_use_gpu(),
+            "verbose": False,
+        }
+        if package:
+            pipeline_kwargs["package"] = package
+        try:
+            pipeline = stanza.Pipeline(lang, **pipeline_kwargs)
+            _STANZA_PIPELINES.append((pkg_display, pipeline))
+            warnings.warn(f"Using Stanza biomedical NER package {pkg_display}.")
+        except Exception as exc:
+            warnings.warn(
+                f"Stanza package {pkg_display} unavailable ({exc!r}); trying fallback."
+            )
+            continue
+
+    if not _STANZA_PIPELINES:
+        warnings.warn(
+            "Unable to initialise any Stanza biomedical NER package; extractions will be empty."
+        )
+    return _STANZA_PIPELINES
+
+
+def _stanza_entities(text: str) -> List[Dict[str, Any]]:
+    pipelines = _ensure_stanza_pipelines()
+    if not pipelines:
+        return []
+    results: List[Dict[str, Any]] = []
+    seen_spans: Set[Tuple[int, int, str]] = set()
+    for pkg_display, pipeline in pipelines:
+        doc = pipeline(text)
+        ents = getattr(doc, "ents", None)
+        if ents is None:
+            ents = getattr(doc, "entities", [])
+        for ent in ents:
+            start = getattr(ent, "start_char", None)
+            end = getattr(ent, "end_char", None)
+            label = getattr(ent, "type", "")
+            if start is not None and end is not None:
+                key = (start, end, label)
+                if key in seen_spans:
+                    continue
+                seen_spans.add(key)
+            results.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "entity_group": label,
+                    "word": getattr(ent, "text", ""),
+                    "source_package": pkg_display,
+                }
+            )
+    return results
+
+
+def _ner_pipeline(text: str) -> List[Dict[str, Any]]:
+    if not text.strip():
+        return []
+    return _stanza_entities(text)
 
 
 def categorize_entity(label: str) -> str:
@@ -406,15 +605,37 @@ def categorize_entity(label: str) -> str:
     default to 'Symptom'.
     """
     lbl = label.upper()
+    direct_map = {
+        "PROBLEM": "Symptom",
+        "FINDING": "Symptom",
+        "SIGN": "Symptom",
+        "DIAGNOSIS": "Diagnosis",
+        "TEST": "Measure",
+        "MEASUREMENT": "Measure",
+        "MEASURE": "Measure",
+        "ASSESSMENT": "Measure",
+        "LAB": "Measure",
+        "TREATMENT": "Treatment",
+        "PROCEDURE": "Treatment",
+        "THERAPY": "Treatment",
+        "MEDICATION": "Treatment",
+        "DEVICE": "Measure",
+        "ANATOMY": "Biomarker",
+        "ANATOMICAL": "Biomarker",
+    }
+    if lbl in direct_map:
+        return direct_map[lbl]
     if "DISEASE" in lbl or "DISORDER" in lbl or "SYNDROME" in lbl:
         return "Diagnosis"
     if "CHEMICAL" in lbl or "DRUG" in lbl or "MED" in lbl:
         return "Treatment"
-    if "GENE" in lbl or "PROTEIN" in lbl or "CELL" in lbl:
+    if "GENE" in lbl or "PROTEIN" in lbl or "CELL" in lbl or "BIOMARKER" in lbl:
         return "Biomarker"
     if "BEHAVIOR" in lbl or "SYMPTOM" in lbl:
         return "Symptom"
-    return None
+    if lbl in {"PERSON", "ORG", "ORGANIZATION", "LOCATION", "EVENT"}:
+        return None
+    return "Symptom"
 
 
 _RELATION_MODE = "nli"
@@ -444,6 +665,13 @@ _REL_TEMPLATES_REV = {
 }
 
 
+_REL_DIRECTION_PENALTY = float(os.getenv("RELATION_NLI_REVERSE_PENALTY", "0.5"))
+_REL_SCORE_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_SCORE", "0.05"))
+_REL_MARGIN_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_MARGIN", "0.04"))
+_REL_ENTAILMENT_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_ENT", "0.6"))
+_REL_REVERSE_GAP = float(os.getenv("RELATION_NLI_REVERSE_GAP", "0.05"))
+
+
 def _init_nli():
     global _nli_tok, _nli_model
     if _nli_tok is None or _nli_model is None:
@@ -456,15 +684,18 @@ def _init_nli():
         _nli_model.eval()
 
 
-def _nli_score(premise: str, hypothesis: str) -> float:
-    """Return entailment probability for (premise -> hypothesis)."""
+def _nli_probs(premise: str, hypothesis: str) -> NliScores:
+    """Return softmax probabilities over contradiction/neutral/entailment."""
     with torch.no_grad():
         enc = _nli_tok(
             premise, hypothesis, truncation=True, max_length=512, return_tensors="pt"
         )
-        out = _nli_model(**enc).logits.softmax(-1)[0]
-        # entailment index for MNLI heads is 2
-        return float(out[2].item())
+        probs = _nli_model(**enc).logits.softmax(-1)[0]
+    return NliScores(
+        entailment=float(probs[2].item()),
+        neutral=float(probs[1].item()),
+        contradiction=float(probs[0].item()),
+    )
 
 
 def _pick_sentence_context(text: str, s1: str, s2: str, window: int = 2) -> str:
@@ -486,27 +717,62 @@ def _pick_sentence_context(text: str, s1: str, s2: str, window: int = 2) -> str:
     return " ".join(sents[lo:hi])
 
 
-def classify_relation_via_nli(context: str, subj: str, obj: str) -> str:
-    """Return one of REL_TYPES using NLI templates; default to co_occurs."""
+def classify_relation_via_nli(context: str, subj: str, obj: str) -> RelationInference:
+    """Return relation prediction with metadata using NLI templates."""
     _init_nli()
-    # Score forward templates
-    scores = []
+    norm_context = context.strip()
+    if not norm_context:
+        return RelationInference(
+            label="co_occurs", entailment=0.0, score=0.0, margin=0.0
+        )
+
+    scored: List[Tuple[str, float, NliScores, Optional[NliScores]]] = []
     for rel, tmpl in _REL_TEMPLATES.items():
-        hyp = tmpl.format(SUBJ=subj, OBJ=obj)
-        scores.append((rel, _nli_score(context, hyp)))
-    # Penalize if reversed template is *more* entailed for directional ones
-    for rel, tmpl in _REL_TEMPLATES_REV.items():
-        hyp_rev = tmpl.format(SUBJ=subj, OBJ=obj)
-        rev = _nli_score(context, hyp_rev)
-        # subtract small penalty if reverse looks more likely
-        for i, (r, sc) in enumerate(scores):
-            if r == rel:
-                scores[i] = (r, sc - 0.1 * rev)
-                break
-    scores.sort(key=lambda x: x[1], reverse=True)
-    best_rel, best_p = scores[0]
-    # small acceptance threshold; otherwise fall back
-    return best_rel if best_p >= 0.55 else "co_occurs"
+        forward = _nli_probs(norm_context, tmpl.format(SUBJ=subj, OBJ=obj))
+        reverse: Optional[NliScores] = None
+        if rel in _REL_TEMPLATES_REV:
+            reverse = _nli_probs(
+                norm_context, _REL_TEMPLATES_REV[rel].format(SUBJ=subj, OBJ=obj)
+            )
+        score = forward.signal
+        if reverse is not None:
+            penalty = max(0.0, reverse.signal)
+            score -= _REL_DIRECTION_PENALTY * penalty
+        scored.append((rel, score, forward, reverse))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_rel, best_score, best_forward, best_reverse = scored[0]
+    runner_score = scored[1][1] if len(scored) > 1 else -1.0
+    margin = best_score - runner_score
+
+    reverse_entail = best_reverse.entailment if best_reverse else 0.0
+    directional_conflict = (
+        best_rel in _REL_TEMPLATES_REV
+        and best_reverse is not None
+        and (reverse_entail - best_forward.entailment) >= _REL_REVERSE_GAP
+    )
+
+    if (
+        best_forward.entailment < _REL_ENTAILMENT_THRESHOLD
+        or best_score < _REL_SCORE_THRESHOLD
+        or margin < _REL_MARGIN_THRESHOLD
+        or directional_conflict
+    ):
+        return RelationInference(
+            label="co_occurs",
+            entailment=best_forward.entailment,
+            score=best_score,
+            margin=max(0.0, margin),
+            reverse_entailment=reverse_entail,
+        )
+
+    return RelationInference(
+        label=best_rel,
+        entailment=best_forward.entailment,
+        score=best_score,
+        margin=margin,
+        reverse_entailment=reverse_entail,
+    )
 
 
 def extract_entities_relations(
@@ -514,7 +780,7 @@ def extract_entities_relations(
 ) -> Optional[PaperExtraction]:
     """Extract nodes and relations from a block of text using NER.
 
-    This function uses a HuggingFace NER pipeline to identify entity spans. It
+    This function uses a Stanza NER pipeline to identify entity spans. It
     collects unique entities, assigns a node type via `categorize_entity`, and
     builds a list of NodeRecord objects. Relations are generated in a naive
     fashion by connecting every distinct pair of entities found in the text with
@@ -522,12 +788,17 @@ def extract_entities_relations(
     not perform relation classification. Returns None if no entities are
     detected.
     """
+    paper_label = meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
     if not text.strip():
+        print(
+            f"[warn] Skipping paper {paper_label}: no text available after preprocessing."
+        )
         return None
     try:
         ner_results = _ner_pipeline(text)
-    except Exception:
+    except Exception as exc:
         # If model inference fails, skip this document.
+        print(f"[warn] Skipping paper {paper_label}: NER pipeline failed ({exc!r}).")
         return None
     entities: Dict[str, NodeRecord] = {}
     for ent in ner_results:
@@ -537,40 +808,72 @@ def extract_entities_relations(
             and ent["start"] is not None
             and ent["end"] is not None
         ):
-            name = text[ent["start"] : ent["end"]]
+            raw_name = text[ent["start"] : ent["end"]]
         else:
-            name = ent.get("word", "").strip()
-        if not name:
+            raw_name = ent.get("word", "")
+        raw_name = _clean_entity_surface(raw_name)
+        if not raw_name:
             continue
-        label = ent.get("entity_group", "")
-        if name not in entities:
+        if raw_name.lower() in _NER_EXCLUDE_TERMS:
+            continue
+        canonical_key = canonical_entity_key(raw_name)
+        if not canonical_key:
+            continue
+        canonical_display = canonical_entity_display(raw_name) or raw_name
+        record = entities.get(canonical_key)
+        if record is None:
+            label = ent.get("entity_group", "")
             node_type = categorize_entity(label)
             if not node_type:
                 continue
-            entities[name] = NodeRecord(
-                canonical_name=name,
+            record = NodeRecord(
+                canonical_name=canonical_display,
+                lemma=canonical_key,
                 node_type=node_type,
                 synonyms=[],
                 normalizations={},
             )
+            entities[canonical_key] = record
+        _update_record_forms(record, [raw_name, canonical_display])
     if not entities:
+        print(f"[warn] Skipping paper {paper_label}: no entities detected.")
         return None
-    entities = {k: v for k, v in entities.items() if v.node_type != "Diagnosis"}
-    if not entities:
+    node_records = [rec for rec in entities.values() if rec.node_type != "Diagnosis"]
+    if not node_records:
+        print(f"[warn] Skipping paper {paper_label}: only Diagnosis entities detected.")
         return None
 
+    node_records.sort(key=lambda r: r.canonical_name.lower())
+
+    def _surface_form(record: NodeRecord) -> str:
+        forms = record.normalizations.get("surface_forms", [])
+        if isinstance(forms, list):
+            for form in forms:
+                if form and form in text:
+                    return form
+        return record.canonical_name
+
+    surface_lookup = {rec.canonical_name: _surface_form(rec) for rec in node_records}
+
     relations: List[RelationRecord] = []
-    ent_names = list(entities.keys())
-    for i in range(len(ent_names)):
-        for j in range(i + 1, len(ent_names)):
-            subj, obj = ent_names[i], ent_names[j]
+    for i in range(len(node_records)):
+        for j in range(i + 1, len(node_records)):
+            subj = node_records[i].canonical_name
+            obj = node_records[j].canonical_name
             pred = "co_occurs"
             conf = 0.5
-            sent_ctx = _pick_sentence_context(text, subj, obj)
-            pred = classify_relation_via_nli(sent_ctx, subj, obj)
-            # crude confidence from entailment score of chosen hypothesis
-            # (reuse internal scorer to fetch the final probability)
-            conf = 0.7 if pred != "co_occurs" else 0.5
+            sent_ctx = _pick_sentence_context(
+                text, surface_lookup[subj], surface_lookup[obj]
+            )
+            inference = classify_relation_via_nli(sent_ctx, subj, obj)
+            pred = inference.label
+            if pred == "co_occurs":
+                conf = 0.45
+            else:
+                conf = max(
+                    0.55,
+                    min(0.95, inference.entailment + 0.1 * inference.margin),
+                )
             dirn = (
                 "directed"
                 if pred in {"treats", "predicts", "biomarker_for", "measure_of"}
@@ -584,7 +887,14 @@ def extract_entities_relations(
                     directionality=dirn,
                     evidence_span=sent_ctx[:300],
                     confidence=conf,
-                    qualifiers={},
+                    qualifiers={
+                        "nli_entailment": round(inference.entailment, 4),
+                        "nli_margin": round(inference.margin, 4),
+                        "nli_reverse_entailment": round(
+                            inference.reverse_entailment, 4
+                        ),
+                        "nli_score": round(inference.score, 4),
+                    },
                 )
             )
 
@@ -594,13 +904,112 @@ def extract_entities_relations(
         title=meta.get("title", ""),
         year=meta.get("year"),
         venue=meta.get("venue"),
-        nodes=list(entities.values()),
+        nodes=node_records,
         relations=relations,
     )
 
 
+_LEMMA_OVERRIDES = {
+    "antipsychotics": "antipsychotic",
+    "bacteria": "bacterium",
+    "criteria": "criterion",
+    "data": "data",
+    "diagnoses": "diagnosis",
+    "news": "news",
+    "research": "research",
+    "series": "series",
+    "species": "species",
+    "tumours": "tumor",
+    "tumors": "tumor",
+}
+
+_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _clean_entity_surface(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip())
+
+
+def _apply_case_pattern(original: str, base_lower: str) -> str:
+    if original.isupper():
+        return base_lower.upper()
+    if original.islower():
+        return base_lower
+    if original.istitle():
+        return base_lower.title()
+    return base_lower
+
+
+def _lemmatize_word(word: str) -> str:
+    if not word:
+        return word
+    lower = word.lower()
+    if word.isupper() and len(word) <= 4:
+        return word
+    if lower in _LEMMA_OVERRIDES:
+        return _apply_case_pattern(word, _LEMMA_OVERRIDES[lower])
+    noun = _LEMMATIZER.lemmatize(lower, pos="n")
+    verb = _LEMMATIZER.lemmatize(lower, pos="v")
+    adj = _LEMMATIZER.lemmatize(lower, pos="a")
+    candidates = [c for c in (noun, verb, adj) if c]
+    base = min(candidates, key=len, default=lower)
+    return _apply_case_pattern(word, base)
+
+
+def _lemmatize_text(text: str) -> str:
+    return _WORD_RE.sub(lambda m: _lemmatize_word(m.group(0)), text)
+
+
+def canonical_entity_key(name: str) -> str:
+    cleaned = _clean_entity_surface(name)
+    if not cleaned:
+        return ""
+    lemma = _lemmatize_text(cleaned.lower())
+    return re.sub(r"\s+", " ", lemma).strip()
+
+
+def canonical_entity_display(name: str) -> str:
+    cleaned = _clean_entity_surface(name)
+    if not cleaned:
+        return ""
+    lemma = _lemmatize_text(cleaned)
+    lemma = re.sub(r"\s+", " ", lemma).strip()
+    if not lemma:
+        return None
+    if lemma.islower() and re.search(r"[a-z]", lemma):
+        lemma = lemma[0].upper() + lemma[1:]
+    return lemma
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for item in items:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _update_record_forms(record: NodeRecord, candidates: Iterable[str]) -> None:
+    existing_forms = record.normalizations.get("surface_forms")
+    if isinstance(existing_forms, list):
+        forms = list(existing_forms)
+    else:
+        forms = [record.canonical_name]
+    forms.extend(candidates)
+    forms.append(record.canonical_name)
+    normalized_forms = _dedupe_preserve_order(forms)
+    record.normalizations["surface_forms"] = normalized_forms
+    record.synonyms = _dedupe_preserve_order(
+        list(record.synonyms)
+        + [f for f in normalized_forms if f != record.canonical_name]
+    )
+
+
 def normalize_name(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip())
+    return _clean_entity_surface(s)
 
 
 def accum_extractions(
@@ -623,6 +1032,7 @@ def accum_extractions(
             node_rows.append(
                 {
                     "paper_id": extraction.paper_id,
+                    "lemma": n.lemma,
                     "canonical_name": normalize_name(n.canonical_name),
                     "node_type": n.node_type,
                     "synonyms": json.dumps(n.synonyms, ensure_ascii=False),
@@ -696,6 +1106,8 @@ def build_multilayer_graph(
             **graph.nodes[name]["normalizations"],
             **json.loads(row["normalizations"]),
         }
+        if "lemma" in row and isinstance(row["lemma"], str) and row["lemma"]:
+            graph.nodes[name]["lemma"] = row["lemma"]
     for _, row in rels_df.iterrows():
         graph.add_edge(
             row["subject"],
@@ -969,7 +1381,13 @@ if __name__ == "__main__":
         "--n-most-recent",
         type=int,
         default=250,
-        help="Number of most‑recent OA papers to fetch",
+        help="Number of most-recent OA papers to fetch",
+    )
+    parser.add_argument(
+        "--fetch-buffer",
+        type=int,
+        default=5,
+        help="Extra works to over-fetch per bucket to compensate for duplicates",
     )
     parser.add_argument(
         "--eval-nodes",
@@ -992,17 +1410,51 @@ if __name__ == "__main__":
 
     # Fetch the two buckets of papers from OpenAlex and deduplicate them
     print("[info] Fetching OpenAlex (top-cited and most-recent)")
-    top_cited = fetch_top_n(
-        args.query, args.filters, sort="cited_by_count:desc", n=args.n_top_cited
+    fetch_buffer = max(0, args.fetch_buffer)
+
+    def _fetch_bucket(
+        sort: str, base_n: int
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        full = fetch_top_n(
+            args.query,
+            args.filters,
+            sort=sort,
+            n=base_n + fetch_buffer,
+        )
+        return full[:base_n], full[base_n:]
+
+    top_primary, top_extra = _fetch_bucket("cited_by_count:desc", args.n_top_cited)
+    recent_primary, recent_extra = _fetch_bucket(
+        "publication_date:desc", args.n_most_recent
     )
-    most_recent = fetch_top_n(
-        args.query, args.filters, sort="publication_date:desc", n=args.n_most_recent
-    )
-    by_id: Dict[str, Dict[str, Any]] = {}
-    for rec in itertools.chain(top_cited, most_recent):
-        if rec.get("id") and rec["id"] not in by_id:
-            by_id[rec["id"]] = rec
-    records = list(by_id.values())
+
+    target_total = args.n_top_cited + args.n_most_recent
+    records: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+
+    def add_candidates(candidates: Iterable[Dict[str, Any]]) -> None:
+        for rec in candidates:
+            rid = rec.get("id")
+            if not rid or rid in seen_ids:
+                continue
+            records.append(rec)
+            seen_ids.add(rid)
+            if len(records) >= target_total:
+                return
+
+    add_candidates(top_primary)
+    add_candidates(recent_primary)
+    if len(records) < target_total:
+        add_candidates(top_extra)
+    if len(records) < target_total:
+        add_candidates(recent_extra)
+
+    if len(records) < target_total:
+        deficit = target_total - len(records)
+        print(
+            f"[warn] Only {len(records)} unique works found (short by {deficit}). "
+            "Increase --fetch-buffer or relax filters to retrieve more."
+        )
     print(f"[info] Candidate papers: {len(records)} (unique across both buckets)")
 
     print("[info] Downloading full texts and extracting (RESULTS-only)")
