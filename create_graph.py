@@ -30,6 +30,8 @@ import math
 import os
 import pathlib
 import re
+import threading
+import time
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -222,6 +224,61 @@ _CLIENT = httpx.Client(
     },
     timeout=60.0,
 )
+_OPENALEX_LOCK = threading.Lock()
+_LAST_OPENALEX_REQUEST = 0.0
+_OPENALEX_MIN_INTERVAL = 0.55  # 2 requests/second per rate limit guidance
+_OPENALEX_MAX_RETRIES = 6
+
+
+def _reserve_openalex_slot() -> None:
+    """Block until we are allowed to send the next OpenAlex request."""
+    global _LAST_OPENALEX_REQUEST
+    while True:
+        with _OPENALEX_LOCK:
+            now = time.monotonic()
+            elapsed = now - _LAST_OPENALEX_REQUEST
+            if elapsed >= _OPENALEX_MIN_INTERVAL:
+                _LAST_OPENALEX_REQUEST = now
+                return
+            wait_time = _OPENALEX_MIN_INTERVAL - elapsed
+        time.sleep(max(wait_time, 0.0))
+
+
+def _openalex_request(method: str, path: str, **kwargs: Any) -> httpx.Response:
+    """Send an OpenAlex request with basic rate limiting and retry backoff."""
+    attempt = 0
+    while True:
+        attempt += 1
+        _reserve_openalex_slot()
+        try:
+            response = _CLIENT.request(method, path, **kwargs)
+        except httpx.RequestError:
+            if attempt >= _OPENALEX_MAX_RETRIES:
+                raise
+            # Exponential backoff capped at ~8 seconds
+            backoff = min(2 ** (attempt - 1) * _OPENALEX_MIN_INTERVAL, 8.0)
+            time.sleep(backoff)
+            continue
+
+        if response.status_code != 429:
+            return response
+
+        if attempt >= _OPENALEX_MAX_RETRIES:
+            response.raise_for_status()
+
+        retry_after = response.headers.get("Retry-After")
+        try:
+            retry_delay = float(retry_after) if retry_after else 0.0
+        except ValueError:
+            retry_delay = 0.0
+        retry_delay = max(retry_delay, _OPENALEX_MIN_INTERVAL)
+        time.sleep(retry_delay)
+
+
+def _openalex_get(path: str, **kwargs: Any) -> httpx.Response:
+    return _openalex_request("GET", path, **kwargs)
+
+
 DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 
@@ -253,7 +310,7 @@ def fetch_openalex_page(
     }
     if sort:
         params["sort"] = sort
-    r = _CLIENT.get("/works", params=params)
+    r = _openalex_get("/works", params=params)
     if r.status_code != 200:
         print("Status:", r.status_code)
         print("Reason:", r.reason_phrase)
@@ -1512,6 +1569,7 @@ if __name__ == "__main__":
     # Fetch the two buckets of papers from OpenAlex and deduplicate them
     print("[info] Fetching OpenAlex (top-cited and most-recent)")
     fetch_buffer = max(0, args.fetch_buffer)
+    query_terms = _normalize_queries(args.query)
 
     def _fetch_bucket(
         sort: str, base_n: int
@@ -1522,14 +1580,26 @@ if __name__ == "__main__":
             sort=sort,
             n=base_n + fetch_buffer,
         )
-        return full[:base_n], full[base_n:]
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for rec in full:
+            key = rec.get("search_query", "")
+            grouped.setdefault(key, []).append(rec)
+
+        primary: List[Dict[str, Any]] = []
+        extra: List[Dict[str, Any]] = []
+        for term in query_terms:
+            term_results = grouped.get(term, [])
+            primary.extend(term_results[:base_n])
+            extra.extend(term_results[base_n:])
+        return primary, extra
 
     top_primary, top_extra = _fetch_bucket("cited_by_count:desc", args.n_top_cited)
     recent_primary, recent_extra = _fetch_bucket(
         "publication_date:desc", args.n_most_recent
     )
 
-    target_total = args.n_top_cited + args.n_most_recent
+    terms_multiplier = max(len(query_terms), 1)
+    target_total = (args.n_top_cited + args.n_most_recent) * terms_multiplier
     records: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
 
