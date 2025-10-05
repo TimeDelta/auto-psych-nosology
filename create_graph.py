@@ -515,7 +515,7 @@ def _ensure_stanza_pipelines() -> List[Tuple[str, "stanza.Pipeline"]]:
     if _STANZA_PIPELINES:
         return _STANZA_PIPELINES
     lang = os.getenv("STANZA_LANG", "en")
-    processors = os.getenv("STANZA_PROCESSORS", "tokenize,ner")
+    processors = os.getenv("STANZA_PROCESSORS", "tokenize,mwt,pos,lemma,ner")
     for package in _STANZA_PACKAGE_CANDIDATES:
         pkg_display = (
             package
@@ -572,6 +572,26 @@ def _stanza_entities(text: str) -> List[Dict[str, Any]]:
             start = getattr(ent, "start_char", None)
             end = getattr(ent, "end_char", None)
             label = getattr(ent, "type", "")
+            words = getattr(ent, "words", [])
+            lemmas: List[str] = []
+            upos: List[str] = []
+            xpos: List[str] = []
+            tokens: List[str] = []
+            for word in words:
+                tok = getattr(word, "text", "")
+                if tok:
+                    tokens.append(tok)
+                lemma = getattr(word, "lemma", "")
+                if lemma:
+                    lemmas.append(lemma)
+                elif tok:
+                    lemmas.append(tok)
+                pos = getattr(word, "upos", "")
+                if pos:
+                    upos.append(pos)
+                xpos_tag = getattr(word, "xpos", "")
+                if xpos_tag:
+                    xpos.append(xpos_tag)
             if start is not None and end is not None:
                 key = (start, end, label)
                 if key in seen_spans:
@@ -584,6 +604,10 @@ def _stanza_entities(text: str) -> List[Dict[str, Any]]:
                     "entity_group": label,
                     "word": getattr(ent, "text", ""),
                     "source_package": pkg_display,
+                    "lemma": " ".join(lemmas).strip(),
+                    "upos": upos,
+                    "xpos": xpos,
+                    "tokens": tokens,
                 }
             )
     return results
@@ -816,10 +840,20 @@ def extract_entities_relations(
             continue
         if raw_name.lower() in _NER_EXCLUDE_TERMS:
             continue
-        canonical_key = canonical_entity_key(raw_name)
+        pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
+        if pos_tags:
+            informative = {"NOUN", "PROPN", "VERB", "ADJ"}
+            banned = {"PRON", "DET", "PART", "INTJ", "SYM", "PUNCT"}
+            if not any(tag in informative for tag in pos_tags):
+                continue
+            if all(tag in banned for tag in pos_tags):
+                continue
+        lemma_hint = (ent.get("lemma") or "").strip()
+        lemma_source = lemma_hint if lemma_hint else raw_name
+        canonical_key = canonical_entity_key(lemma_source)
         if not canonical_key:
             continue
-        canonical_display = canonical_entity_display(raw_name) or raw_name
+        canonical_display = canonical_entity_display(lemma_hint or raw_name) or raw_name
         record = entities.get(canonical_key)
         if record is None:
             label = ent.get("entity_group", "")
@@ -834,6 +868,28 @@ def extract_entities_relations(
                 normalizations={},
             )
             entities[canonical_key] = record
+        if lemma_hint:
+            existing_lemmas = record.normalizations.get("lemmas", [])
+            record.normalizations["lemmas"] = _dedupe_preserve_order(
+                list(existing_lemmas) + [lemma_hint]
+            )
+        if pos_tags:
+            existing_pos = record.normalizations.get("upos", [])
+            record.normalizations["upos"] = _dedupe_preserve_order(
+                list(existing_pos) + pos_tags
+            )
+        source_pkg = ent.get("source_package")
+        if source_pkg:
+            existing_sources = record.normalizations.get("ner_sources", [])
+            record.normalizations["ner_sources"] = _dedupe_preserve_order(
+                list(existing_sources) + [source_pkg]
+            )
+        tokens = ent.get("tokens") or []
+        if tokens:
+            existing_tokens = record.normalizations.get("tokens", [])
+            record.normalizations["tokens"] = _dedupe_preserve_order(
+                list(existing_tokens) + tokens
+            )
         _update_record_forms(record, [raw_name, canonical_display])
     if not entities:
         print(f"[warn] Skipping paper {paper_label}: no entities detected.")
