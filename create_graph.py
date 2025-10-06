@@ -219,6 +219,51 @@ class KnowledgeGraphPipeline:
         successful_total = 0
         total_required = sum(target_map.values())
 
+        BUCKET_PRIORITY = {"top": 0, "recent": 1}
+
+        def _bucket_priority(bucket: str) -> int:
+            return BUCKET_PRIORITY.get(bucket, 2)
+
+        def _source_sort_key(source: Dict[str, Any]) -> Tuple[int, int, int, str]:
+            bucket = str(source.get("bucket") or LEGACY_BUCKET)
+            is_buffer = 1 if source.get("is_buffer") else 0
+            rank_raw = source.get("rank")
+            rank = rank_raw if isinstance(rank_raw, int) else 1_000_000
+            term = str(source.get("term", "") or "")
+            return (is_buffer, _bucket_priority(bucket), rank, term)
+
+        def _select_needed_keys_from_sources(
+            sources: Sequence[Dict[str, Any]]
+        ) -> set[Tuple[str, str]]:
+            candidates: List[Tuple[Tuple[str, str], Dict[str, Any], int]] = []
+            for source in sorted(list(sources), key=_source_sort_key):
+                bucket = str(source.get("bucket") or LEGACY_BUCKET)
+                term = str(source.get("term", "") or "")
+                key = (term, bucket)
+                target = target_map.get(key)
+                if target is None or target <= 0:
+                    continue
+                remaining = target - success_counts.get(key, 0)
+                if remaining <= 0:
+                    continue
+                candidates.append((key, source, remaining))
+            if not candidates:
+                return set()
+
+            def _selection_priority(
+                item: Tuple[Tuple[str, str], Dict[str, Any], int]
+            ) -> Tuple[int, int, int, int]:
+                key, source, remaining = item
+                bucket = key[1]
+                bucket_order = _bucket_priority(bucket)
+                is_buffer = 1 if source.get("is_buffer") else 0
+                rank_raw = source.get("rank")
+                rank = rank_raw if isinstance(rank_raw, int) else 1_000_000
+                return (-remaining, bucket_order, is_buffer, rank)
+
+            selected_key, _, _ = min(candidates, key=_selection_priority)
+            return {selected_key}
+
         def _bump_success(key: Tuple[str, str]) -> None:
             nonlocal successful_total
             target = target_map.get(key)
@@ -248,14 +293,8 @@ class KnowledgeGraphPipeline:
                         "_candidate_sources",
                         [{"term": "", "bucket": LEGACY_BUCKET, "is_buffer": False}],
                     )
-                seen_keys: set[Tuple[str, str]] = set()
-                for source in sources:
-                    bucket = source.get("bucket") or LEGACY_BUCKET
-                    term = str(source.get("term", "") or "")
-                    key = (term, bucket)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
+                assignments = _select_needed_keys_from_sources(sources)
+                for key in assignments:
                     _bump_success(key)
 
         def persist_checkpoint(status: Optional[str] = None) -> None:
@@ -282,30 +321,26 @@ class KnowledgeGraphPipeline:
         processed_new = 0
         skipped_existing = 0
 
-        for record in tqdm(records):
+        remaining_required = max(total_required - successful_total, 0)
+        progress_bar: Optional[tqdm] = None
+        if remaining_required > 0:
+            progress_bar = tqdm(total=remaining_required, desc="Processing papers")
+
+        for record in records:
             if total_required > 0 and successful_total >= total_required:
                 break
             record_id = checkpoint_record_id(record)
             if record_id in completed_ids:
                 skipped_existing += 1
                 continue
+            success_before = successful_total
             sources = record.get("_candidate_sources") or []
             if not sources and ("", LEGACY_BUCKET) in target_map:
                 sources = record.setdefault(
                     "_candidate_sources",
                     [{"term": "", "bucket": LEGACY_BUCKET, "is_buffer": False}],
                 )
-            needed_keys: set[Tuple[str, str]] = set()
-            for source in sources:
-                bucket = source.get("bucket") or LEGACY_BUCKET
-                term = str(source.get("term", "") or "")
-                key = (term, bucket)
-                target = target_map.get(key)
-                if target is None or target <= 0:
-                    continue
-                if success_counts.get(key, 0) >= target:
-                    continue
-                needed_keys.add(key)
+            needed_keys = _select_needed_keys_from_sources(sources)
             if not needed_keys:
                 continue
             meta = {
@@ -331,6 +366,10 @@ class KnowledgeGraphPipeline:
                     processed_new += 1
                     for key in needed_keys:
                         _bump_success(key)
+                    if progress_bar is not None:
+                        delta = successful_total - success_before
+                        if delta > 0:
+                            progress_bar.update(delta)
             except KeyboardInterrupt:
                 print("[warn] Interrupted by user; saving checkpoint before exit.")
                 persist_checkpoint(status="interrupted")
@@ -350,8 +389,26 @@ class KnowledgeGraphPipeline:
                     persist_checkpoint(status="running")
                     attempted_since_checkpoint = 0
 
+        if progress_bar is not None:
+            progress_bar.close()
+
         if periodic_enabled and attempted_since_checkpoint > 0:
             persist_checkpoint(status="running")
+
+        unmet_targets = {
+            key: target_map[key] - success_counts.get(key, 0)
+            for key in target_map
+            if success_counts.get(key, 0) < target_map[key]
+        }
+        if unmet_targets:
+            details = ", ".join(
+                f"{term or '[default]'}:{bucket} -> {remaining}"
+                for (term, bucket), remaining in sorted(unmet_targets.items())
+            )
+            print(
+                "[warn] Unable to satisfy all candidate slots; consider increasing "
+                f"--fetch-buffer. Unfilled targets: {details}"
+            )
 
         if skipped_existing:
             print(
