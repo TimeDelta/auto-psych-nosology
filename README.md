@@ -2,7 +2,7 @@
 ## Table of Contents
 - [Code Notes](#code-notes)
 - [Introduction](#introduction)
-- [Background / Literature Review](#background-literature-review)
+- [Background / Literature Review](#background--literature-review)
     - [Biomarkers of Psychopathology](#biomarkers-of-psychopathology)
     - [Transdiagnostic Dimensions](#transdiagnostic-dimensions)
     - [Automated Methods](#automated-methods)
