@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
-import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -21,6 +21,13 @@ from text_normalization import (
     clean_entity_surface,
     dedupe_preserve_order,
 )
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+_LOG_LEVEL_NAME = os.getenv("AUTO_PSYCH_LOG_LEVEL", "INFO").strip().upper()
+logger.setLevel(getattr(logging, _LOG_LEVEL_NAME, logging.INFO))
+logging.getLogger("stanza").setLevel(logging.INFO)
 
 RELATION_ROLE_CONSTRAINTS: Dict[str, Dict[str, Set[str]]] = {
     "treats": {"subject": {"Treatment"}, "object": {"Diagnosis", "Symptom"}},
@@ -140,8 +147,11 @@ class EntityRelationExtractor:
 
     def _stanza_use_gpu(self) -> bool:
         if os.getenv("STANZA_USE_GPU", "").strip() == "0":
-            return False
-        return torch.cuda.is_available()
+            use_gpu = False
+        else:
+            use_gpu = torch.cuda.is_available()
+        logger.debug("Stanza GPU enabled: %s", use_gpu)
+        return use_gpu
 
     def _parse_package_spec(self, spec: str) -> Optional[Any]:
         spec = (spec or "").strip()
@@ -162,7 +172,9 @@ class EntityRelationExtractor:
         forced = os.getenv("STANZA_FORCE_PACKAGE", "").strip()
         if forced:
             parsed = self._parse_package_spec(forced)
-            return [parsed] if parsed else []
+            candidates = [parsed] if parsed else []
+            logger.debug("Forced Stanza package candidates: %s", candidates)
+            return candidates
 
         candidates: List[Any] = [
             {
@@ -181,6 +193,7 @@ class EntityRelationExtractor:
         for fallback in ("craft", "mimic"):
             if fallback not in candidates:
                 candidates.append(fallback)
+        logger.debug("Stanza package candidates: %s", candidates)
         return candidates
 
     def _ensure_stanza_pipelines(self) -> List[Tuple[str, "stanza.Pipeline"]]:
@@ -213,14 +226,16 @@ class EntityRelationExtractor:
             try:
                 pipeline = stanza.Pipeline(lang, **pipeline_kwargs)
                 pipelines.append((str(pkg_display), pipeline))
-                warnings.warn(f"Using Stanza biomedical NER package {pkg_display}.")
+                logger.info("Using Stanza biomedical NER package %s.", pkg_display)
             except Exception as exc:
-                warnings.warn(
-                    f"Stanza package {pkg_display} unavailable ({exc!r}); trying fallback."
+                logger.warning(
+                    "Stanza package %s unavailable (%s); trying fallback.",
+                    pkg_display,
+                    exc,
                 )
                 continue
         if not pipelines:
-            warnings.warn(
+            logger.error(
                 "Unable to initialise any Stanza biomedical NER package; extractions will be empty."
             )
         self._pipelines = pipelines
@@ -448,16 +463,15 @@ class EntityRelationExtractor:
             meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
         )
         if not text.strip():
-            warnings.warn(
-                f"Skipping paper {paper_label}: no text available after preprocessing."
+            logger.info(
+                "Skipping paper %s: no text available after preprocessing.",
+                paper_label,
             )
             return None
         try:
             ner_results = self._ner_pipeline(text)
-        except Exception as exc:
-            warnings.warn(
-                f"Skipping paper {paper_label}: NER pipeline failed ({exc!r})."
-            )
+        except Exception:
+            logger.exception("Skipping paper %s: NER pipeline failed.", paper_label)
             return None
 
         entities: Dict[str, NodeRecord] = {}
@@ -535,7 +549,7 @@ class EntityRelationExtractor:
                 )
             self._update_record_forms(record, [raw_name, canonical_display])
         if not entities:
-            warnings.warn(f"Skipping paper {paper_label}: no entities detected.")
+            logger.info("Skipping paper %s: no entities detected.", paper_label)
             return None
 
         node_records = list(entities.values())
