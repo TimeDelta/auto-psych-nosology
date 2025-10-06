@@ -1,0 +1,631 @@
+"""Entity and relation extraction using Stanza NER and a biomedical NLI model."""
+
+from __future__ import annotations
+
+import os
+import re
+import threading
+import warnings
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import stanza
+import torch
+from nltk.tokenize import sent_tokenize
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+from models import NodeRecord, PaperExtraction, RelationRecord
+from text_normalization import (
+    canonical_entity_display,
+    canonical_entity_key,
+    clean_entity_surface,
+    dedupe_preserve_order,
+)
+
+RELATION_ROLE_CONSTRAINTS: Dict[str, Dict[str, Set[str]]] = {
+    "treats": {"subject": {"Treatment"}, "object": {"Diagnosis", "Symptom"}},
+    "biomarker_for": {"subject": {"Biomarker"}, "object": {"Diagnosis", "Symptom"}},
+    "measure_of": {"subject": {"Measure"}, "object": {"Diagnosis", "Symptom"}},
+    "predicts": {
+        "subject": {"Biomarker", "Measure", "Symptom"},
+        "object": {"Diagnosis", "Symptom"},
+    },
+}
+
+_RELATION_MODE = "nli"
+_NLI_MODEL_NAME = "pritamdeka/PubMedBERT-MNLI-MedNLI"
+_REL_TEMPLATES = {
+    "treats": "{SUBJ} treats {OBJ}.",
+    "biomarker_for": "{SUBJ} is a biomarker for {OBJ}.",
+    "measure_of": "{SUBJ} is a measure of {OBJ}.",
+    "predicts": "{SUBJ} predicts {OBJ}.",
+    "supports": "{SUBJ} is positively associated with {OBJ}.",
+    "contradicts": "{SUBJ} is negatively associated with {OBJ}.",
+}
+_REL_TEMPLATES_REV = {
+    "treats": "{OBJ} treats {SUBJ}.",
+    "biomarker_for": "{OBJ} is a biomarker for {SUBJ}.",
+    "measure_of": "{OBJ} is a measure of {SUBJ}.",
+    "predicts": "{OBJ} predicts {SUBJ}.",
+}
+
+_REL_DIRECTION_PENALTY = float(os.getenv("RELATION_NLI_REVERSE_PENALTY", "0.5"))
+_REL_SCORE_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_SCORE", "0.05"))
+_REL_MARGIN_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_MARGIN", "0.04"))
+_REL_ENTAILMENT_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_ENT", "0.6"))
+_REL_REVERSE_GAP = float(os.getenv("RELATION_NLI_REVERSE_GAP", "0.05"))
+
+
+@dataclass
+class NliScores:
+    entailment: float
+    neutral: float
+    contradiction: float
+
+    @property
+    def signal(self) -> float:
+        return self.entailment - self.contradiction
+
+
+@dataclass
+class RelationInference:
+    label: str
+    entailment: float
+    score: float
+    margin: float
+    reverse_entailment: float = 0.0
+
+
+@dataclass
+class ExtractionConfig:
+    ner_exclude_terms: Set[str] = field(
+        default_factory=lambda: {
+            term.strip().lower()
+            for term in os.getenv(
+                "NER_EXCLUDE_TERMS",
+                "patient,patients,control,controls,participant,participants,subject,subjects,human,humans,donor,donors",
+            ).split(",")
+            if term.strip()
+        }
+    )
+    stanza_lang: str = field(default_factory=lambda: os.getenv("STANZA_LANG", "en"))
+    stanza_processors: str = field(
+        default_factory=lambda: os.getenv(
+            "STANZA_PROCESSORS", "tokenize,mwt,pos,lemma,ner"
+        )
+    )
+    stanza_primary_ner: str = field(
+        default_factory=lambda: os.getenv("STANZA_NER_PACKAGE", "").strip() or "bc5cdr"
+    )
+    stanza_tokenize_pkg: str = field(
+        default_factory=lambda: os.getenv("STANZA_TOKENIZE_PACKAGE", "").strip()
+        or "default"
+    )
+    stanza_extra_biomed: Sequence[str] = field(
+        default_factory=lambda: [
+            pkg.strip()
+            for pkg in os.getenv(
+                "STANZA_BIOMED_PACKAGES",
+                "anatem|bc4chemd|bionlp13cg|jnlpba|linnaeus|ncbi_disease",
+            ).split("|")
+            if pkg.strip()
+        ]
+    )
+    stanza_extra_packages: Sequence[str] = field(
+        default_factory=lambda: [
+            pkg.strip()
+            for pkg in os.getenv("STANZA_EXTRA_PACKAGES", "").split("|")
+            if pkg.strip()
+        ]
+    )
+    nli_model_name: str = _NLI_MODEL_NAME
+    relation_role_constraints: Dict[str, Dict[str, Set[str]]] = field(
+        default_factory=lambda: dict(RELATION_ROLE_CONSTRAINTS)
+    )
+
+
+class EntityRelationExtractor:
+    def __init__(
+        self,
+        config: Optional[ExtractionConfig] = None,
+        stanza_pipelines: Optional[List[Tuple[str, "stanza.Pipeline"]]] = None,
+        nli_tokenizer=None,
+        nli_model=None,
+    ) -> None:
+        self.config = config or ExtractionConfig()
+        self._pipelines = stanza_pipelines
+        self._nli_tokenizer = nli_tokenizer
+        self._nli_model = nli_model
+        self._nli_lock = threading.Lock()
+
+    def _stanza_use_gpu(self) -> bool:
+        if os.getenv("STANZA_USE_GPU", "").strip() == "0":
+            return False
+        return torch.cuda.is_available()
+
+    def _parse_package_spec(self, spec: str) -> Optional[Any]:
+        spec = (spec or "").strip()
+        if not spec:
+            return None
+        if any(ch in spec for ch in "=;,"):
+            cfg: Dict[str, str] = {}
+            for part in re.split(r"[;,]", spec):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                cfg[key.strip()] = value.strip()
+            return cfg or None
+        return spec
+
+    def _build_stanza_package_candidates(self) -> List[Any]:
+        forced = os.getenv("STANZA_FORCE_PACKAGE", "").strip()
+        if forced:
+            parsed = self._parse_package_spec(forced)
+            return [parsed] if parsed else []
+
+        candidates: List[Any] = [
+            {
+                "tokenize": self.config.stanza_tokenize_pkg,
+                "ner": self.config.stanza_primary_ner,
+            }
+        ]
+        for extra_pkg in self.config.stanza_extra_biomed:
+            candidates.append(
+                {"tokenize": self.config.stanza_tokenize_pkg, "ner": extra_pkg}
+            )
+        for extra in self.config.stanza_extra_packages:
+            parsed = self._parse_package_spec(extra)
+            if parsed and parsed not in candidates:
+                candidates.append(parsed)
+        for fallback in ("craft", "mimic"):
+            if fallback not in candidates:
+                candidates.append(fallback)
+        return candidates
+
+    def _ensure_stanza_pipelines(self) -> List[Tuple[str, "stanza.Pipeline"]]:
+        if self._pipelines is not None:
+            return self._pipelines
+        lang = self.config.stanza_lang
+        processors = self.config.stanza_processors
+        pipelines: List[Tuple[str, "stanza.Pipeline"]] = []
+        for package in self._build_stanza_package_candidates():
+            pkg_display = (
+                package
+                if isinstance(package, str)
+                else ", ".join(f"{k}={v}" for k, v in package.items())
+            )
+            download_kwargs = {"processors": processors, "verbose": False}
+            try:
+                if package:
+                    download_kwargs["package"] = package
+                stanza.download(lang, **download_kwargs)
+            except Exception:
+                pass
+
+            pipeline_kwargs = {
+                "processors": processors,
+                "use_gpu": self._stanza_use_gpu(),
+                "verbose": False,
+            }
+            if package:
+                pipeline_kwargs["package"] = package
+            try:
+                pipeline = stanza.Pipeline(lang, **pipeline_kwargs)
+                pipelines.append((str(pkg_display), pipeline))
+                warnings.warn(f"Using Stanza biomedical NER package {pkg_display}.")
+            except Exception as exc:
+                warnings.warn(
+                    f"Stanza package {pkg_display} unavailable ({exc!r}); trying fallback."
+                )
+                continue
+        if not pipelines:
+            warnings.warn(
+                "Unable to initialise any Stanza biomedical NER package; extractions will be empty."
+            )
+        self._pipelines = pipelines
+        return self._pipelines
+
+    def _ensure_nli(self):
+        if self._nli_tokenizer is not None and self._nli_model is not None:
+            return
+        with self._nli_lock:
+            if self._nli_tokenizer is None or self._nli_model is None:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.config.nli_model_name, token=None, local_files_only=False
+                )
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    self.config.nli_model_name, token=None, use_safetensors=True
+                )
+                model.eval()
+                self._nli_tokenizer = tokenizer
+                self._nli_model = model
+
+    def _nli_probs(self, premise: str, hypothesis: str) -> NliScores:
+        self._ensure_nli()
+        assert self._nli_tokenizer is not None and self._nli_model is not None
+        with torch.no_grad():
+            encoding = self._nli_tokenizer(
+                premise,
+                hypothesis,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            logits = self._nli_model(**encoding).logits.softmax(-1)[0]
+        return NliScores(
+            entailment=float(logits[2].item()),
+            neutral=float(logits[1].item()),
+            contradiction=float(logits[0].item()),
+        )
+
+    def categorize_entity(self, label: str) -> Optional[str]:
+        lbl = label.upper()
+        direct_map = {
+            "PROBLEM": "Symptom",
+            "FINDING": "Symptom",
+            "SIGN": "Symptom",
+            "DIAGNOSIS": "Diagnosis",
+            "TEST": "Measure",
+            "MEASUREMENT": "Measure",
+            "MEASURE": "Measure",
+            "ASSESSMENT": "Measure",
+            "LAB": "Measure",
+            "TREATMENT": "Treatment",
+            "PROCEDURE": "Treatment",
+            "THERAPY": "Treatment",
+            "MEDICATION": "Treatment",
+            "DEVICE": "Measure",
+            "ANATOMY": "Biomarker",
+            "ANATOMICAL": "Biomarker",
+        }
+        if lbl in direct_map:
+            return direct_map[lbl]
+        if "DISEASE" in lbl or "DISORDER" in lbl or "SYNDROME" in lbl:
+            return "Diagnosis"
+        if "CHEMICAL" in lbl or "DRUG" in lbl or "MED" in lbl:
+            return "Treatment"
+        if "GENE" in lbl or "PROTEIN" in lbl or "CELL" in lbl or "BIOMARKER" in lbl:
+            return "Biomarker"
+        if "BEHAVIOR" in lbl or "SYMPTOM" in lbl:
+            return "Symptom"
+        if lbl in {"PERSON", "ORG", "ORGANIZATION", "LOCATION", "EVENT"}:
+            return None
+        return "Symptom"
+
+    def _relation_allowed_for_types(
+        self, predicate: str, subj_type: str, obj_type: str
+    ) -> bool:
+        rules = self.config.relation_role_constraints.get(predicate)
+        if not rules:
+            return True
+        allowed_subject = rules.get("subject")
+        allowed_object = rules.get("object")
+        if allowed_subject and subj_type not in allowed_subject:
+            return False
+        if allowed_object and obj_type not in allowed_object:
+            return False
+        return True
+
+    def _pick_sentence_context(
+        self, text: str, s1: str, s2: str, window: int = 2
+    ) -> str:
+        sentences = sent_tokenize(text)
+        indexes = [
+            i
+            for i, sentence in enumerate(sentences)
+            if (s1 in sentence and s2 in sentence)
+        ]
+        if not indexes:
+            idx1 = next(
+                (i for i, sentence in enumerate(sentences) if s1 in sentence), None
+            )
+            idx2 = next(
+                (i for i, sentence in enumerate(sentences) if s2 in sentence), None
+            )
+            if idx1 is None or idx2 is None:
+                return text[:2000]
+            lo, hi = sorted([idx1, idx2])
+            lo = max(0, lo - window)
+            hi = min(len(sentences), hi + window + 1)
+            return " ".join(sentences[lo:hi])
+        lo = max(0, min(indexes) - window)
+        hi = min(len(sentences), max(indexes) + window + 1)
+        return " ".join(sentences[lo:hi])
+
+    def classify_relation_via_nli(
+        self, context: str, subj: str, obj: str
+    ) -> RelationInference:
+        if not context.strip():
+            return RelationInference(
+                label="co_occurs", entailment=0.0, score=0.0, margin=0.0
+            )
+        scored: List[Tuple[str, float, NliScores, Optional[NliScores]]] = []
+        for rel, template in _REL_TEMPLATES.items():
+            forward = self._nli_probs(context, template.format(SUBJ=subj, OBJ=obj))
+            reverse: Optional[NliScores] = None
+            if rel in _REL_TEMPLATES_REV:
+                reverse = self._nli_probs(
+                    context, _REL_TEMPLATES_REV[rel].format(SUBJ=subj, OBJ=obj)
+                )
+            score = forward.signal
+            if reverse is not None:
+                penalty = max(0.0, reverse.signal)
+                score -= _REL_DIRECTION_PENALTY * penalty
+            scored.append((rel, score, forward, reverse))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        best_rel, best_score, best_forward, best_reverse = scored[0]
+        runner_score = scored[1][1] if len(scored) > 1 else -1.0
+        margin = best_score - runner_score
+
+        reverse_entail = best_reverse.entailment if best_reverse else 0.0
+        directional_conflict = (
+            best_rel in _REL_TEMPLATES_REV
+            and best_reverse is not None
+            and (reverse_entail - best_forward.entailment) >= _REL_REVERSE_GAP
+        )
+
+        if (
+            best_forward.entailment < _REL_ENTAILMENT_THRESHOLD
+            or best_score < _REL_SCORE_THRESHOLD
+            or margin < _REL_MARGIN_THRESHOLD
+            or directional_conflict
+        ):
+            return RelationInference(
+                label="co_occurs",
+                entailment=best_forward.entailment,
+                score=best_score,
+                margin=max(0.0, margin),
+                reverse_entailment=reverse_entail,
+            )
+        return RelationInference(
+            label=best_rel,
+            entailment=best_forward.entailment,
+            score=best_score,
+            margin=margin,
+            reverse_entailment=reverse_entail,
+        )
+
+    def _ner_pipeline(self, text: str) -> List[Dict[str, Any]]:
+        if not text.strip():
+            return []
+        pipelines = self._ensure_stanza_pipelines()
+        if not pipelines:
+            return []
+        results: List[Dict[str, Any]] = []
+        seen_spans: Set[Tuple[int, int, str]] = set()
+        for pkg_display, pipeline in pipelines:
+            doc = pipeline(text)
+            entities = getattr(doc, "ents", None)
+            if entities is None:
+                entities = getattr(doc, "entities", [])
+            for ent in entities:
+                start = getattr(ent, "start_char", None)
+                end = getattr(ent, "end_char", None)
+                label = getattr(ent, "type", "")
+                words = getattr(ent, "words", [])
+                lemmas: List[str] = []
+                upos: List[str] = []
+                xpos: List[str] = []
+                tokens: List[str] = []
+                for word in words:
+                    token = getattr(word, "text", "")
+                    if token:
+                        tokens.append(token)
+                    lemma = getattr(word, "lemma", "")
+                    if lemma:
+                        lemmas.append(lemma)
+                    elif token:
+                        lemmas.append(token)
+                    pos = getattr(word, "upos", "")
+                    if pos:
+                        upos.append(pos)
+                    xpos_tag = getattr(word, "xpos", "")
+                    if xpos_tag:
+                        xpos.append(xpos_tag)
+                if start is not None and end is not None:
+                    key = (start, end, label)
+                    if key in seen_spans:
+                        continue
+                    seen_spans.add(key)
+                results.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "entity_group": label,
+                        "word": getattr(ent, "text", ""),
+                        "source_package": pkg_display,
+                        "lemma": " ".join(lemmas).strip(),
+                        "upos": upos,
+                        "xpos": xpos,
+                        "tokens": tokens,
+                    }
+                )
+        return results
+
+    def extract(self, meta: Dict[str, Any], text: str) -> Optional[PaperExtraction]:
+        paper_label = (
+            meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
+        )
+        if not text.strip():
+            warnings.warn(
+                f"Skipping paper {paper_label}: no text available after preprocessing."
+            )
+            return None
+        try:
+            ner_results = self._ner_pipeline(text)
+        except Exception as exc:
+            warnings.warn(
+                f"Skipping paper {paper_label}: NER pipeline failed ({exc!r})."
+            )
+            return None
+
+        entities: Dict[str, NodeRecord] = {}
+        for ent in ner_results:
+            if (
+                "start" in ent
+                and "end" in ent
+                and ent["start"] is not None
+                and ent["end"] is not None
+            ):
+                raw_name = text[ent["start"] : ent["end"]]
+            else:
+                raw_name = ent.get("word", "")
+            raw_name = clean_entity_surface(raw_name)
+            if not raw_name:
+                continue
+            if raw_name.lower() in self.config.ner_exclude_terms:
+                continue
+            tokens = ent.get("tokens") or []
+            pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
+            if pos_tags:
+                informative = {"NOUN", "PROPN", "VERB", "ADJ"}
+                banned = {"PRON", "DET", "PART", "INTJ", "SYM", "PUNCT"}
+                if not any(tag in informative for tag in pos_tags):
+                    continue
+                if all(tag in banned for tag in pos_tags):
+                    continue
+                noun_like = {"NOUN", "PROPN"}
+                if not any(tag in noun_like for tag in pos_tags):
+                    token_count = len(tokens) if tokens else len(raw_name.split())
+                    if token_count <= 1:
+                        continue
+            lemma_hint = (ent.get("lemma") or "").strip()
+            lemma_source = lemma_hint if lemma_hint else raw_name
+            canonical_key = canonical_entity_key(lemma_source)
+            if not canonical_key:
+                continue
+            canonical_display = (
+                canonical_entity_display(lemma_hint or raw_name) or raw_name
+            )
+            record = entities.get(canonical_key)
+            if record is None:
+                label = ent.get("entity_group", "")
+                node_type = self.categorize_entity(label)
+                if not node_type:
+                    continue
+                record = NodeRecord(
+                    canonical_name=canonical_display,
+                    lemma=canonical_key,
+                    node_type=node_type,
+                    synonyms=[],
+                    normalizations={},
+                )
+                entities[canonical_key] = record
+            if lemma_hint:
+                existing_lemmas = record.normalizations.get("lemmas", [])
+                record.normalizations["lemmas"] = dedupe_preserve_order(
+                    list(existing_lemmas) + [lemma_hint]
+                )
+            if pos_tags:
+                existing_pos = record.normalizations.get("upos", [])
+                record.normalizations["upos"] = dedupe_preserve_order(
+                    list(existing_pos) + pos_tags
+                )
+            source_pkg = ent.get("source_package")
+            if source_pkg:
+                existing_sources = record.normalizations.get("ner_sources", [])
+                record.normalizations["ner_sources"] = dedupe_preserve_order(
+                    list(existing_sources) + [source_pkg]
+                )
+            if tokens:
+                existing_tokens = record.normalizations.get("tokens", [])
+                record.normalizations["tokens"] = dedupe_preserve_order(
+                    list(existing_tokens) + tokens
+                )
+            self._update_record_forms(record, [raw_name, canonical_display])
+        if not entities:
+            warnings.warn(f"Skipping paper {paper_label}: no entities detected.")
+            return None
+
+        node_records = list(entities.values())
+        node_records.sort(key=lambda record: record.canonical_name.lower())
+        surface_lookup = {
+            record.canonical_name: self._surface_form(record, text)
+            for record in node_records
+        }
+
+        relations: List[RelationRecord] = []
+        for i in range(len(node_records)):
+            for j in range(i + 1, len(node_records)):
+                subj = node_records[i].canonical_name
+                obj = node_records[j].canonical_name
+                subj_type = node_records[i].node_type
+                obj_type = node_records[j].node_type
+                context = self._pick_sentence_context(
+                    text, surface_lookup[subj], surface_lookup[obj]
+                )
+                inference = self.classify_relation_via_nli(context, subj, obj)
+                predicate = inference.label
+                if predicate != "co_occurs" and not self._relation_allowed_for_types(
+                    predicate, subj_type, obj_type
+                ):
+                    predicate = "co_occurs"
+                if predicate == "co_occurs":
+                    continue
+                confidence = min(1.0, inference.entailment + 0.1 * inference.margin)
+                directionality = (
+                    "directed"
+                    if predicate
+                    in {"treats", "predicts", "biomarker_for", "measure_of"}
+                    else "undirected"
+                )
+                relations.append(
+                    RelationRecord(
+                        subject=subj,
+                        predicate=predicate,
+                        object=obj,
+                        directionality=directionality,
+                        evidence_span=context[:300],
+                        confidence=confidence,
+                        qualifiers={
+                            "nli_raw_label": inference.label,
+                            "nli_entailment": round(inference.entailment, 4),
+                            "nli_margin": round(inference.margin, 4),
+                            "nli_reverse_entailment": round(
+                                inference.reverse_entailment, 4
+                            ),
+                            "nli_score": round(inference.score, 4),
+                        },
+                    )
+                )
+        return PaperExtraction(
+            paper_id=meta.get("id", ""),
+            doi=meta.get("doi"),
+            title=meta.get("title", ""),
+            year=meta.get("year"),
+            venue=meta.get("venue"),
+            nodes=node_records,
+            relations=relations,
+        )
+
+    def _surface_form(self, record: NodeRecord, text: str) -> str:
+        forms = record.normalizations.get("surface_forms", [])
+        if isinstance(forms, list):
+            for form in forms:
+                if form and form in text:
+                    return form
+        return record.canonical_name
+
+    def _update_record_forms(
+        self, record: NodeRecord, candidates: Iterable[str]
+    ) -> None:
+        existing_forms = record.normalizations.get("surface_forms")
+        if isinstance(existing_forms, list):
+            forms = list(existing_forms)
+        else:
+            forms = [record.canonical_name]
+        forms.extend(candidates)
+        forms.append(record.canonical_name)
+        normalized_forms = dedupe_preserve_order(forms)
+        record.normalizations["surface_forms"] = normalized_forms
+        record.synonyms = dedupe_preserve_order(
+            list(record.synonyms)
+            + [form for form in normalized_forms if form != record.canonical_name]
+        )
+
+
+__all__ = [
+    "EntityRelationExtractor",
+    "ExtractionConfig",
+]
