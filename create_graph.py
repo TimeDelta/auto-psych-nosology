@@ -946,6 +946,7 @@ def extract_entities_relations(
             continue
         if raw_name.lower() in _NER_EXCLUDE_TERMS:
             continue
+        tokens = ent.get("tokens") or []
         pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
         if pos_tags:
             informative = {"NOUN", "PROPN", "VERB", "ADJ"}
@@ -954,6 +955,12 @@ def extract_entities_relations(
                 continue
             if all(tag in banned for tag in pos_tags):
                 continue
+            noun_like = {"NOUN", "PROPN"}
+            if not any(tag in noun_like for tag in pos_tags):
+                token_count = len(tokens) if tokens else len(raw_name.split())
+                if token_count <= 1:
+                    # Skip adjective-only spans like "psychiatric" that Stanza tags as entities.
+                    continue
         lemma_hint = (ent.get("lemma") or "").strip()
         lemma_source = lemma_hint if lemma_hint else raw_name
         canonical_key = canonical_entity_key(lemma_source)
@@ -990,7 +997,6 @@ def extract_entities_relations(
             record.normalizations["ner_sources"] = _dedupe_preserve_order(
                 list(existing_sources) + [source_pkg]
             )
-        tokens = ent.get("tokens") or []
         if tokens:
             existing_tokens = record.normalizations.get("tokens", [])
             record.normalizations["tokens"] = _dedupe_preserve_order(
