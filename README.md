@@ -131,7 +131,7 @@ Multiplex Graph Design
 - Export Schema: edge qualifiers are flattened as `qual_*` attributes (e.g., `qual_nli_score`, `qual_claim`, `qual_evidence_label`) so GraphML/HTML tooltips surface the underlying evidence without manual JSON parsing
 
 1. Specify queries (“bipolar disorder”, “major depressive disorder”, “schizoaffective disorder”, “anxiety disorder”, “PTSD”, “OCD”, “OCPD")
-1. Fetch text from OpenAlex (falling back to PMC) for top M most cited and N most recent papers for each query
+1. Fetch text from OpenAlex (falling back to PMC) for top M most cited and N most recent papers for each query, all of which are restricted to have been published in the past decade
 1. Pull out only results and discussion section
 1. Extraction process (via Biomedical Stanza and Hugging Face)
     1. Tokenization

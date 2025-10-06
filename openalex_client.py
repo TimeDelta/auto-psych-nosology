@@ -5,17 +5,33 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import date
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import httpx
 
 OPENALEX_BASE_URL = "https://api.openalex.org"
-DEFAULT_FILTER = (
-    "from_publication_date:2015-10-03,"
-    "open_access.is_oa:true,"
-    "language:en,"
-    "concepts.id:C61535369",
-)
+
+
+def _ten_years_ago(reference: date) -> date:
+    try:
+        return reference.replace(year=reference.year - 10)
+    except ValueError:
+        # Handle leap-day edge cases by falling back to Feb 28.
+        return reference.replace(month=2, day=28, year=reference.year - 10)
+
+
+def _default_filter() -> List[str]:
+    lower_bound = _ten_years_ago(date.today()).isoformat()
+    return [
+        f"from_publication_date:{lower_bound},",
+        "open_access.is_oa:true,",
+        "language:en,",
+        "concepts.id:C61535369",
+    ]
+
+
+DEFAULT_FILTER = tuple(_default_filter())
 
 _CLIENT = httpx.Client(
     base_url=OPENALEX_BASE_URL,
