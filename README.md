@@ -1,5 +1,6 @@
 # Automated Psychiatric Nosology via Partitioning of Multiplex Graph Generated from Mining Scientific Papers for Findings
 ## Table of Contents
+- [Code Notes](#code-notes)
 - [Introduction](#introduction)
 - [Background / Literature Review](#background-literature-review)
     - [Biomarkers of Psychopathology](#biomarkers-of-psychopathology)
@@ -11,6 +12,10 @@
 - [Methods](#methods)
     - [Graph Creation](#graph-creation)
     - [Preventing Biased Alignment](#preventing-biased-alignment)
+
+## Code Notes
+- This project uses python 3.10
+- Must install [graph tool](https://graph-tool.skewed.de) in order to run the [create_hSBM_partitions.py](./create_hSBM_partitions.py) script.
 
 ## Introduction
 Psychiatric classification remains dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM) and the International Classification of Diseases (ICD).
