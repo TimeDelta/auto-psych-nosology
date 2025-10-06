@@ -297,17 +297,28 @@ class EntityRelationExtractor:
             "PROBLEM": "Symptom",
             "FINDING": "Symptom",
             "SIGN": "Symptom",
+            "BEHAVIOR": "Symptom",
+            "SYMPTOM": "Symptom",
+            #
             "DIAGNOSIS": "Diagnosis",
+            "DISEASE": "Diagnosis",
+            "SYNDROME": "Diagnosis",
+            #
             "TEST": "Measure",
             "MEASUREMENT": "Measure",
             "MEASURE": "Measure",
             "ASSESSMENT": "Measure",
             "LAB": "Measure",
+            #
             "TREATMENT": "Treatment",
             "PROCEDURE": "Treatment",
             "THERAPY": "Treatment",
             "MEDICATION": "Treatment",
             "DEVICE": "Treatment",
+            "CHEMICAL": "Treatment",
+            "DRUG": "Treatment",
+            "MED": "Treatment",
+            #
             "ANATOMY": "Biomarker",
             "ANATOMICAL": "Biomarker",
             "CELL_LINE": "Biomarker",
@@ -315,21 +326,14 @@ class EntityRelationExtractor:
             "DNA": "Biomarker",
             "PROEIN": "Biomarker",
             "RNA": "Biomarker",
+            "GENE": "Biomarker",
+            "BIOMARKER": "Biomarker",
+            #
             "SPECIES": "Species",
         }
         if lbl in direct_map:
             return direct_map[lbl]
-        if "DISEASE" in lbl or "DISORDER" in lbl or "SYNDROME" in lbl:
-            return "Diagnosis"
-        if "CHEMICAL" in lbl or "DRUG" in lbl or "MED" in lbl:
-            return "Treatment"
-        if "GENE" in lbl or "PROTEIN" in lbl or "CELL" in lbl or "BIOMARKER" in lbl:
-            return "Biomarker"
-        if "BEHAVIOR" in lbl or "SYMPTOM" in lbl:
-            return "Symptom"
-        if lbl in {"PERSON", "ORG", "ORGANIZATION", "LOCATION", "EVENT"}:
-            return None
-        return "Symptom"
+        return None
 
     def _relation_allowed_for_types(
         self, predicate: str, subj_type: str, obj_type: str
