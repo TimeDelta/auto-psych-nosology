@@ -73,6 +73,18 @@ REL_TYPES: Set[str] = {
     "measure_of",
 }
 
+# Heuristic role constraints to prevent implausible relation/type combos.
+# Keys: predicate -> required node types for subject/object. Omitted sides are unconstrained.
+RELATION_ROLE_CONSTRAINTS: Dict[str, Dict[str, Set[str]]] = {
+    "treats": {"subject": {"Treatment"}, "object": {"Diagnosis", "Symptom"}},
+    "biomarker_for": {"subject": {"Biomarker"}, "object": {"Diagnosis", "Symptom"}},
+    "measure_of": {"subject": {"Measure"}, "object": {"Diagnosis", "Symptom"}},
+    "predicts": {
+        "subject": {"Biomarker", "Measure", "Symptom"},
+        "object": {"Diagnosis", "Symptom"},
+    },
+}
+
 DIAGNOSIS_MASK_LEXICON = {
     "major depressive disorder": [
         "MDD",
@@ -905,6 +917,20 @@ def classify_relation_via_nli(context: str, subj: str, obj: str) -> RelationInfe
     )
 
 
+def _relation_allowed_for_types(predicate: str, subj_type: str, obj_type: str) -> bool:
+    """Return True when the predicate is compatible with the node type pair."""
+    rules = RELATION_ROLE_CONSTRAINTS.get(predicate)
+    if not rules:
+        return True
+    allowed_subject = rules.get("subject")
+    allowed_object = rules.get("object")
+    if allowed_subject and subj_type not in allowed_subject:
+        return False
+    if allowed_object and obj_type not in allowed_object:
+        return False
+    return True
+
+
 def extract_entities_relations(
     meta: Dict[str, Any], text: str
 ) -> Optional[PaperExtraction]:
@@ -1024,6 +1050,8 @@ def extract_entities_relations(
         for j in range(i + 1, len(node_records)):
             subj = node_records[i].canonical_name
             obj = node_records[j].canonical_name
+            subj_type = node_records[i].node_type
+            obj_type = node_records[j].node_type
             pred = "co_occurs"
             conf = 0.5
             sent_ctx = _pick_sentence_context(
@@ -1031,6 +1059,12 @@ def extract_entities_relations(
             )
             inference = classify_relation_via_nli(sent_ctx, subj, obj)
             pred = inference.label
+            filtered = False
+            if pred != "co_occurs" and not _relation_allowed_for_types(
+                pred, subj_type, obj_type
+            ):
+                pred = "co_occurs"
+                filtered = True
             if pred == "co_occurs":
                 conf = 0.45
             else:
@@ -1052,12 +1086,14 @@ def extract_entities_relations(
                     evidence_span=sent_ctx[:300],
                     confidence=conf,
                     qualifiers={
+                        "nli_raw_label": inference.label,
                         "nli_entailment": round(inference.entailment, 4),
                         "nli_margin": round(inference.margin, 4),
                         "nli_reverse_entailment": round(
                             inference.reverse_entailment, 4
                         ),
                         "nli_score": round(inference.score, 4),
+                        "relation_type_filtered": filtered,
                     },
                 )
             )
