@@ -12,6 +12,7 @@ NODE_TYPES: Set[str] = {
     "Biomarker",
     "Treatment",
     "Measure",
+    "Species",
 }
 
 REL_TYPES: Set[str] = {

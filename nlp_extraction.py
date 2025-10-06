@@ -130,7 +130,7 @@ class ExtractionConfig:
             pkg.strip()
             for pkg in os.getenv(
                 "STANZA_BIOMED_PACKAGES",
-                "anatem|bc4chemd|jnlpba|linnaeus|ncbi_disease",
+                "anatem|bc4chemd|jnlpba|linnaeus|ncbi_disease|i2b2",
             ).split("|")
             if pkg.strip()
         ]
@@ -315,6 +315,7 @@ class EntityRelationExtractor:
             "DNA": "Biomarker",
             "PROEIN": "Biomarker",
             "RNA": "Biomarker",
+            "SPECIES": "Species",
         }
         if lbl in direct_map:
             return direct_map[lbl]
