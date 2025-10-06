@@ -932,17 +932,17 @@ def _relation_allowed_for_types(predicate: str, subj_type: str, obj_type: str) -
 
 
 def extract_entities_relations(
-    meta: Dict[str, Any], text: str
+    meta: Dict[str, Any],
+    text: str,
 ) -> Optional[PaperExtraction]:
     """Extract nodes and relations from a block of text using NER.
 
     This function uses a Stanza NER pipeline to identify entity spans. It
     collects unique entities, assigns a node type via `categorize_entity`, and
-    builds a list of NodeRecord objects. Relations are generated in a naive
-    fashion by connecting every distinct pair of entities found in the text with
-    a 'co_occurs' edge. Evidence spans are omitted because this pipeline does
-    not perform relation classification. Returns None if no entities are
-    detected.
+    builds a list of NodeRecord objects. For each entity pair an NLI-based
+    classifier attempts to assign a typed predicate; pairs that fail to meet the
+    confidence/role checks are discarded instead of emitting fallback
+    `co_occurs` edges. Returns None if no entities are detected.
     """
     paper_label = meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
     if not text.strip():
@@ -1066,12 +1066,8 @@ def extract_entities_relations(
                 pred = "co_occurs"
                 filtered = True
             if pred == "co_occurs":
-                conf = 0.45
-            else:
-                conf = max(
-                    0.55,
-                    min(0.95, inference.entailment + 0.1 * inference.margin),
-                )
+                continue
+            conf = min(1.0, inference.entailment + 0.1 * inference.margin)
             dirn = (
                 "directed"
                 if pred in {"treats", "predicts", "biomarker_for", "measure_of"}
