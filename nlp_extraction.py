@@ -255,6 +255,13 @@ class EntityRelationExtractor:
             logger.error(
                 "Unable to initialise any Stanza biomedical NER package; extractions will be empty."
             )
+        else:
+            pkg_labels = ", ".join(pkg for pkg, _ in pipelines)
+            logger.info(
+                "Finished loading %d Stanza NER pipeline(s): %s",
+                len(pipelines),
+                pkg_labels,
+            )
         self._pipelines = pipelines
         return self._pipelines
 
