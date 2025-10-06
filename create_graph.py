@@ -31,6 +31,8 @@ import math
 import os
 import pathlib
 import re
+import threading
+import time
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -71,6 +73,18 @@ REL_TYPES: Set[str] = {
     "treats",
     "biomarker_for",
     "measure_of",
+}
+
+# Heuristic role constraints to prevent implausible relation/type combos.
+# Keys: predicate -> required node types for subject/object. Omitted sides are unconstrained.
+RELATION_ROLE_CONSTRAINTS: Dict[str, Dict[str, Set[str]]] = {
+    "treats": {"subject": {"Treatment"}, "object": {"Diagnosis", "Symptom"}},
+    "biomarker_for": {"subject": {"Biomarker"}, "object": {"Diagnosis", "Symptom"}},
+    "measure_of": {"subject": {"Measure"}, "object": {"Diagnosis", "Symptom"}},
+    "predicts": {
+        "subject": {"Biomarker", "Measure", "Symptom"},
+        "object": {"Diagnosis", "Symptom"},
+    },
 }
 
 DIAGNOSIS_MASK_LEXICON = {
@@ -378,6 +392,61 @@ _CLIENT = httpx.Client(
     },
     timeout=60.0,
 )
+_OPENALEX_LOCK = threading.Lock()
+_LAST_OPENALEX_REQUEST = 0.0
+_OPENALEX_MIN_INTERVAL = 0.55  # 2 requests/second per rate limit guidance
+_OPENALEX_MAX_RETRIES = 6
+
+
+def _reserve_openalex_slot() -> None:
+    """Block until we are allowed to send the next OpenAlex request."""
+    global _LAST_OPENALEX_REQUEST
+    while True:
+        with _OPENALEX_LOCK:
+            now = time.monotonic()
+            elapsed = now - _LAST_OPENALEX_REQUEST
+            if elapsed >= _OPENALEX_MIN_INTERVAL:
+                _LAST_OPENALEX_REQUEST = now
+                return
+            wait_time = _OPENALEX_MIN_INTERVAL - elapsed
+        time.sleep(max(wait_time, 0.0))
+
+
+def _openalex_request(method: str, path: str, **kwargs: Any) -> httpx.Response:
+    """Send an OpenAlex request with basic rate limiting and retry backoff."""
+    attempt = 0
+    while True:
+        attempt += 1
+        _reserve_openalex_slot()
+        try:
+            response = _CLIENT.request(method, path, **kwargs)
+        except httpx.RequestError:
+            if attempt >= _OPENALEX_MAX_RETRIES:
+                raise
+            # Exponential backoff capped at ~8 seconds
+            backoff = min(2 ** (attempt - 1) * _OPENALEX_MIN_INTERVAL, 8.0)
+            time.sleep(backoff)
+            continue
+
+        if response.status_code != 429:
+            return response
+
+        if attempt >= _OPENALEX_MAX_RETRIES:
+            response.raise_for_status()
+
+        retry_after = response.headers.get("Retry-After")
+        try:
+            retry_delay = float(retry_after) if retry_after else 0.0
+        except ValueError:
+            retry_delay = 0.0
+        retry_delay = max(retry_delay, _OPENALEX_MIN_INTERVAL)
+        time.sleep(retry_delay)
+
+
+def _openalex_get(path: str, **kwargs: Any) -> httpx.Response:
+    return _openalex_request("GET", path, **kwargs)
+
+
 DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 
@@ -409,7 +478,7 @@ def fetch_openalex_page(
     }
     if sort:
         params["sort"] = sort
-    r = _CLIENT.get("/works", params=params)
+    r = _openalex_get("/works", params=params)
     if r.status_code != 200:
         print("Status:", r.status_code)
         print("Reason:", r.reason_phrase)
@@ -1004,18 +1073,32 @@ def classify_relation_via_nli(context: str, subj: str, obj: str) -> RelationInfe
     )
 
 
+def _relation_allowed_for_types(predicate: str, subj_type: str, obj_type: str) -> bool:
+    """Return True when the predicate is compatible with the node type pair."""
+    rules = RELATION_ROLE_CONSTRAINTS.get(predicate)
+    if not rules:
+        return True
+    allowed_subject = rules.get("subject")
+    allowed_object = rules.get("object")
+    if allowed_subject and subj_type not in allowed_subject:
+        return False
+    if allowed_object and obj_type not in allowed_object:
+        return False
+    return True
+
+
 def extract_entities_relations(
-    meta: Dict[str, Any], text: str
+    meta: Dict[str, Any],
+    text: str,
 ) -> Optional[PaperExtraction]:
     """Extract nodes and relations from a block of text using NER.
 
     This function uses a Stanza NER pipeline to identify entity spans. It
     collects unique entities, assigns a node type via `categorize_entity`, and
-    builds a list of NodeRecord objects. Relations are generated in a naive
-    fashion by connecting every distinct pair of entities found in the text with
-    a 'co_occurs' edge. Evidence spans are omitted because this pipeline does
-    not perform relation classification. Returns None if no entities are
-    detected.
+    builds a list of NodeRecord objects. For each entity pair an NLI-based
+    classifier attempts to assign a typed predicate; pairs that fail to meet the
+    confidence/role checks are discarded instead of emitting fallback
+    `co_occurs` edges. Returns None if no entities are detected.
     """
     paper_label = meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
     if not text.strip():
@@ -1045,6 +1128,7 @@ def extract_entities_relations(
             continue
         if raw_name.lower() in _NER_EXCLUDE_TERMS:
             continue
+        tokens = ent.get("tokens") or []
         pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
         if pos_tags:
             informative = {"NOUN", "PROPN", "VERB", "ADJ"}
@@ -1053,6 +1137,12 @@ def extract_entities_relations(
                 continue
             if all(tag in banned for tag in pos_tags):
                 continue
+            noun_like = {"NOUN", "PROPN"}
+            if not any(tag in noun_like for tag in pos_tags):
+                token_count = len(tokens) if tokens else len(raw_name.split())
+                if token_count <= 1:
+                    # Skip adjective-only spans like "psychiatric" that Stanza tags as entities.
+                    continue
         lemma_hint = (ent.get("lemma") or "").strip()
         lemma_source = lemma_hint if lemma_hint else raw_name
         canonical_key = canonical_entity_key(lemma_source)
@@ -1089,7 +1179,6 @@ def extract_entities_relations(
             record.normalizations["ner_sources"] = _dedupe_preserve_order(
                 list(existing_sources) + [source_pkg]
             )
-        tokens = ent.get("tokens") or []
         if tokens:
             existing_tokens = record.normalizations.get("tokens", [])
             record.normalizations["tokens"] = _dedupe_preserve_order(
@@ -1117,6 +1206,8 @@ def extract_entities_relations(
         for j in range(i + 1, len(node_records)):
             subj = node_records[i].canonical_name
             obj = node_records[j].canonical_name
+            subj_type = node_records[i].node_type
+            obj_type = node_records[j].node_type
             pred = "co_occurs"
             conf = 0.5
             sent_ctx = _pick_sentence_context(
@@ -1124,13 +1215,15 @@ def extract_entities_relations(
             )
             inference = classify_relation_via_nli(sent_ctx, subj, obj)
             pred = inference.label
+            filtered = False
+            if pred != "co_occurs" and not _relation_allowed_for_types(
+                pred, subj_type, obj_type
+            ):
+                pred = "co_occurs"
+                filtered = True
             if pred == "co_occurs":
-                conf = 0.45
-            else:
-                conf = max(
-                    0.55,
-                    min(0.95, inference.entailment + 0.1 * inference.margin),
-                )
+                continue
+            conf = min(1.0, inference.entailment + 0.1 * inference.margin)
             dirn = (
                 "directed"
                 if pred in {"treats", "predicts", "biomarker_for", "measure_of"}
@@ -1145,12 +1238,14 @@ def extract_entities_relations(
                     evidence_span=sent_ctx[:300],
                     confidence=conf,
                     qualifiers={
+                        "nli_raw_label": inference.label,
                         "nli_entailment": round(inference.entailment, 4),
                         "nli_margin": round(inference.margin, 4),
                         "nli_reverse_entailment": round(
                             inference.reverse_entailment, 4
                         ),
                         "nli_score": round(inference.score, 4),
+                        "relation_type_filtered": filtered,
                     },
                 )
             )
@@ -1710,6 +1805,32 @@ if __name__ == "__main__":
         )
     if resume_state:
         print(f"[info] Loaded {len(paper_level)} extracted papers from checkpoint.")
+    # Fetch the two buckets of papers from OpenAlex and deduplicate them
+    print("[info] Fetching OpenAlex (top-cited and most-recent)")
+    fetch_buffer = max(0, args.fetch_buffer)
+    query_terms = _normalize_queries(args.query)
+
+    def _fetch_bucket(
+        sort: str, base_n: int
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        full = fetch_top_n(
+            args.query,
+            args.filters,
+            sort=sort,
+            n=base_n + fetch_buffer,
+        )
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for rec in full:
+            key = rec.get("search_query", "")
+            grouped.setdefault(key, []).append(rec)
+
+        primary: List[Dict[str, Any]] = []
+        extra: List[Dict[str, Any]] = []
+        for term in query_terms:
+            term_results = grouped.get(term, [])
+            primary.extend(term_results[:base_n])
+            extra.extend(term_results[base_n:])
+        return primary, extra
 
     checkpoint_metadata = (
         dict(resume_state.metadata) if resume_state and resume_state.metadata else {}
@@ -1741,6 +1862,10 @@ if __name__ == "__main__":
 
     checkpoint_interval = max(0, args.checkpoint_interval)
     periodic_enabled = checkpoint_interval > 0
+    terms_multiplier = max(len(query_terms), 1)
+    target_total = (args.n_top_cited + args.n_most_recent) * terms_multiplier
+    records: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
 
     records: List[Dict[str, Any]]
     if records_from_checkpoint is not None:
