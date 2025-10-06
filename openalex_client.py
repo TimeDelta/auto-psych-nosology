@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import httpx
 
@@ -100,6 +100,18 @@ def _distribute_evenly(total: int, buckets: int) -> List[int]:
     return [base + 1 if i < remainder else base for i in range(buckets)]
 
 
+def _record_key(record: Dict[str, Any]) -> str:
+    for key in ("id", "paper_id", "doi", "title"):
+        value = record.get(key)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+        elif value not in (None, ""):
+            return str(value)
+    return json.dumps(record, sort_keys=True, default=str)
+
+
 def fetch_openalex_page(
     query: str,
     filters: str,
@@ -178,49 +190,55 @@ def fetch_candidate_records(
 ) -> List[Dict[str, Any]]:
     fetch_buffer = max(0, fetch_buffer)
     queries = _normalize_queries(query)
-    terms_multiplier = max(len(queries), 1)
-    target_total = (top_n + recent_n) * terms_multiplier
+    if not queries:
+        queries = [""]
 
-    def _bucket(sort: str, count: int) -> List[Dict[str, Any]]:
-        if not queries:
-            return fetch_top_n(query, filters, sort=sort, n=count + fetch_buffer)
-        extras = _distribute_evenly(fetch_buffer, len(queries))
-        results: List[Dict[str, Any]] = []
+    per_term_buffer = _distribute_evenly(fetch_buffer, len(queries))
+
+    def _collect_bucket(
+        bucket_name: str, sort: str, base_count: int
+    ) -> List[Dict[str, Any]]:
+        if base_count <= 0:
+            return []
+        collected: List[Dict[str, Any]] = []
         for idx, term in enumerate(queries):
-            per_term_n = count + extras[idx]
-            results.extend(_fetch_top_n_single(term, filters, sort, per_term_n))
-        return results
+            per_term_target = max(base_count, 0)
+            per_term_bonus = per_term_buffer[idx] if fetch_buffer else 0
+            per_term_n = per_term_target + per_term_bonus
+            if per_term_n <= 0:
+                continue
+            term_results = _fetch_top_n_single(term, filters, sort, per_term_n)
+            for rank, rec in enumerate(term_results):
+                candidate = dict(rec)
+                source = {
+                    "term": term,
+                    "bucket": bucket_name,
+                    "is_buffer": rank >= per_term_target,
+                    "rank": rank,
+                }
+                candidate["_candidate_sources"] = [source]
+                collected.append(candidate)
+        return collected
 
-    top_results = _bucket("cited_by_count:desc", top_n)
-    recent_results = _bucket("publication_date:desc", recent_n)
-
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for record in top_results + recent_results:
-        key = record.get("search_query", "")
-        grouped.setdefault(key, []).append(record)
+    candidates = _collect_bucket("top", "cited_by_count:desc", top_n)
+    candidates += _collect_bucket("recent", "publication_date:desc", recent_n)
 
     records: List[Dict[str, Any]] = []
-    seen_ids: Set[str] = set()
+    dedup_index: Dict[str, Dict[str, Any]] = {}
 
-    def add_candidates(candidates: Iterable[Dict[str, Any]], limit: int) -> None:
-        for rec in candidates:
-            rec_id = rec.get("id")
-            if not rec_id or rec_id in seen_ids:
-                continue
-            records.append(rec)
-            seen_ids.add(rec_id)
-            if len(records) >= limit:
-                return
+    for candidate in candidates:
+        key = _record_key(candidate)
+        existing = dedup_index.get(key)
+        sources = candidate.get("_candidate_sources") or []
+        if existing is None:
+            dedup_index[key] = candidate
+            records.append(candidate)
+        else:
+            existing_sources = existing.setdefault("_candidate_sources", [])
+            for source in sources:
+                if source not in existing_sources:
+                    existing_sources.append(source)
 
-    for term in queries:
-        term_results = grouped.get(term, [])
-        add_candidates(term_results[:top_n], target_total)
-        add_candidates(term_results[top_n:], target_total)
-
-    extras = [
-        rec for rec in top_results + recent_results if rec.get("id") not in seen_ids
-    ]
-    add_candidates(extras, target_total)
     return records
 
 

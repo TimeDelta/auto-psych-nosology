@@ -187,6 +187,77 @@ class KnowledgeGraphPipeline:
                 f"[info] Candidate papers: {len(records)} (unique across both buckets)"
             )
 
+        LEGACY_BUCKET = "__legacy__"
+        default_targets = {
+            "top": max(config.n_top_cited, 0),
+            "recent": max(config.n_most_recent, 0),
+        }
+        record_lookup: Dict[str, Dict[str, Any]] = {}
+        target_map: Dict[Tuple[str, str], int] = {}
+
+        for rec in records:
+            rec_id = checkpoint_record_id(rec)
+            if rec_id:
+                record_lookup[rec_id] = rec
+            sources = rec.get("_candidate_sources") or []
+            for source in sources:
+                bucket = source.get("bucket")
+                if bucket not in default_targets:
+                    continue
+                target = default_targets[bucket]
+                if target <= 0:
+                    continue
+                term = str(source.get("term", "") or "")
+                target_map.setdefault((term, bucket), target)
+
+        if not target_map:
+            legacy_target = default_targets["top"] + default_targets["recent"]
+            if legacy_target > 0:
+                target_map[("", LEGACY_BUCKET)] = legacy_target
+
+        success_counts: Dict[Tuple[str, str], int] = {key: 0 for key in target_map}
+        successful_total = 0
+        total_required = sum(target_map.values())
+
+        def _bump_success(key: Tuple[str, str]) -> None:
+            nonlocal successful_total
+            target = target_map.get(key)
+            if target is None or target <= 0:
+                return
+            current = success_counts.get(key, 0)
+            if current >= target:
+                return
+            success_counts[key] = current + 1
+            successful_total += 1
+
+        if paper_level:
+            for extraction in paper_level:
+                extraction_key = checkpoint_record_id(
+                    {
+                        "id": extraction.paper_id,
+                        "doi": extraction.doi,
+                        "title": extraction.title,
+                    }
+                )
+                record_meta = record_lookup.get(extraction_key)
+                if record_meta is None:
+                    continue
+                sources = record_meta.get("_candidate_sources") or []
+                if not sources and ("", LEGACY_BUCKET) in target_map:
+                    sources = record_meta.setdefault(
+                        "_candidate_sources",
+                        [{"term": "", "bucket": LEGACY_BUCKET, "is_buffer": False}],
+                    )
+                seen_keys: set[Tuple[str, str]] = set()
+                for source in sources:
+                    bucket = source.get("bucket") or LEGACY_BUCKET
+                    term = str(source.get("term", "") or "")
+                    key = (term, bucket)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    _bump_success(key)
+
         def persist_checkpoint(status: Optional[str] = None) -> None:
             metadata = dict(checkpoint_metadata)
             if status is not None:
@@ -212,9 +283,30 @@ class KnowledgeGraphPipeline:
         skipped_existing = 0
 
         for record in tqdm(records):
+            if total_required > 0 and successful_total >= total_required:
+                break
             record_id = checkpoint_record_id(record)
             if record_id in completed_ids:
                 skipped_existing += 1
+                continue
+            sources = record.get("_candidate_sources") or []
+            if not sources and ("", LEGACY_BUCKET) in target_map:
+                sources = record.setdefault(
+                    "_candidate_sources",
+                    [{"term": "", "bucket": LEGACY_BUCKET, "is_buffer": False}],
+                )
+            needed_keys: set[Tuple[str, str]] = set()
+            for source in sources:
+                bucket = source.get("bucket") or LEGACY_BUCKET
+                term = str(source.get("term", "") or "")
+                key = (term, bucket)
+                target = target_map.get(key)
+                if target is None or target <= 0:
+                    continue
+                if success_counts.get(key, 0) >= target:
+                    continue
+                needed_keys.add(key)
+            if not needed_keys:
                 continue
             meta = {
                 "id": record.get("id"),
@@ -237,6 +329,8 @@ class KnowledgeGraphPipeline:
                 if extraction:
                     paper_level.append(extraction)
                     processed_new += 1
+                    for key in needed_keys:
+                        _bump_success(key)
             except KeyboardInterrupt:
                 print("[warn] Interrupted by user; saving checkpoint before exit.")
                 persist_checkpoint(status="interrupted")
