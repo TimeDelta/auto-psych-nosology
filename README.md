@@ -16,6 +16,7 @@
 ## Code Notes
 - This project uses python 3.10
 - Must install [graph tool](https://graph-tool.skewed.de) in order to run the [create_hSBM_partitions.py](./create_hSBM_partitions.py) script.
+- In order to use this for something other than psychiatry, must change `"concepts.id:C61535369",` filter part in [openalex_client.py](./openalex_client.py)
 
 ## Introduction
 Psychiatric classification remains dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM) and the International Classification of Diseases (ICD).
