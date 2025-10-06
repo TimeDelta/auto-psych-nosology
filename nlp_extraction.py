@@ -130,7 +130,7 @@ class ExtractionConfig:
             pkg.strip()
             for pkg in os.getenv(
                 "STANZA_BIOMED_PACKAGES",
-                "anatem|bc4chemd|jnlpba|linnaeus|ncbi_disease|i2b2",
+                "anatem|bc5cdr|jnlpba|linnaeus|ncbi_disease|i2b2",
             ).split("|")
             if pkg.strip()
         ]
