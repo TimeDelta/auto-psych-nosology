@@ -136,12 +136,13 @@ def export_visnetwork_html(
 
     nodes = []
     for n, attrs in graph.nodes(data=True):
+        attrs_str = stringify_complex_attrs(attrs)
         label = str(attrs.get(node_label_attr, n))
         ntype = str(attrs.get(node_type_attr, "node"))
         color = pick_color(ntype, node_colors, DEFAULT_NODE_PALETTE)
         title_lines = [str(label)]
         title_lines.extend(
-            f"{k}: {v}" for k, v in sorted(attrs.items()) if k != node_label_attr
+            f"{k}: {v}" for k, v in sorted(attrs_str.items()) if k != node_label_attr
         )
         title = "\n".join(title_lines)
         nodes.append(
@@ -158,9 +159,10 @@ def export_visnetwork_html(
     edges = []
     if graph.is_multigraph():
         for u, v, k, attrs in graph.edges(keys=True, data=True):
+            attrs_str = stringify_complex_attrs(attrs)
             etype = str(attrs.get(edge_type_attr, "edge"))
             color = pick_color(etype, edge_colors, DEFAULT_EDGE_PALETTE)
-            title_lines = [f"{kk}: {vv}" for kk, vv in sorted(attrs.items())]
+            title_lines = [f"{kk}: {vv}" for kk, vv in sorted(attrs_str.items())]
             title = "\n".join(title_lines) if title_lines else etype
             edges.append(
                 {
@@ -174,9 +176,10 @@ def export_visnetwork_html(
             )
     else:
         for u, v, attrs in graph.edges(data=True):
+            attrs_str = stringify_complex_attrs(attrs)
             etype = str(attrs.get(edge_type_attr, "edge"))
             color = pick_color(etype, edge_colors, DEFAULT_EDGE_PALETTE)
-            title_lines = [f"{kk}: {vv}" for kk, vv in sorted(attrs.items())]
+            title_lines = [f"{kk}: {vv}" for kk, vv in sorted(attrs_str.items())]
             title = "\n".join(title_lines) if title_lines else etype
             edges.append(
                 {

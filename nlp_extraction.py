@@ -14,7 +14,13 @@ import torch
 from nltk.tokenize import sent_tokenize
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from models import NodeRecord, PaperExtraction, RelationRecord
+from models import (
+    EVIDENCE_RELATIONS,
+    ClaimDescriptor,
+    NodeRecord,
+    PaperExtraction,
+    RelationRecord,
+)
 from text_normalization import (
     canonical_entity_display,
     canonical_entity_key,
@@ -39,21 +45,32 @@ RELATION_ROLE_CONSTRAINTS: Dict[str, Dict[str, Set[str]]] = {
     },
 }
 
+_FALLBACK_RELATION_RULES: Tuple[Tuple[Set[str], Set[str], str], ...] = (
+    ({"Treatment"}, {"Diagnosis", "Symptom"}, "treats"),
+    ({"Biomarker"}, {"Diagnosis", "Symptom"}, "biomarker_for"),
+    ({"Measure"}, {"Diagnosis", "Symptom"}, "measure_of"),
+    ({"Symptom"}, {"Diagnosis", "Symptom"}, "predicts"),
+)
+
 _RELATION_MODE = "nli"
 _NLI_MODEL_NAME = "pritamdeka/PubMedBERT-MNLI-MedNLI"
-_REL_TEMPLATES = {
+_SUBSTANTIVE_REL_TEMPLATES = {
     "treats": "{SUBJ} treats {OBJ}.",
     "biomarker_for": "{SUBJ} is a biomarker for {OBJ}.",
     "measure_of": "{SUBJ} is a measure of {OBJ}.",
     "predicts": "{SUBJ} predicts {OBJ}.",
-    "supports": "{SUBJ} is positively associated with {OBJ}.",
-    "contradicts": "{SUBJ} is negatively associated with {OBJ}.",
 }
-_REL_TEMPLATES_REV = {
+_SUBSTANTIVE_REL_TEMPLATES_REV = {
     "treats": "{OBJ} treats {SUBJ}.",
     "biomarker_for": "{OBJ} is a biomarker for {SUBJ}.",
     "measure_of": "{OBJ} is a measure of {SUBJ}.",
     "predicts": "{OBJ} predicts {SUBJ}.",
+}
+_EVIDENCE_REL_TEMPLATES = {
+    "supports": "{SUBJ} is positively associated with {OBJ}.",
+    "contradicts": "{SUBJ} is negatively associated with {OBJ}.",
+    "replicates": "{SUBJ} replicates findings reported for {OBJ}.",
+    "null_reported": "{SUBJ} reports null findings with respect to {OBJ}.",
 }
 
 _REL_DIRECTION_PENALTY = float(os.getenv("RELATION_NLI_REVERSE_PENALTY", "0.5"))
@@ -290,9 +307,14 @@ class EntityRelationExtractor:
             "PROCEDURE": "Treatment",
             "THERAPY": "Treatment",
             "MEDICATION": "Treatment",
-            "DEVICE": "Measure",
+            "DEVICE": "Treatment",
             "ANATOMY": "Biomarker",
             "ANATOMICAL": "Biomarker",
+            "CELL_LINE": "Biomarker",
+            "CELL_TYPE": "Biomarker",
+            "DNA": "Biomarker",
+            "PROEIN": "Biomarker",
+            "RNA": "Biomarker",
         }
         if lbl in direct_map:
             return direct_map[lbl]
@@ -322,6 +344,14 @@ class EntityRelationExtractor:
             return False
         return True
 
+    def _fallback_relation_for_types(
+        self, subj_type: str, obj_type: str
+    ) -> Optional[str]:
+        for subj_candidates, obj_candidates, predicate in _FALLBACK_RELATION_RULES:
+            if subj_type in subj_candidates and obj_type in obj_candidates:
+                return predicate
+        return None
+
     def _pick_sentence_context(
         self, text: str, s1: str, s2: str, window: int = 2
     ) -> str:
@@ -348,51 +378,49 @@ class EntityRelationExtractor:
         hi = min(len(sentences), max(indexes) + window + 1)
         return " ".join(sentences[lo:hi])
 
-    def classify_relation_via_nli(
-        self, context: str, subj: str, obj: str
-    ) -> RelationInference:
+    def _score_relation_templates(
+        self,
+        context: str,
+        subj: str,
+        obj: str,
+        templates: Dict[str, str],
+        reverse_templates: Optional[Dict[str, str]] = None,
+    ) -> Optional[RelationInference]:
         if not context.strip():
-            return RelationInference(
-                label="co_occurs", entailment=0.0, score=0.0, margin=0.0
-            )
+            return None
         scored: List[Tuple[str, float, NliScores, Optional[NliScores]]] = []
-        for rel, template in _REL_TEMPLATES.items():
+        for rel, template in templates.items():
             forward = self._nli_probs(context, template.format(SUBJ=subj, OBJ=obj))
             reverse: Optional[NliScores] = None
-            if rel in _REL_TEMPLATES_REV:
+            if reverse_templates and rel in reverse_templates:
                 reverse = self._nli_probs(
-                    context, _REL_TEMPLATES_REV[rel].format(SUBJ=subj, OBJ=obj)
+                    context, reverse_templates[rel].format(SUBJ=subj, OBJ=obj)
                 )
             score = forward.signal
             if reverse is not None:
                 penalty = max(0.0, reverse.signal)
                 score -= _REL_DIRECTION_PENALTY * penalty
             scored.append((rel, score, forward, reverse))
+        if not scored:
+            return None
         scored.sort(key=lambda item: item[1], reverse=True)
         best_rel, best_score, best_forward, best_reverse = scored[0]
         runner_score = scored[1][1] if len(scored) > 1 else -1.0
         margin = best_score - runner_score
-
         reverse_entail = best_reverse.entailment if best_reverse else 0.0
         directional_conflict = (
-            best_rel in _REL_TEMPLATES_REV
+            bool(reverse_templates)
+            and best_rel in (reverse_templates or {})
             and best_reverse is not None
             and (reverse_entail - best_forward.entailment) >= _REL_REVERSE_GAP
         )
-
         if (
             best_forward.entailment < _REL_ENTAILMENT_THRESHOLD
             or best_score < _REL_SCORE_THRESHOLD
             or margin < _REL_MARGIN_THRESHOLD
             or directional_conflict
         ):
-            return RelationInference(
-                label="co_occurs",
-                entailment=best_forward.entailment,
-                score=best_score,
-                margin=max(0.0, margin),
-                reverse_entailment=reverse_entail,
-            )
+            return None
         return RelationInference(
             label=best_rel,
             entailment=best_forward.entailment,
@@ -400,6 +428,21 @@ class EntityRelationExtractor:
             margin=margin,
             reverse_entailment=reverse_entail,
         )
+
+    def classify_relation_via_nli(
+        self, context: str, subj: str, obj: str
+    ) -> Tuple[Optional[RelationInference], Optional[RelationInference]]:
+        relation = self._score_relation_templates(
+            context,
+            subj,
+            obj,
+            _SUBSTANTIVE_REL_TEMPLATES,
+            _SUBSTANTIVE_REL_TEMPLATES_REV,
+        )
+        evidence = self._score_relation_templates(
+            context, subj, obj, _EVIDENCE_REL_TEMPLATES
+        )
+        return relation, evidence
 
     def _ner_pipeline(self, text: str) -> List[Dict[str, Any]]:
         if not text.strip():
@@ -569,21 +612,133 @@ class EntityRelationExtractor:
                 context = self._pick_sentence_context(
                     text, surface_lookup[subj], surface_lookup[obj]
                 )
-                inference = self.classify_relation_via_nli(context, subj, obj)
-                predicate = inference.label
-                if predicate != "co_occurs" and not self._relation_allowed_for_types(
-                    predicate, subj_type, obj_type
-                ):
-                    predicate = "co_occurs"
-                if predicate == "co_occurs":
+                relation_inf, evidence_inf = self.classify_relation_via_nli(
+                    context, subj, obj
+                )
+                candidates: List[Dict[str, Any]] = [
+                    {
+                        "subj": subj,
+                        "obj": obj,
+                        "subj_type": subj_type,
+                        "obj_type": obj_type,
+                        "relation": relation_inf,
+                        "evidence": evidence_inf,
+                    }
+                ]
+
+                needs_alternate_orientation = (
+                    relation_inf is None
+                    or not self._relation_allowed_for_types(
+                        relation_inf.label, subj_type, obj_type
+                    )
+                )
+                if needs_alternate_orientation:
+                    swapped_relation, swapped_evidence = self.classify_relation_via_nli(
+                        context, obj, subj
+                    )
+                    candidates.append(
+                        {
+                            "subj": obj,
+                            "obj": subj,
+                            "subj_type": obj_type,
+                            "obj_type": subj_type,
+                            "relation": swapped_relation,
+                            "evidence": swapped_evidence,
+                        }
+                    )
+
+                chosen: Optional[Dict[str, Any]] = None
+                for candidate in candidates:
+                    candidate_rel = candidate["relation"]
+                    if candidate_rel and self._relation_allowed_for_types(
+                        candidate_rel.label,
+                        candidate["subj_type"],
+                        candidate["obj_type"],
+                    ):
+                        chosen = candidate
+                        break
+
+                if chosen is None:
+                    fallback_candidate: Optional[Dict[str, Any]] = next(
+                        (
+                            cand
+                            for cand in candidates
+                            if cand["evidence"] is not None
+                            and self._fallback_relation_for_types(
+                                cand["subj_type"], cand["obj_type"]
+                            )
+                        ),
+                        None,
+                    )
+                    if fallback_candidate is None:
+                        continue
+                    fallback_predicate = self._fallback_relation_for_types(
+                        fallback_candidate["subj_type"], fallback_candidate["obj_type"]
+                    )
+                    assert fallback_predicate is not None
+                    evidence_for_fallback = fallback_candidate["evidence"]
+                    assert evidence_for_fallback is not None
+                    fallback_relation = RelationInference(
+                        label=fallback_predicate,
+                        entailment=evidence_for_fallback.entailment,
+                        score=evidence_for_fallback.score,
+                        margin=evidence_for_fallback.margin,
+                        reverse_entailment=evidence_for_fallback.reverse_entailment,
+                    )
+                    chosen = dict(fallback_candidate)
+                    chosen["relation"] = fallback_relation
+
+                if chosen is None:
                     continue
-                confidence = min(1.0, inference.entailment + 0.1 * inference.margin)
+
+                relation_chosen: RelationInference = chosen["relation"]
+                evidence_chosen: Optional[RelationInference] = chosen["evidence"]
+                subj = chosen["subj"]
+                obj = chosen["obj"]
+                subj_type = chosen["subj_type"]
+                obj_type = chosen["obj_type"]
+
+                predicate = relation_chosen.label
+                confidence = min(
+                    1.0, relation_chosen.entailment + 0.1 * relation_chosen.margin
+                )
                 directionality = (
                     "directed"
                     if predicate
                     in {"treats", "predicts", "biomarker_for", "measure_of"}
                     else "undirected"
                 )
+                claim_descriptor = self._build_claim_descriptor(predicate, subj, obj)
+                qualifiers: Dict[str, Any] = {
+                    "nli_raw_label": relation_chosen.label,
+                    "nli_entailment": round(relation_chosen.entailment, 4),
+                    "nli_margin": round(relation_chosen.margin, 4),
+                    "nli_reverse_entailment": round(
+                        relation_chosen.reverse_entailment, 4
+                    ),
+                    "nli_score": round(relation_chosen.score, 4),
+                }
+                if claim_descriptor:
+                    qualifiers["claim"] = claim_descriptor.model_dump(exclude_none=True)
+                if evidence_chosen is not None:
+                    evidence_descriptor = self._build_claim_descriptor(
+                        evidence_chosen.label, subj, obj
+                    )
+                    qualifiers.update(
+                        {
+                            "evidence_label": evidence_chosen.label,
+                            "evidence_entailment": round(evidence_chosen.entailment, 4),
+                            "evidence_margin": round(evidence_chosen.margin, 4),
+                            "evidence_score": round(evidence_chosen.score, 4),
+                            "evidence_reverse_entailment": round(
+                                evidence_chosen.reverse_entailment, 4
+                            ),
+                        }
+                    )
+                    if evidence_descriptor:
+                        qualifiers["evidence_claim"] = evidence_descriptor.model_dump(
+                            exclude_none=True
+                        )
                 relations.append(
                     RelationRecord(
                         subject=subj,
@@ -592,15 +747,8 @@ class EntityRelationExtractor:
                         directionality=directionality,
                         evidence_span=context[:300],
                         confidence=confidence,
-                        qualifiers={
-                            "nli_raw_label": inference.label,
-                            "nli_entailment": round(inference.entailment, 4),
-                            "nli_margin": round(inference.margin, 4),
-                            "nli_reverse_entailment": round(
-                                inference.reverse_entailment, 4
-                            ),
-                            "nli_score": round(inference.score, 4),
-                        },
+                        claim=claim_descriptor,
+                        qualifiers=qualifiers,
                     )
                 )
         return PaperExtraction(
@@ -636,6 +784,76 @@ class EntityRelationExtractor:
         record.synonyms = dedupe_preserve_order(
             list(record.synonyms)
             + [form for form in normalized_forms if form != record.canonical_name]
+        )
+
+    def _build_claim_descriptor(
+        self, predicate: str, subject: str, obj: str
+    ) -> ClaimDescriptor:
+        """Construct a claim descriptor that explains what an evidence edge supports."""
+
+        predicate = predicate.lower()
+        if predicate == "treats":
+            return ClaimDescriptor(
+                type="causal",
+                statement=f"{subject} treats {obj}",
+                direction="positive",
+                evidence_type="nli_text_entailment",
+            )
+        if predicate == "predicts":
+            return ClaimDescriptor(
+                type="association",
+                statement=f"{subject} predicts {obj}",
+                direction="positive",
+                evidence_type="nli_text_entailment",
+            )
+        if predicate == "biomarker_for":
+            return ClaimDescriptor(
+                type="mechanistic",
+                statement=f"{subject} is a biomarker for {obj}",
+                direction="positive",
+                evidence_type="nli_text_entailment",
+            )
+        if predicate == "measure_of":
+            return ClaimDescriptor(
+                type="measurement",
+                statement=f"{subject} is a measure of {obj}",
+                direction="positive",
+                evidence_type="nli_text_entailment",
+            )
+        if predicate == "supports":
+            return ClaimDescriptor(
+                type="association",
+                statement=f"{subject} is positively associated with {obj}",
+                direction="positive",
+                evidence_type="nli_text_entailment",
+            )
+        if predicate == "contradicts":
+            return ClaimDescriptor(
+                type="association",
+                statement=f"{subject} is negatively associated with {obj}",
+                direction="negative",
+                evidence_type="nli_text_entailment",
+            )
+        if predicate == "replicates":
+            return ClaimDescriptor(
+                type="measurement",
+                statement=f"{subject} replicates findings reported for {obj}",
+                direction="positive",
+                evidence_type="nli_text_entailment",
+            )
+        if predicate == "null_reported":
+            return ClaimDescriptor(
+                type="association",
+                statement=f"{subject} reports null findings with respect to {obj}",
+                direction="null",
+                evidence_type="nli_text_entailment",
+            )
+
+        return ClaimDescriptor(
+            statement=f"{subject} relates to {obj}",
+            type="unknown",
+            direction="unknown",
+            evidence_type="nli_text_entailment",
         )
 
 

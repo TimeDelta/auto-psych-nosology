@@ -100,23 +100,54 @@ def build_multilayer_graph(
         if "lemma" in row and isinstance(row["lemma"], str) and row["lemma"]:
             graph.nodes[name]["lemma"] = row["lemma"]
     for _, row in relations_df.iterrows():
-        graph.add_edge(
-            row["subject"],
-            row["object"],
-            predicate=row["predicate"],
-            paper_id=row["paper_id"],
-            directionality=row["directionality"],
-            evidence_span=row["evidence_span"],
-            confidence=float(row["confidence"]),
-            qualifiers=json.loads(row["qualifiers"]),
-            n_papers=int(row.get("n_papers", 1) or 1),
-            paper_ids=(
+        qualifiers_raw = row["qualifiers"]
+        if isinstance(qualifiers_raw, dict):
+            qualifiers_dict = qualifiers_raw
+        elif isinstance(qualifiers_raw, str) and qualifiers_raw:
+            try:
+                qualifiers_dict = json.loads(qualifiers_raw)
+            except Exception:
+                qualifiers_dict = {}
+        else:
+            qualifiers_dict = {}
+
+        edge_attrs: Dict[str, Any] = {
+            "predicate": row["predicate"],
+            "paper_id": row["paper_id"],
+            "directionality": row["directionality"],
+            "evidence_span": row["evidence_span"],
+            "confidence": float(row["confidence"]),
+            "qualifiers": qualifiers_dict,
+            "n_papers": int(row.get("n_papers", 1) or 1),
+            "paper_ids": (
                 row["paper_ids"]
                 if isinstance(row["paper_ids"], list)
                 else json.loads(row["paper_ids"])
                 if isinstance(row["paper_ids"], str)
                 else []
             ),
+        }
+
+        def _flatten(prefix: str, value: Any) -> None:
+            key_name = f"qual_{prefix}" if prefix else "qualifier"
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    child_prefix = f"{prefix}_{sub_key}" if prefix else str(sub_key)
+                    _flatten(child_prefix, sub_value)
+            elif isinstance(value, (list, tuple)):
+                edge_attrs[key_name] = json.dumps(value, ensure_ascii=False)
+            elif isinstance(value, (str, int, float, bool)) or value is None:
+                edge_attrs[key_name] = value if value is not None else ""
+            else:
+                edge_attrs[key_name] = json.dumps(value, ensure_ascii=False)
+
+        for qual_key, qual_value in qualifiers_dict.items():
+            _flatten(str(qual_key), qual_value)
+
+        graph.add_edge(
+            row["subject"],
+            row["object"],
+            **edge_attrs,
         )
     return graph
 

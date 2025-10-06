@@ -103,9 +103,11 @@ Any observed alignment that later emerges with HiTOP or RDoC therefore reflects 
 
 ### Graph Creation
 Multiplex Graph Design
-- Node Types: symptoms, diagnoses (will be ignored in partitioning), treatments, metrics and biomarkers
-- Edge Types: support for / against, prediction, co-occurrence, etc.
-- Edge property for the number of relevant papers
+- Node Types: extractor currently emits `Symptom`, `Diagnosis`, `Biomarker`, `Treatment`, and `Measure`
+- Structural Relation Types (directed where appropriate): `treats`, `predicts`, `biomarker_for`, `measure_of`
+- Evidence Qualifiers: each structural edge stores the NLI evidence label (`supports`, `contradicts`, `replicates`, `null_reported`) plus scores, margins, and an embedded `ClaimDescriptor`
+- Orientation Logic: for every node pair we test both subject->object and object->subject hypotheses; if neither satisfies the role constraints, an evidence-backed fallback (e.g., Treatment→Diagnosis as `treats`) is applied so clinically plausible edges persist instead of isolating nodes
+- Export Schema: edge qualifiers are flattened as `qual_*` attributes (e.g., `qual_nli_score`, `qual_claim`, `qual_evidence_label`) so GraphML/HTML tooltips surface the underlying evidence without manual JSON parsing
 
 1. Specify queries (“bipolar disorder”, “major depressive disorder”, “schizoaffective disorder”, “anxiety disorder”, “PTSD”, “OCD”, “OCPD")
 1. Fetch text from OpenAlex (falling back to PMC) for top M most cited and N most recent papers for each query
