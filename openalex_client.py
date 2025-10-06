@@ -92,6 +92,14 @@ def _normalize_queries(query: Union[str, Sequence[str]]) -> List[str]:
     return [q for q in items if q]
 
 
+def _distribute_evenly(total: int, buckets: int) -> List[int]:
+    if buckets <= 0:
+        return []
+    base = total // buckets
+    remainder = total % buckets
+    return [base + 1 if i < remainder else base for i in range(buckets)]
+
+
 def fetch_openalex_page(
     query: str,
     filters: str,
@@ -174,7 +182,14 @@ def fetch_candidate_records(
     target_total = (top_n + recent_n) * terms_multiplier
 
     def _bucket(sort: str, count: int) -> List[Dict[str, Any]]:
-        return fetch_top_n(query, filters, sort=sort, n=count + fetch_buffer)
+        if not queries:
+            return fetch_top_n(query, filters, sort=sort, n=count + fetch_buffer)
+        extras = _distribute_evenly(fetch_buffer, len(queries))
+        results: List[Dict[str, Any]] = []
+        for idx, term in enumerate(queries):
+            per_term_n = count + extras[idx]
+            results.extend(_fetch_top_n_single(term, filters, sort, per_term_n))
+        return results
 
     top_results = _bucket("cited_by_count:desc", top_n)
     recent_results = _bucket("publication_date:desc", recent_n)
