@@ -1,4 +1,17 @@
 # Automated Psychiatric Nosology via Partitioning of Multiplex Graph Generated from Mining Scientific Papers for Findings
+## Table of Contents
+- [Introduction](#introduction)
+- [Background / Literature Review](#background-literature-review)
+    - [Biomarkers of Psychopathology](#biomarkers-of-psychopathology)
+    - [Transdiagnostic Dimensions](#transdiagnostic-dimensions)
+    - [Automated Methods](#automated-methods)
+    - [Conclusion](#conclusion)
+- [Research Question](#research-question)
+- [Hypothesis](#hypothesis)
+- [Methods](#methods)
+    - [Graph Creation](#graph-creation)
+    - [Preventing Biased Alignment](#preventing-biased-alignment)
+
 ## Introduction
 Psychiatric classification remains dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM) and the International Classification of Diseases (ICD).
 While clinically useful, these frameworks have been widely criticized for high comorbidity, arbitrary diagnostic thresholds, and limited biological validity. Meta-analytic research increasingly demonstrates that psychiatric disorders rarely conform to discrete boundaries, but instead share overlapping symptoms and biological substrates.
