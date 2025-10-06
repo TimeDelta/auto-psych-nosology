@@ -1,6 +1,6 @@
 # Automated Psychiatric Nosology via Partitioning of Multiplex Graph Generated from Mining Scientific Papers for Findings
 ## Introduction
-Psychiatric classification remains dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM-5) and the International Classification of Diseases (ICD).
+Psychiatric classification remains dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM) and the International Classification of Diseases (ICD).
 While clinically useful, these frameworks have been widely criticized for high comorbidity, arbitrary diagnostic thresholds, and limited biological validity. Meta-analytic research increasingly demonstrates that psychiatric disorders rarely conform to discrete boundaries, but instead share overlapping symptoms and biological substrates.
 
 In response, dimensional alternatives have emerged.
@@ -17,11 +17,11 @@ The resulting structures are evaluated for parsimony, stability, and alignment w
 The goal is to assess whether a data-driven, integrative method can approximate or extend current frameworks, offering psychiatry a more biologically grounded and reproducible classification system without the overhead of manually building the nosology.
 
 ## Background / Literature Review
-Psychiatric nosology has long been dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM-5) and the International Classification of Diseases (ICD).
+Psychiatric nosology has long been dominated by categorical systems such as the DSM and the ICD.
 These frameworks define discrete diagnostic entities and draw strict boundaries between normal and pathological states.
 However, their limitations are well established, including high comorbidity rates, arbitrary thresholds, and limited biological validity [1], [2].
 Categorical standards such as DSM-5 impose rigid yes/no decisions regarding diagnosis [3], despite evidence from meta-analytic research indicating that most psychiatric disorders are better conceptualized as continuous spectra rather than binary categories [4].
-These concerns have motivated the development of dimensional alternatives, notably the Hierarchical Taxonomy of Psychopathology (HiTOP) [3] and the Research Domain Criteria (RDoC) [5].
+These concerns have motivated the development of dimensional alternatives, notably the HiTOP [3] and the RDoC [5].
 Each represents a unique effort to reconceptualize psychiatric nosology: HiTOP is symptom-driven and data-based, while RDoC is neuroscience-driven and theory-based.
 This review examines evidence from biomarkers, transdiagnostic dimensions, and computational models.
 Findings converge on the theme that psychiatric disorders are not discrete entities but reflect shared, transdiagnostic mechanisms with disorder-specific features sometimes co-occurring and thus are best represented dimensionally.
@@ -137,6 +137,12 @@ This ensures that any observed alignment reflects genuine structural similaritie
         - add inter-cluster gates to decide which inter-cluster connections matter
         - learn separate inter-cluster matrix per edge type
         - maybe also model absent edges in order to help prevent trivial solutions like collapse of communities to all of one node type to one community for each node type
+
+## Abbreviations
+- DSM = Diagnostic and Statistical Manual of Mental Disorders
+- HiTOP = Hierarchical Taxonomy of Psychopathology
+- ICD = International Classification of Diseases
+- RDoC = Research Domain Criteria
 
 ## References
 1. R. Kotov et al., “The Hierarchical Taxonomy of Psychopathology (HiTOP): A dimensional alternative to traditional nosologies,” J. Abnorm. Psychol., vol. 126, no. 4, pp. 454–477, 2017.
