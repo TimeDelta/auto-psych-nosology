@@ -12,6 +12,8 @@
 - [Methods](#methods)
     - [Graph Creation](#graph-creation)
     - [Preventing Biased Alignment](#preventing-biased-alignment)
+- [Abbreviations](#abbreviations)
+- [References](#references)
 
 ## Code Notes
 - This project uses python 3.10
