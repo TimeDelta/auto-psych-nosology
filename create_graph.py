@@ -169,6 +169,105 @@ class KnowledgeGraphPipeline:
         checkpoint_interval = max(0, config.checkpoint_interval)
         periodic_enabled = checkpoint_interval > 0
 
+        LEGACY_BUCKET = "__legacy__"
+        default_targets = {
+            "top": max(config.n_top_cited, 0),
+            "recent": max(config.n_most_recent, 0),
+        }
+        BUCKET_PRIORITY = {"top": 0, "recent": 1}
+
+        def _bucket_priority(bucket: str) -> int:
+            return BUCKET_PRIORITY.get(bucket, 2)
+
+        def _source_sort_key(source: Dict[str, Any]) -> Tuple[int, int, int, str]:
+            bucket = str(source.get("bucket") or LEGACY_BUCKET)
+            is_buffer = 1 if source.get("is_buffer") else 0
+            rank_raw = source.get("rank")
+            rank = rank_raw if isinstance(rank_raw, int) else 1_000_000
+            term = str(source.get("term", "") or "")
+            return (is_buffer, _bucket_priority(bucket), rank, term)
+
+        def _selection_priority(
+            item: Tuple[Tuple[str, str], Dict[str, Any], int]
+        ) -> Tuple[int, int, int, int]:
+            key, source, remaining = item
+            bucket_order = _bucket_priority(key[1])
+            is_buffer = 1 if source.get("is_buffer") else 0
+            rank_raw = source.get("rank")
+            rank = rank_raw if isinstance(rank_raw, int) else 1_000_000
+            return (-remaining, bucket_order, is_buffer, rank)
+
+        def _select_needed_keys_from_sources(
+            sources: Sequence[Dict[str, Any]],
+            target_map_local: Dict[Tuple[str, str], int],
+            success_counts_ref: Dict[Tuple[str, str], int],
+        ) -> set[Tuple[str, str]]:
+            candidates: List[Tuple[Tuple[str, str], Dict[str, Any], int]] = []
+            for source in sorted(list(sources), key=_source_sort_key):
+                bucket = str(source.get("bucket") or LEGACY_BUCKET)
+                term = str(source.get("term", "") or "")
+                key = (term, bucket)
+                target = target_map_local.get(key)
+                if target is None or target <= 0:
+                    continue
+                remaining = target - success_counts_ref.get(key, 0)
+                if remaining <= 0:
+                    continue
+                candidates.append((key, source, remaining))
+            if not candidates:
+                return set()
+            selected_key, _, _ = min(candidates, key=_selection_priority)
+            return {selected_key}
+
+        def _preview_target_map(
+            records_seq: Sequence[Dict[str, Any]]
+        ) -> Dict[Tuple[str, str], int]:
+            preview: Dict[Tuple[str, str], int] = {}
+            for rec in records_seq:
+                sources = rec.get("_candidate_sources") or []
+                for source in sources:
+                    bucket = source.get("bucket")
+                    if bucket not in default_targets:
+                        continue
+                    target = default_targets[bucket]
+                    if target <= 0:
+                        continue
+                    term = str(source.get("term", "") or "")
+                    preview.setdefault((term, bucket), target)
+            if not preview:
+                legacy_target = default_targets["top"] + default_targets["recent"]
+                if legacy_target > 0:
+                    preview[("", LEGACY_BUCKET)] = legacy_target
+            return preview
+
+        def _simulate_assignable(
+            records_seq: Sequence[Dict[str, Any]],
+            target_map_local: Dict[Tuple[str, str], int],
+        ) -> int:
+            if not target_map_local:
+                return 0
+            simulated_counts: Dict[Tuple[str, str], int] = {
+                key: 0 for key in target_map_local
+            }
+            simulated_total = 0
+            for rec in records_seq:
+                sources = rec.get("_candidate_sources") or []
+                if not sources and ("", LEGACY_BUCKET) in target_map_local:
+                    sources = [
+                        {"term": "", "bucket": LEGACY_BUCKET, "is_buffer": False}
+                    ]
+                assignments = _select_needed_keys_from_sources(
+                    sources, target_map_local, simulated_counts
+                )
+                if not assignments:
+                    continue
+                for key in assignments:
+                    simulated_counts[key] = simulated_counts.get(key, 0) + 1
+                    simulated_total += 1
+            return simulated_total
+
+        effective_fetch_buffer = max(config.fetch_buffer, 0)
+
         if records_from_checkpoint is not None:
             records = records_from_checkpoint
             print(
@@ -176,22 +275,67 @@ class KnowledgeGraphPipeline:
             )
         else:
             print("[info] Fetching OpenAlex (top-cited and most-recent)")
-            records = fetch_candidate_records(
-                config.query,
-                config.filters,
-                config.n_top_cited,
-                config.n_most_recent,
-                fetch_buffer=config.fetch_buffer,
-            )
-            print(
-                f"[info] Candidate papers: {len(records)} (unique across both buckets)"
-            )
+            current_fetch_buffer = effective_fetch_buffer
+            auto_fetch_limit = max(20, (current_fetch_buffer or 1) * 4)
+            previous_possible = -1
 
-        LEGACY_BUCKET = "__legacy__"
-        default_targets = {
-            "top": max(config.n_top_cited, 0),
-            "recent": max(config.n_most_recent, 0),
-        }
+            while True:
+                records = fetch_candidate_records(
+                    config.query,
+                    config.filters,
+                    config.n_top_cited,
+                    config.n_most_recent,
+                    fetch_buffer=current_fetch_buffer,
+                )
+                print(
+                    "[info] Candidate papers: "
+                    + f"{len(records)} (unique across both buckets; fetch_buffer={current_fetch_buffer})"
+                )
+                preview_target_map = _preview_target_map(records)
+                total_preview_required = sum(preview_target_map.values())
+                possible_preview = (
+                    _simulate_assignable(records, preview_target_map)
+                    if total_preview_required > 0
+                    else 0
+                )
+                if (
+                    total_preview_required <= 0
+                    or possible_preview >= total_preview_required
+                ):
+                    effective_fetch_buffer = current_fetch_buffer
+                    break
+                if possible_preview <= previous_possible:
+                    print(
+                        "[warn] Additional fetch attempts are not increasing "
+                        "unique coverage; proceeding with current candidates."
+                    )
+                    effective_fetch_buffer = current_fetch_buffer
+                    break
+                if current_fetch_buffer >= auto_fetch_limit:
+                    print(
+                        f"[warn] Reached automatic fetch-buffer cap ({auto_fetch_limit}); "
+                        f"proceeding with {possible_preview}/{total_preview_required} "
+                        "fillable papers."
+                    )
+                    effective_fetch_buffer = current_fetch_buffer
+                    break
+                previous_possible = possible_preview
+                next_fetch_buffer = max(
+                    current_fetch_buffer * 2, current_fetch_buffer + 1, 1
+                )
+                if next_fetch_buffer > auto_fetch_limit:
+                    next_fetch_buffer = auto_fetch_limit
+                if next_fetch_buffer == current_fetch_buffer:
+                    effective_fetch_buffer = current_fetch_buffer
+                    break
+                print(
+                    f"[info] Only {possible_preview} of {total_preview_required} slots "
+                    f"covered; increasing fetch buffer to {next_fetch_buffer}."
+                )
+                current_fetch_buffer = next_fetch_buffer
+
+        checkpoint_metadata["effective_fetch_buffer"] = effective_fetch_buffer
+
         record_lookup: Dict[str, Dict[str, Any]] = {}
         target_map: Dict[Tuple[str, str], int] = {}
 
@@ -218,51 +362,6 @@ class KnowledgeGraphPipeline:
         success_counts: Dict[Tuple[str, str], int] = {key: 0 for key in target_map}
         successful_total = 0
         total_required = sum(target_map.values())
-
-        BUCKET_PRIORITY = {"top": 0, "recent": 1}
-
-        def _bucket_priority(bucket: str) -> int:
-            return BUCKET_PRIORITY.get(bucket, 2)
-
-        def _source_sort_key(source: Dict[str, Any]) -> Tuple[int, int, int, str]:
-            bucket = str(source.get("bucket") or LEGACY_BUCKET)
-            is_buffer = 1 if source.get("is_buffer") else 0
-            rank_raw = source.get("rank")
-            rank = rank_raw if isinstance(rank_raw, int) else 1_000_000
-            term = str(source.get("term", "") or "")
-            return (is_buffer, _bucket_priority(bucket), rank, term)
-
-        def _select_needed_keys_from_sources(
-            sources: Sequence[Dict[str, Any]]
-        ) -> set[Tuple[str, str]]:
-            candidates: List[Tuple[Tuple[str, str], Dict[str, Any], int]] = []
-            for source in sorted(list(sources), key=_source_sort_key):
-                bucket = str(source.get("bucket") or LEGACY_BUCKET)
-                term = str(source.get("term", "") or "")
-                key = (term, bucket)
-                target = target_map.get(key)
-                if target is None or target <= 0:
-                    continue
-                remaining = target - success_counts.get(key, 0)
-                if remaining <= 0:
-                    continue
-                candidates.append((key, source, remaining))
-            if not candidates:
-                return set()
-
-            def _selection_priority(
-                item: Tuple[Tuple[str, str], Dict[str, Any], int]
-            ) -> Tuple[int, int, int, int]:
-                key, source, remaining = item
-                bucket = key[1]
-                bucket_order = _bucket_priority(bucket)
-                is_buffer = 1 if source.get("is_buffer") else 0
-                rank_raw = source.get("rank")
-                rank = rank_raw if isinstance(rank_raw, int) else 1_000_000
-                return (-remaining, bucket_order, is_buffer, rank)
-
-            selected_key, _, _ = min(candidates, key=_selection_priority)
-            return {selected_key}
 
         def _bump_success(key: Tuple[str, str]) -> None:
             nonlocal successful_total
@@ -293,7 +392,9 @@ class KnowledgeGraphPipeline:
                         "_candidate_sources",
                         [{"term": "", "bucket": LEGACY_BUCKET, "is_buffer": False}],
                     )
-                assignments = _select_needed_keys_from_sources(sources)
+                assignments = _select_needed_keys_from_sources(
+                    sources, target_map, success_counts
+                )
                 for key in assignments:
                     _bump_success(key)
 
@@ -340,7 +441,9 @@ class KnowledgeGraphPipeline:
                     "_candidate_sources",
                     [{"term": "", "bucket": LEGACY_BUCKET, "is_buffer": False}],
                 )
-            needed_keys = _select_needed_keys_from_sources(sources)
+            needed_keys = _select_needed_keys_from_sources(
+                sources, target_map, success_counts
+            )
             if not needed_keys:
                 continue
             meta = {
