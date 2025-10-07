@@ -130,7 +130,7 @@ Multiplex Graph Design
 - Orientation Logic: for every node pair, test both subject→object and object→subject hypotheses; if neither satisfies the role constraints, an evidence-backed fallback (e.g., Treatment→Diagnosis as `treats`) is applied so clinically plausible edges persist instead of isolating nodes
 - Export Schema: edge qualifiers are flattened as `qual_*` attributes (e.g., `qual_nli_score`, `qual_claim`, `qual_evidence_label`) so GraphML/HTML tooltips surface the underlying evidence without manual JSON parsing
 
-1. Specify queries (“bipolar disorder”, “major depressive disorder”, “schizoaffective disorder”, “anxiety disorder”, “PTSD”, “OCD”, “OCPD")
+1. Specified queries ("bipolar disorder", "major depressive disorder", "schizoaffective disorder", "anxiety disorder", "PTSD", "OCD", "OCPD") are split into buckets with an extra fetch buffer evenly spread amongst each of the queries in case an error occurs during download or processing
 1. Fetch text from OpenAlex (falling back to PMC) for top M most cited and N most recent papers for each query, all of which are restricted to have been published in the past decade
 1. Pull out only results and discussion section
 1. Extraction process (via Biomedical Stanza and Hugging Face)
