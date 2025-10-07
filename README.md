@@ -12,6 +12,7 @@
 - [Methods](#methods)
     - [Graph Creation](#graph-creation)
     - [Preventing Biased Alignment](#preventing-biased-alignment)
+    - [Partitioning](#partitioning)
 - [Abbreviations](#abbreviations)
 - [References](#references)
 
@@ -148,22 +149,32 @@ This entity-level masking substantially reduces over-masking and yields more bio
 Only after the final partitioning is complete will alignment metrics such as normalized mutual information and adjusted Rand index be computed against HiTOP and RDoC categories.
 This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
 
-## Unanswered Questions
-- Which partitioning algorithms to test
-    - hierarchical stochastic block model
-    - If time allows, try to do something with self-compressing auto-encoders like my learning-to-learn project
-        - still use rGCN structure with latent dimensions #Nodes x #Communities (start w/ #Nodes)
-        - add Louizos et al. 2018 style L0 regularization
-        - add community gates to decide how many clusters survive
+### Partitioning
+- Short explanation of hierarchical stochastic block model (hSBM) [19]
+- If time allows, try to do something with self-compressing auto-encoders (SCAE) like my learning-to-learn project otherwise mention this for future work since it would
+    - still use recurrent graph convolutional network (rGCN) architecture with latent dimensions #Nodes x #Clusters (start w/ #Nodes)
+    - add Louizos et al. 2018 style L0 regularization [20]
+        - add cluster gates to decide how many clusters survive
         - add inter-cluster gates to decide which inter-cluster connections matter
-        - learn separate inter-cluster matrix per edge type
-        - maybe also model absent edges in order to help prevent trivial solutions like collapse of communities to all of one node type to one community for each node type
+    - learn separate inter-cluster matrix per edge type (how to combine?)
+    - maybe also model absent edges in order to help prevent trivial solutions like collapse of clusters to all of one node type to one cluster for each node type
+
+| Aspect                        | rGCN Self-Compressing Autoencoder (rGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (hSBM)                                                                                  |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Representation**            | Learns *continuous latent embeddings* for nodes and relations; nonlinear, differentiable, expressive.                                        | Assigns *discrete cluster memberships* via probabilistic inference on connectivity patterns.                              |
+| **Objective**                 | Minimizes reconstruction loss → learns information-optimal embeddings that compress the multiplex graph while preserving semantic structure. | Maximizes likelihood under a generative model → partitions graph to best explain edge densities between groups.             |
+| **Adaptivity**                | Learns directly from heterogeneous, weighted, typed edges and can incorporate node attributes, features, and higher-order dependencies.      | Operates purely on adjacency structure (and possibly metadata) assuming a fixed parametric form (block interaction matrix). |
+| **Scalability & Flexibility** | Scales gracefully to large multiplex graphs via minibatch training and GPU acceleration; can integrate multiple modalities in future.                  | Computationally expensive for deep hierarchies; inference is typically O(N²), with N = #nodes in graph, and difficult to extend across modalities.     |
+| **Output**                    | Produces a *latent manifold* where distances encode both structural and semantic similarity — enabling *continuous transdiagnostic spectra*. | Produces discrete, possibly hierarchical clusters — enforcing categorical partitions reminiscent of DSM-like divisions.     |
 
 ## Abbreviations
 - DSM = Diagnostic and Statistical Manual of Mental Disorders
 - HiTOP = Hierarchical Taxonomy of Psychopathology
+- hSBM = Hierarchical Stochastic Block Model
 - ICD = International Classification of Diseases
 - RDoC = Research Domain Criteria
+- rGCN = Recurrent Graph Convolutional Network
+- SCAE = Self-Compressing Auto-Encoder
 
 ## References
 1. R. Kotov et al., “The Hierarchical Taxonomy of Psychopathology (HiTOP): A dimensional alternative to traditional nosologies,” J. Abnorm. Psychol., vol. 126, no. 4, pp. 454–477, 2017.
@@ -184,3 +195,5 @@ This ensures that any observed alignment reflects genuine structural similaritie
 1. L. Wang et al., “BIOS: An algorithmically generated biomedical knowledge graph,” arXiv preprint arXiv:2203.09975, 2022.
 1. W. Wei et al., “NetMoST: A network-based machine learning approach for subtyping schizophrenia using polygenic SNP allele biomarkers,” arXiv preprint arXiv:2305.07005, 2023.
 1. D. Drysdale et al., “Resting-state connectivity biomarkers define neurophysiological subtypes of depression,” Nat. Med., vol. 23, pp. 28–38, 2017.
+1. T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership stochastic blockmodels for multiple networks and experimental interventions,” in Handbook of Mixed Membership Models and Their Applications, E. Airoldi, D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman & Hall/CRC Press, 2014, pp. 463–488.
+1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
