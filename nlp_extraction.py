@@ -135,7 +135,7 @@ class ExtractionConfig:
     stanza_lang: str = field(default_factory=lambda: os.getenv("STANZA_LANG", "en"))
     stanza_processors: str = field(
         default_factory=lambda: os.getenv(
-            "STANZA_PROCESSORS", "tokenize,mwt,pos,lemma,ner"
+            "STANZA_PROCESSORS", "tokenize,mwt,pos,lemma,depparse,ner,coref"
         )
     )
     stanza_tokenize_pkg: str = field(
@@ -240,7 +240,18 @@ class EntityRelationExtractor:
         if self._pipelines is not None:
             return self._pipelines
         lang = self.config.stanza_lang
-        processors = self.config.stanza_processors
+        raw_processors = self.config.stanza_processors
+        if isinstance(raw_processors, str):
+            proc_parts = [
+                part.strip() for part in raw_processors.split(",") if part.strip()
+            ]
+        else:
+            proc_parts = list(raw_processors or [])
+        if "parse" in proc_parts and "depparse" not in proc_parts:
+            proc_parts = [
+                "depparse" if part == "parse" else part for part in proc_parts
+            ]
+        processors = ",".join(proc_parts)
         pipelines: List[Tuple[str, "stanza.Pipeline"]] = []
         for package in self._build_stanza_package_candidates():
             pkg_display = (
@@ -387,6 +398,104 @@ class EntityRelationExtractor:
                 return predicate
         return None
 
+    def _coref_mention_info(
+        self, doc: "stanza.Document", mention: Any
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            sentence_idx = int(getattr(mention, "sentence", -1))
+            start_token = int(getattr(mention, "start_word", -1))
+            end_token = int(getattr(mention, "end_word", -1))
+        except Exception:
+            return None
+        if sentence_idx < 0 or start_token < 0 or end_token <= start_token:
+            return None
+        sentences = getattr(doc, "sentences", [])
+        if sentence_idx >= len(sentences):
+            return None
+        sentence = sentences[sentence_idx]
+        tokens = getattr(sentence, "tokens", [])
+        if end_token > len(tokens):
+            return None
+        start = tokens[start_token]
+        end = tokens[end_token - 1]
+        start_char = getattr(start, "start_char", None)
+        end_char = getattr(end, "end_char", None)
+        if start_char is None or end_char is None:
+            return None
+        surface = doc.text[start_char:end_char]
+        upos: List[str] = []
+        lemmas: List[str] = []
+        for token in tokens[start_token:end_token]:
+            for word in getattr(token, "words", []) or []:
+                if getattr(word, "upos", None):
+                    upos.append(word.upos)
+                if getattr(word, "lemma", None):
+                    lemmas.append(word.lemma)
+        return {
+            "sentence_idx": sentence_idx,
+            "start_char": int(start_char),
+            "end_char": int(end_char),
+            "surface": clean_entity_surface(surface),
+            "upos": upos,
+            "lemmas": lemmas,
+            "start_token": start_token,
+            "end_token": end_token,
+        }
+
+    def _select_coref_antecedent(
+        self, mentions: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        if not mentions:
+            raise ValueError("Cannot select antecedent from empty mention list")
+        ranked: List[Tuple[int, int, Dict[str, Any]]] = []
+        for idx, info in enumerate(mentions):
+            pos = info.get("upos", [])
+            score = 0
+            if any(tag == "PROPN" for tag in pos):
+                score = 3
+            elif any(tag == "NOUN" for tag in pos):
+                score = 2
+            elif any(tag == "ADJ" for tag in pos):
+                score = 1
+            length = info.get("end_char", 0) - info.get("start_char", 0)
+            ranked.append((score, -length, idx))
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best_index = ranked[0][2]
+        return mentions[best_index]
+
+    def _build_coref_reference_map(
+        self, doc: "stanza.Document"
+    ) -> Dict[Tuple[int, int], Dict[str, Any]]:
+        chains = getattr(doc, "coref", None)
+        if not chains:
+            return {}
+        references: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for chain in chains:
+            mention_infos: List[Dict[str, Any]] = []
+            for mention in getattr(chain, "mentions", []) or []:
+                info = self._coref_mention_info(doc, mention)
+                if info is None:
+                    continue
+                mention_infos.append(info)
+            if not mention_infos:
+                continue
+            mention_infos.sort(key=lambda m: (m["start_char"], m["end_char"]))
+            antecedent = self._select_coref_antecedent(mention_infos)
+            antecedent_key = (antecedent["start_char"], antecedent["end_char"])
+            for info in mention_infos:
+                key = (info["start_char"], info["end_char"])
+                if key == antecedent_key:
+                    continue
+                if key in references:
+                    continue
+                references[key] = {
+                    "text": antecedent["surface"],
+                    "start": antecedent["start_char"],
+                    "end": antecedent["end_char"],
+                    "surface": info["surface"],
+                }
+        return references
+
     def _pick_sentence_context(
         self, text: str, s1: str, s2: str, window: int = 2
     ) -> str:
@@ -489,6 +598,7 @@ class EntityRelationExtractor:
         seen_spans: Set[Tuple[int, int, str]] = set()
         for pkg_display, pipeline in pipelines:
             doc = pipeline(text)
+            coref_map = self._build_coref_reference_map(doc)
             entities = getattr(doc, "ents", None)
             if entities is None:
                 entities = getattr(doc, "entities", [])
@@ -521,6 +631,10 @@ class EntityRelationExtractor:
                     if key in seen_spans:
                         continue
                     seen_spans.add(key)
+                if start is not None and end is not None:
+                    coref_info = coref_map.get((start, end))
+                else:
+                    coref_info = None
                 results.append(
                     {
                         "start": start,
@@ -532,6 +646,7 @@ class EntityRelationExtractor:
                         "upos": upos,
                         "xpos": xpos,
                         "tokens": tokens,
+                        "coref_antecedent": coref_info,
                     }
                 )
         return results
@@ -554,6 +669,7 @@ class EntityRelationExtractor:
 
         entities: Dict[str, NodeRecord] = {}
         for ent in ner_results:
+            coref_info = ent.get("coref_antecedent") or None
             if (
                 "start" in ent
                 and "end" in ent
@@ -568,6 +684,17 @@ class EntityRelationExtractor:
                 continue
             if raw_name.lower() in self.config.ner_exclude_terms:
                 continue
+            original_surface = raw_name
+            lemma_from_ent = (ent.get("lemma") or "").strip()
+            lemma_override: Optional[str] = None
+            if coref_info:
+                antecedent_text = clean_entity_surface(coref_info.get("text") or "")
+                if (
+                    antecedent_text
+                    and antecedent_text.lower() not in self.config.ner_exclude_terms
+                ):
+                    raw_name = antecedent_text
+                    lemma_override = canonical_entity_display(antecedent_text)
             tokens = ent.get("tokens") or []
             pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
             if pos_tags:
@@ -582,7 +709,7 @@ class EntityRelationExtractor:
                     token_count = len(tokens) if tokens else len(raw_name.split())
                     if token_count <= 1:
                         continue
-            lemma_hint = (ent.get("lemma") or "").strip()
+            lemma_hint = lemma_override or lemma_from_ent
             lemma_source = lemma_hint if lemma_hint else raw_name
             canonical_key = canonical_entity_key(lemma_source)
             if not canonical_key:
@@ -604,10 +731,15 @@ class EntityRelationExtractor:
                     normalizations={},
                 )
                 entities[canonical_key] = record
+            lemma_values: List[str] = []
             if lemma_hint:
+                lemma_values.append(lemma_hint)
+            if lemma_from_ent and lemma_from_ent not in lemma_values:
+                lemma_values.append(lemma_from_ent)
+            if lemma_values:
                 existing_lemmas = record.normalizations.get("lemmas", [])
                 record.normalizations["lemmas"] = dedupe_preserve_order(
-                    list(existing_lemmas) + [lemma_hint]
+                    list(existing_lemmas) + lemma_values
                 )
             if pos_tags:
                 existing_pos = record.normalizations.get("upos", [])
@@ -625,7 +757,14 @@ class EntityRelationExtractor:
                 record.normalizations["tokens"] = dedupe_preserve_order(
                     list(existing_tokens) + tokens
                 )
-            self._update_record_forms(record, [raw_name, canonical_display])
+            name_candidates = [raw_name, canonical_display]
+            if (
+                coref_info
+                and original_surface
+                and original_surface.lower() != raw_name.lower()
+            ):
+                name_candidates.append(original_surface)
+            self._update_record_forms(record, name_candidates)
         if not entities:
             logger.info("Skipping paper %s: no entities detected.", paper_label)
             return None
