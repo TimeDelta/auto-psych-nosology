@@ -80,6 +80,26 @@ _REL_ENTAILMENT_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_ENT", "0.6"))
 _REL_REVERSE_GAP = float(os.getenv("RELATION_NLI_REVERSE_GAP", "0.05"))
 
 
+def _stanza_ner_packages() -> List[str]:
+    packages: List[str] = []
+
+    configured = os.getenv("STANZA_NER_PACKAGES", "").strip()
+    if configured:
+        packages.extend(pkg.strip() for pkg in configured.split("|") if pkg.strip())
+    else:
+        packages.extend(
+            [
+                "bc5cdr",
+                "anatem",
+                "jnlpba",
+                "linnaeus",
+                "ncbi_disease",
+                "i2b2",
+            ]
+        )
+    return dedupe_preserve_order(packages)
+
+
 @dataclass
 class NliScores:
     entailment: float
@@ -118,22 +138,12 @@ class ExtractionConfig:
             "STANZA_PROCESSORS", "tokenize,mwt,pos,lemma,ner"
         )
     )
-    stanza_primary_ner: str = field(
-        default_factory=lambda: os.getenv("STANZA_NER_PACKAGE", "").strip() or "bc5cdr"
-    )
     stanza_tokenize_pkg: str = field(
         default_factory=lambda: os.getenv("STANZA_TOKENIZE_PACKAGE", "").strip()
         or "default"
     )
-    stanza_extra_biomed: Sequence[str] = field(
-        default_factory=lambda: [
-            pkg.strip()
-            for pkg in os.getenv(
-                "STANZA_BIOMED_PACKAGES",
-                "anatem|bc5cdr|jnlpba|linnaeus|ncbi_disease|i2b2",
-            ).split("|")
-            if pkg.strip()
-        ]
+    stanza_ner_packages: Sequence[str] = field(
+        default_factory=lambda: _stanza_ner_packages()
     )
     stanza_extra_packages: Sequence[str] = field(
         default_factory=lambda: [
@@ -193,23 +203,36 @@ class EntityRelationExtractor:
             logger.debug("Forced Stanza package candidates: %s", candidates)
             return candidates
 
-        candidates: List[Any] = [
-            {
-                "tokenize": self.config.stanza_tokenize_pkg,
-                "ner": self.config.stanza_primary_ner,
-            }
-        ]
-        for extra_pkg in self.config.stanza_extra_biomed:
-            candidates.append(
-                {"tokenize": self.config.stanza_tokenize_pkg, "ner": extra_pkg}
-            )
+        candidates: List[Any] = []
+        base_tokenize_pkg = self.config.stanza_tokenize_pkg
+
+        def normalize_candidate(value: Any) -> Any:
+            if isinstance(value, str):
+                return {"tokenize": base_tokenize_pkg, "ner": value}
+            if isinstance(value, dict):
+                candidate = dict(value)
+                candidate.setdefault("tokenize", base_tokenize_pkg)
+                return candidate
+            return value
+
+        for pkg in self.config.stanza_ner_packages:
+            parsed = self._parse_package_spec(pkg) if isinstance(pkg, str) else pkg
+            if not parsed:
+                continue
+            candidate = normalize_candidate(parsed)
+            if candidate not in candidates:
+                candidates.append(candidate)
         for extra in self.config.stanza_extra_packages:
             parsed = self._parse_package_spec(extra)
-            if parsed and parsed not in candidates:
-                candidates.append(parsed)
+            if not parsed:
+                continue
+            candidate = normalize_candidate(parsed)
+            if candidate not in candidates:
+                candidates.append(candidate)
         for fallback in ("craft", "mimic"):
-            if fallback not in candidates:
-                candidates.append(fallback)
+            candidate = normalize_candidate(fallback)
+            if candidate not in candidates:
+                candidates.append(candidate)
         logger.debug("Stanza package candidates: %s", candidates)
         return candidates
 
