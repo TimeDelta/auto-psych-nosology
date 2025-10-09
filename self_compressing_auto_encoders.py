@@ -1,149 +1,17 @@
 import math
-from typing import Any, Dict, List
+import random
+from typing import Any, Dict, List, Optional, Tuple
 from warnings import warn
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tasks import TASK_FEATURE_DIMS, TASK_TYPE_TO_INDEX
-from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import MessagePassing, global_mean_pool
-from torch_geometric.utils import (
-    add_self_loops,
-    degree,
-    softmax,
-    to_dense_adj,
-    to_dense_batch,
-)
+from torch_geometric.nn import MessagePassing, RGCNConv, global_mean_pool
+from torch_geometric.utils import degree, softmax
+
 from utility import generate_random_string
-
-
-class DAGAttention(MessagePassing):
-    """
-    DAG-specific attention aggregator (Chen et al. 2021).
-    Each node attends over its predecessors + itself (node context).
-    """
-
-    def __init__(self, in_channels, out_channels, negative_slope=0.2):
-        super().__init__(aggr="add")
-        self.lin = nn.Linear(in_channels, out_channels, bias=False)
-        self.att = nn.Parameter(torch.Tensor(1, 2 * out_channels))
-        self.leaky_relu = nn.LeakyReLU(negative_slope)
-        nn.init.kaiming_uniform_(
-            self.lin.weight, negative_slope, mode="fan_in", nonlinearity="leaky_relu"
-        )
-        nn.init.kaiming_uniform_(
-            self.att, negative_slope, mode="fan_in", nonlinearity="leaky_relu"
-        )
-
-    def forward(self, x, edge_index):
-        x = self.lin(x)
-        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        return self.propagate(edge_index, x=x)
-
-    def message(self, x_i, x_j, index, ptr, size_i):
-        cat = torch.cat([x_i, x_j], dim=-1)
-        alpha = (cat * self.att).sum(dim=-1)
-        alpha = self.leaky_relu(alpha)
-        alpha = softmax(alpha, index, ptr, size_i)
-        return x_j * alpha.view(-1, 1)
-
-    def update(self, aggr_out):
-        return F.relu(aggr_out)
-
-
-class AsyncDAGLayer(nn.Module):
-    """Simple asynchronous message passing layer following a topological order."""
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.lin = nn.Linear(in_channels, out_channels)
-
-    def forward(self, x, edge_index):
-        x = self.lin(x)
-        num_nodes = x.size(0)
-        device = x.device
-        indeg = torch.zeros(num_nodes, dtype=torch.long, device=device)
-        indeg.scatter_add_(
-            0,
-            edge_index[1],
-            torch.ones(edge_index.size(1), dtype=torch.long, device=device),
-        )
-        preds = [[] for _ in range(num_nodes)]
-        for s, d in edge_index.t().tolist():
-            preds[d].append(s)
-        order = [n for n in range(num_nodes) if indeg[n] == 0]
-        i = 0
-        while i < len(order):
-            n = order[i]
-            mask = edge_index[0] == n
-            for dest in edge_index[1][mask].tolist():
-                indeg[dest] -= 1
-                if indeg[dest] == 0:
-                    order.append(dest)
-            i += 1
-        h = torch.zeros_like(x)
-        for n in order:
-            if preds[n]:
-                agg = h[preds[n]].mean(dim=0)
-                h[n] = F.relu(x[n] + agg)
-            else:
-                h[n] = F.relu(x[n])
-        return h
-
-
-class TasksEncoder(nn.Module):
-    def __init__(self, hidden_dim: int, latent_dim: int, type_embedding_dim: int):
-        super().__init__()
-        # Separate module per task type because each task has different number of features
-        # and features don't semantically align
-        self.latent_dim = latent_dim
-        self.embedder = nn.Embedding(len(TASK_FEATURE_DIMS), type_embedding_dim)
-        self.encoders = nn.ModuleDict(
-            {
-                str(TASK_TYPE_TO_INDEX[type]): nn.Sequential(
-                    nn.Linear(num_features + type_embedding_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                )
-                for type, num_features in TASK_FEATURE_DIMS.items()
-            }
-        )
-        # Shared mu/logvar heads
-        self.lin_mu = nn.Linear(hidden_dim, latent_dim)
-        self.lin_logvar = nn.Linear(hidden_dim, latent_dim)
-
-    def forward(self, task_types, feature_vecs):
-        mu_list, logvar_list = [], []
-        for task_type, feature_vec in zip(task_types, feature_vecs):
-            task_type_embedding = self.embedder(task_type)
-            feature_vec = torch.as_tensor(feature_vec, dtype=torch.float).flatten()
-            h = self.encoders[str(task_type.item())](
-                torch.cat((task_type_embedding, feature_vec), dim=0)
-            )
-            mu_list.append(self.lin_mu(h))
-            logvar_list.append(self.lin_logvar(h))
-        return torch.stack(mu_list, dim=0), torch.stack(logvar_list, dim=0)
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        z = mu + torch.randn_like(std) * std
-        return z if self.latent_mask is None else z * self.latent_mask
-
-    def prune_latent_dims(self, kept_idx: torch.LongTensor):
-        def prune_lin(old):
-            layer = nn.Linear(old.in_features, kept_idx.numel()).to(old.weight.device)
-            layer.weight.data = old.weight.data[kept_idx]
-            layer.bias.data = old.bias.data[kept_idx]
-            return layer
-
-        self.lin_mu = prune_lin(self.lin_mu)
-        self.lin_logvar = prune_lin(self.lin_logvar)
-        self.latent_dim = len(kept_idx)
 
 
 class SharedAttributeVocab(nn.Module):
@@ -251,6 +119,422 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))
 
 
+class HardConcreteGate(nn.Module):
+    """Louizos et al. (2018) hard-concrete gate for L0-style sparsity."""
+
+    def __init__(
+        self,
+        shape: Tuple[int, ...],
+        temperature: float = 2.0 / 3.0,
+        limit_a: float = -0.1,
+        limit_b: float = 1.1,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.log_alpha = nn.Parameter(torch.zeros(shape))
+        self.temperature = temperature
+        self.limit_a = limit_a
+        self.limit_b = limit_b
+        self.eps = eps
+
+    def _sample(self, training: bool) -> torch.Tensor:
+        if training:
+            u = torch.rand_like(self.log_alpha)
+            s = torch.log(u + self.eps) - torch.log(1 - u + self.eps)
+            z = torch.sigmoid((s + self.log_alpha) / self.temperature)
+        else:
+            z = torch.sigmoid(self.log_alpha)
+        z = z * (self.limit_b - self.limit_a) + self.limit_a
+        return z.clamp(0.0, 1.0)
+
+    def forward(self, training: Optional[bool] = None) -> torch.Tensor:
+        training = self.training if training is None else training
+        return self._sample(training)
+
+    def expected_l0(self) -> torch.Tensor:
+        limit_ratio = -self.limit_a / self.limit_b
+        limit_ratio = max(limit_ratio, self.eps)
+        threshold = self.temperature * math.log(limit_ratio)
+        return torch.sigmoid(self.log_alpha - threshold)
+
+
+class ClusterGate(nn.Module):
+    """Applies hard-concrete gating across clusters."""
+
+    def __init__(self, num_clusters: int, temperature: float = 2.0 / 3.0) -> None:
+        super().__init__()
+        self._gate = HardConcreteGate((num_clusters,), temperature=temperature)
+
+    def forward(self, training: Optional[bool] = None) -> torch.Tensor:
+        return self._gate(training=training)
+
+    def expected_l0(self) -> torch.Tensor:
+        return self._gate.expected_l0()
+
+
+class InterClusterGate(nn.Module):
+    """Hard-concrete gates across relation-specific inter-cluster matrices."""
+
+    def __init__(
+        self,
+        num_relations: int,
+        num_clusters: int,
+        temperature: float = 2.0 / 3.0,
+    ) -> None:
+        super().__init__()
+        self._gate = HardConcreteGate(
+            (num_relations, num_clusters, num_clusters), temperature=temperature
+        )
+
+    def forward(self, training: Optional[bool] = None) -> torch.Tensor:
+        return self._gate(training=training)
+
+    def expected_l0(self) -> torch.Tensor:
+        return self._gate.expected_l0()
+
+
+class RGCNClusterEncoder(nn.Module):
+    """Recurrent relational GCN encoder producing node-to-cluster assignments."""
+
+    def __init__(
+        self,
+        num_node_types: int,
+        attr_encoder: NodeAttributeDeepSetEncoder,
+        num_clusters: int,
+        hidden_dims: Optional[List[int]] = None,
+        num_relations: int = 1,
+        type_embedding_dim: Optional[int] = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        hidden_dims = hidden_dims or [128, 128]
+        self.attr_encoder = attr_encoder
+        self.num_clusters = num_clusters
+        self.num_relations = max(1, num_relations)
+        self.dropout = dropout
+        embed_dim = type_embedding_dim or attr_encoder.out_dim
+        self.node_type_embedding = nn.Embedding(num_node_types, embed_dim)
+        in_dim = embed_dim + attr_encoder.out_dim
+        self.convs = nn.ModuleList()
+        for hidden_dim in hidden_dims:
+            self.convs.append(
+                RGCNConv(
+                    in_dim,
+                    hidden_dim,
+                    self.num_relations,
+                    num_bases=min(self.num_relations, hidden_dim),
+                    bias=True,
+                )
+            )
+            in_dim = hidden_dim
+        self.cluster_assign = nn.Linear(in_dim, num_clusters)
+        self.cluster_gate = ClusterGate(num_clusters)
+
+    def _prepare_edge_type(
+        self,
+        edge_type: Optional[torch.LongTensor],
+        edge_count: int,
+        device: torch.device,
+    ) -> torch.LongTensor:
+        if edge_type is None:
+            return torch.zeros(edge_count, dtype=torch.long, device=device)
+        return edge_type.to(device)
+
+    def forward(
+        self,
+        node_types: torch.LongTensor,
+        edge_index: torch.LongTensor,
+        batch: Optional[torch.LongTensor] = None,
+        node_attributes: Optional[List[List[Dict[str, Any]]]] = None,
+        edge_type: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = node_types.device
+        type_embedding = self.node_type_embedding(node_types)
+
+        if node_attributes and len(node_attributes) > 0:
+            attr_embedding = torch.stack(
+                [
+                    self.attr_encoder(attrs).to(device)
+                    for graph_attrs in node_attributes
+                    for attrs in graph_attrs
+                ],
+                dim=0,
+            )
+        else:
+            attr_embedding = torch.zeros(
+                (node_types.size(0), self.attr_encoder.out_dim), device=device
+            )
+
+        x = torch.cat([type_embedding, attr_embedding], dim=-1)
+        etype = self._prepare_edge_type(edge_type, edge_index.size(1), device)
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index, etype))
+            if self.dropout > 0.0:
+                x = F.dropout(x, p=self.dropout, training=self.training)
+
+        cluster_logits = self.cluster_assign(x)
+        gate_sample = self.cluster_gate(training=self.training).unsqueeze(0)
+        cluster_logits = cluster_logits + torch.log(gate_sample + 1e-8)
+        assignments = F.softmax(cluster_logits, dim=-1)
+
+        info = {
+            "node_embeddings": x,
+            "cluster_assignments": assignments,
+            "cluster_gate_sample": gate_sample.detach(),
+            "cluster_l0": self.cluster_gate.expected_l0(),
+        }
+        if batch is not None:
+            info["batch"] = batch
+        return assignments, info
+
+
+class ClusteredGraphReconstructor(nn.Module):
+    """Decodes cluster assignments into adjacency logits with L0 gating."""
+
+    def __init__(
+        self,
+        num_relations: int,
+        num_clusters: int,
+        negative_sampling_ratio: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.num_relations = max(1, num_relations)
+        self.num_clusters = num_clusters
+        self.negative_sampling_ratio = max(0.0, negative_sampling_ratio)
+        self.inter_cluster_logits = nn.Parameter(
+            torch.zeros(self.num_relations, num_clusters, num_clusters)
+        )
+        nn.init.xavier_uniform_(self.inter_cluster_logits)
+        self.inter_cluster_gate = InterClusterGate(self.num_relations, num_clusters)
+        self.absent_bias = nn.Parameter(torch.zeros(self.num_relations))
+
+    def _inter_weights(self, training: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        gate_sample = self.inter_cluster_gate(training=training)
+        weights = torch.sigmoid(self.inter_cluster_logits) * gate_sample
+        return weights, gate_sample
+
+    def _edge_logits(
+        self,
+        assignments: torch.Tensor,
+        edge_index: torch.LongTensor,
+        edge_type: torch.LongTensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if edge_index.numel() == 0:
+            return torch.empty(0, device=assignments.device)
+        src = assignments[edge_index[0]]
+        dst = assignments[edge_index[1]]
+        relation_weights = weights[edge_type]
+        weighted_dst = torch.bmm(relation_weights, dst.unsqueeze(-1)).squeeze(-1)
+        logits = (src * weighted_dst).sum(dim=-1)
+        logits = logits + self.absent_bias.to(assignments.device)[edge_type]
+        return logits
+
+    def _sample_negative_edges(
+        self,
+        edge_index: torch.LongTensor,
+        batch: Optional[torch.LongTensor],
+        num_nodes: int,
+        ratio: float,
+    ) -> Tuple[torch.LongTensor, torch.LongTensor]:
+        if ratio <= 0.0:
+            return (
+                torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
+                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
+            )
+
+        if num_nodes == 0:
+            return (
+                torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
+                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
+            )
+
+        if batch is None:
+            batch = torch.zeros(num_nodes, dtype=torch.long, device=edge_index.device)
+        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+
+        edge_index_cpu = edge_index.detach().cpu()
+        batch_cpu = batch.detach().cpu()
+        neg_edges: List[Tuple[int, int]] = []
+        neg_types: List[int] = []
+
+        for graph_id in range(num_graphs):
+            node_ids = (batch_cpu == graph_id).nonzero(as_tuple=False).view(-1).tolist()
+            if len(node_ids) <= 1:
+                continue
+            pos_mask = (batch_cpu[edge_index_cpu[0]] == graph_id) & (
+                batch_cpu[edge_index_cpu[1]] == graph_id
+            )
+            edges = edge_index_cpu[:, pos_mask]
+            pos_edges = {tuple(edge) for edge in edges.t().tolist()}
+            max_possible = len(node_ids) ** 2
+            available = max(0, max_possible - len(pos_edges))
+            if available == 0:
+                continue
+            num_pos = max(1, edges.size(1))
+            target = min(available, int(math.ceil(num_pos * ratio)))
+            attempts = 0
+            seen: set[Tuple[int, int]] = set()
+            while len(seen) < target and attempts < max(100, target * 10):
+                u = random.choice(node_ids)
+                v = random.choice(node_ids)
+                attempts += 1
+                pair = (u, v)
+                if pair in pos_edges or pair in seen:
+                    continue
+                seen.add(pair)
+            for u, v in seen:
+                neg_edges.append((u, v))
+                neg_types.append(random.randrange(self.num_relations))
+
+        if not neg_edges:
+            return (
+                torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
+                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
+            )
+
+        neg_edge_tensor = (
+            torch.tensor(neg_edges, dtype=torch.long, device=edge_index.device)
+            .t()
+            .contiguous()
+        )
+        neg_type_tensor = torch.tensor(
+            neg_types, dtype=torch.long, device=edge_index.device
+        )
+        return neg_edge_tensor, neg_type_tensor
+
+    def forward(
+        self,
+        assignments: torch.Tensor,
+        edge_index: torch.LongTensor,
+        batch: Optional[torch.LongTensor] = None,
+        edge_type: Optional[torch.LongTensor] = None,
+        negative_sampling_ratio: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = assignments.device
+        ratio = (
+            self.negative_sampling_ratio
+            if negative_sampling_ratio is None
+            else negative_sampling_ratio
+        )
+        if edge_type is None:
+            edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=device)
+        weights, gate_sample = self._inter_weights(training=self.training)
+
+        if edge_index.size(1) == 0:
+            pos_loss = assignments.new_tensor(0.0)
+            pos_logits = torch.empty(0, device=device)
+        else:
+            pos_logits = self._edge_logits(assignments, edge_index, edge_type, weights)
+            pos_loss = F.binary_cross_entropy_with_logits(
+                pos_logits, torch.ones_like(pos_logits)
+            )
+
+        neg_edges, neg_types = self._sample_negative_edges(
+            edge_index, batch, assignments.size(0), ratio
+        )
+        if neg_edges.size(1) == 0:
+            neg_loss = assignments.new_tensor(0.0)
+            neg_logits = torch.empty(0, device=device)
+        else:
+            neg_logits = self._edge_logits(assignments, neg_edges, neg_types, weights)
+            neg_loss = F.binary_cross_entropy_with_logits(
+                neg_logits, torch.zeros_like(neg_logits)
+            )
+
+        recon_loss = pos_loss + neg_loss
+        info: Dict[str, torch.Tensor] = {
+            "pos_loss": pos_loss.detach(),
+            "neg_loss": neg_loss.detach(),
+            "num_negatives": torch.tensor(neg_edges.size(1), device=device),
+            "inter_l0": self.inter_cluster_gate.expected_l0(),
+            "inter_gate_sample": gate_sample.detach(),
+        }
+        if pos_logits.numel() > 0:
+            info["pos_logits"] = pos_logits.detach()
+        if neg_edges.size(1) > 0:
+            info["neg_logits"] = neg_logits.detach()
+        return recon_loss, info
+
+
+class SelfCompressingRGCNAutoEncoder(nn.Module):
+    """Self-compressing AE with rGCN encoder, L0 cluster gates, and relation gates."""
+
+    def __init__(
+        self,
+        num_node_types: int,
+        attr_encoder: NodeAttributeDeepSetEncoder,
+        num_clusters: int,
+        num_relations: int = 1,
+        hidden_dims: Optional[List[int]] = None,
+        type_embedding_dim: Optional[int] = None,
+        dropout: float = 0.0,
+        negative_sampling_ratio: float = 1.0,
+        l0_cluster_weight: float = 1e-3,
+        l0_inter_weight: float = 1e-3,
+    ) -> None:
+        super().__init__()
+        self.encoder = RGCNClusterEncoder(
+            num_node_types=num_node_types,
+            attr_encoder=attr_encoder,
+            num_clusters=num_clusters,
+            hidden_dims=hidden_dims,
+            num_relations=num_relations,
+            type_embedding_dim=type_embedding_dim,
+            dropout=dropout,
+        )
+        self.decoder = ClusteredGraphReconstructor(
+            num_relations=num_relations,
+            num_clusters=num_clusters,
+            negative_sampling_ratio=negative_sampling_ratio,
+        )
+        self.l0_cluster_weight = l0_cluster_weight
+        self.l0_inter_weight = l0_inter_weight
+
+    def forward(
+        self,
+        node_types: torch.LongTensor,
+        edge_index: torch.LongTensor,
+        batch: Optional[torch.LongTensor] = None,
+        node_attributes: Optional[List[List[Dict[str, Any]]]] = None,
+        edge_type: Optional[torch.LongTensor] = None,
+        negative_sampling_ratio: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        assignments, enc_info = self.encoder(
+            node_types=node_types,
+            edge_index=edge_index,
+            batch=batch,
+            node_attributes=node_attributes,
+            edge_type=edge_type,
+        )
+        recon_loss, dec_info = self.decoder(
+            assignments=assignments,
+            edge_index=edge_index,
+            batch=batch,
+            edge_type=edge_type,
+            negative_sampling_ratio=negative_sampling_ratio,
+        )
+
+        cluster_l0 = enc_info["cluster_l0"].sum()
+        inter_l0 = dec_info["inter_l0"].sum()
+        sparsity_loss = (
+            self.l0_cluster_weight * cluster_l0 + self.l0_inter_weight * inter_l0
+        )
+        total_loss = recon_loss + sparsity_loss
+
+        metrics: Dict[str, torch.Tensor] = {
+            "total_loss": total_loss.detach(),
+            "recon_loss": recon_loss.detach(),
+            "sparsity_loss": sparsity_loss.detach(),
+            "cluster_l0": cluster_l0.detach(),
+            "inter_l0": inter_l0.detach(),
+            "cluster_gate_sample": enc_info["cluster_gate_sample"],
+            "inter_gate_sample": dec_info["inter_gate_sample"],
+        }
+        metrics.update({k: v for k, v in dec_info.items() if "loss" in k})
+        return total_loss, assignments, metrics
+
+
 class GraphEncoder(nn.Module):
     """
     Graph encoder with learnable node type embeddings, deep set encoder for node attributes and DAG attention layers.
@@ -344,7 +628,6 @@ class AsyncGraphEncoder(GraphEncoder):
 
 
 class GraphDeconvNet(MessagePassing):
-
     """
     A Graph Deconvolutional Network (GDN) layer that acts as the
     transpose/inverse of a GCNConv.  It takes an input signal X of
@@ -524,7 +807,9 @@ class GraphDecoder(nn.Module):
                         break
                     elif name_index == self.shared_attr_vocab.name_to_index["<UNK>"]:
                         name_index = len(self.shared_attr_vocab.name_to_index)
-                        name = generate_random_string(8)
+                        name = generate_random_string(
+                            8
+                        )  # TODO: change this to the true attribute name
                         self.shared_attr_vocab.name_to_index[name] = name_index
                         self.shared_attr_vocab.index_to_name[name_index] = name
                     else:
@@ -576,524 +861,163 @@ class GraphDecoder(nn.Module):
         self.latent_dim = kept_idx.numel()
 
 
-class FitnessPredictor(nn.Module):
-    """
-    Auxiliary predictor: maps concatentated graph and task latents (z_g, z_t) to fitness.
-    """
-
-    def __init__(self, latent_dim, hidden_dim=64, fitness_dim=4):
-        super().__init__()
-        self.fc1 = nn.Linear(latent_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, fitness_dim)
-
-    def forward(self, z_graph, z_task):
-        return self.fc2(F.relu(self.fc1(torch.cat([z_graph, z_task], dim=-1))))
-
-    def prune_latent_dims(self, kept_idx: torch.LongTensor):
-        """
-        Keep only the latent dims in `kept_idx` for predictor.fc1.
-        fc2 stays the same.
-        """
-        device = self.fc1.weight.device
-
-        def prune_lin(old):
-            layer = nn.Linear(old.in_features, kept_idx.numel()).to(old.weight.device)
-            layer.weight.data = old.weight.data[kept_idx]
-            layer.bias.data = old.bias.data[kept_idx]
-            return layer
-
-        self.fc1 = prune_lin(self.fc1)
-
-
-class SelfCompressingFitnessRegularizedDAGVAE(nn.Module):
-    """
-    DAG-VAE with ARD prior that is regularized by fitness prediction from latent and has
-    latent-mask for dynamic pruning.
-    """
-
-    def __init__(
-        self,
-        graph_encoder: GraphEncoder,
-        tasks_encoder: TasksEncoder,
-        decoder: GraphDecoder,
-        fitness_predictor: FitnessPredictor,
-    ):
-        super().__init__()
-        self.graph_encoder = graph_encoder
-        self.decoder = decoder
-        self.fitness_predictor = fitness_predictor
-        self.tasks_encoder = tasks_encoder
-        # ARD: learnable log-precision per latent dimension
-        self.log_alpha_g = nn.Parameter(torch.zeros(self.graph_encoder.latent_dim))
-        self.log_alpha_t = nn.Parameter(torch.zeros(self.tasks_encoder.latent_dim))
-        # masks for active latent dims (1=active, 0=pruned)
-        self.register_buffer(
-            "graph_latent_mask", torch.ones(self.graph_encoder.latent_dim)
-        )
-        self.register_buffer(
-            "tasks_latent_mask", torch.ones(self.tasks_encoder.latent_dim)
-        )
-
-    @property
-    def shared_attr_vocab(self):
-        return self.graph_encoder.shared_attr_vocab
-
-    @property
-    def attr_encoder(self):
-        return self.graph_encoder.attr_encoder
-
-    @property
-    def max_value_dim(self):
-        return self.graph_encoder.max_value_dim
-
-    def encode(
-        self, node_types, edge_index, node_attributes, batch, task_type, task_features
-    ):
-        mu_g, lv_g = self.graph_encoder(node_types, edge_index, node_attributes, batch)
-        mu_t, lv_t = self.tasks_encoder(task_type, task_features)
-        return mu_g, lv_g, mu_t, lv_t
-
-    def reparameterize(self, mu, logvar, latent_mask):
-        std = torch.exp(0.5 * logvar)
-        z = mu + torch.randn_like(std) * std
-        return z if latent_mask is None else z * latent_mask
-
-    def decode(self, z):
-        return self.decoder(z)
-
-    def forward(
-        self, node_types, edge_index, node_attributes, batch, task_type, task_features
-    ):
-        mu_g, lv_g, mu_t, lv_t = self.encode(
-            node_types, edge_index, node_attributes, batch, task_type, task_features
-        )
-        graph_latent = self.reparameterize(mu_g, lv_g, self.graph_latent_mask)
-        task_latent = self.reparameterize(mu_t, lv_t, self.tasks_latent_mask)
-        decoded_graphs = self.decode(graph_latent)
-        fitness_pred = self.fitness_predictor(graph_latent, task_latent)
-        return (
-            decoded_graphs,
-            fitness_pred,
-            graph_latent,
-            task_latent,
-            mu_g,
-            lv_g,
-            mu_t,
-            lv_t,
-        )
-
-    def prune_latent_dims(self, num_prune=1):
-        # Identify and mask out dims with highest precision (least variance)
-        def prune(latent_mask, log_alpha, desc):
-            # precision = exp(log_alpha)
-            latent_mask = latent_mask.cpu().numpy().astype(bool)
-            precisions = torch.exp(log_alpha).detach().cpu().numpy()
-            active_indices = np.where(latent_mask)[0]
-            active_indices = active_indices[np.argsort(precisions[active_indices])]
-            dims_to_prune = active_indices[-num_prune:]
-            dims_to_prune = [d for d in dims_to_prune.tolist() if precisions[d] > 1]
-            latent_mask[dims_to_prune] = 0.0
-            if len(dims_to_prune) > 0:
-                print(f"Pruned {desc} latent dims: {dims_to_prune}")
-            return torch.tensor(latent_mask)
-
-        self.graph_latent_mask.copy_(
-            prune(self.graph_latent_mask, self.log_alpha_g, "graph")
-        )
-        self.tasks_latent_mask.copy_(
-            prune(self.tasks_latent_mask, self.log_alpha_t, "tasks")
-        )
-
-    def resize_bottleneck(self):
-        """
-        Permanently shrink bottleneck to active dims via the per-module prune methods.
-        """
-        graph_kept_idx = self.graph_latent_mask.nonzero(as_tuple=True)[0]
-        old_graph_dim = self.graph_latent_mask.numel()
-        new_graph_dim = graph_kept_idx.numel()
-        if new_graph_dim == old_graph_dim:
-            print("No graph latent dims to permanently prune.")
-            return
-        task_kept_idx = self.tasks_latent_mask.nonzero(as_tuple=True)[0]
-        old_task_dim = self.tasks_latent_mask.numel()
-        new_task_dim = task_kept_idx.numel()
-        if new_task_dim == old_task_dim:
-            print("No task latent dims to permanently prune.")
-            return
-
-        print(
-            f"Permanently resizing graph bottleneck: {old_graph_dim} → {new_graph_dim}; task bottleneck: {old_task_dim} → {new_task_dim}"
-        )
-
-        # Prune graph-related modules
-        self.graph_encoder.prune_latent_dims(graph_kept_idx)
-        self.decoder.prune_latent_dims(graph_kept_idx)
-        self.fitness_predictor.prune_latent_dims(graph_kept_idx)
-        self.tasks_encoder.prune_latent_dims(task_kept_idx)
-        # Update ARD precision parameters for graph and task
-        self.log_alpha_g = nn.Parameter(self.log_alpha_g.data[graph_kept_idx].clone())
-        self.log_alpha_t = nn.Parameter(self.log_alpha_t.data[task_kept_idx].clone())
-        # Update latent masks
-        self.register_buffer("graph_latent_mask", torch.ones(graph_kept_idx.numel()))
-        self.register_buffer("tasks_latent_mask", torch.ones(task_kept_idx.numel()))
-
-        print("Bottlenecks resized")
-
-
 class OnlineTrainer:
-    """
-    Incremental trainer with ARD-KL + loss-thresholded iterative pruning,
-    supporting variable node-feature dimensions via list-of-graphs decoding.
-    """
+    """Minimal trainer for the self-compressing rGCN autoencoder."""
 
     def __init__(
         self,
-        model: SelfCompressingFitnessRegularizedDAGVAE,
+        model: SelfCompressingRGCNAutoEncoder,
         optimizer,
-        fitness_key_ordering=[],
+        device: Optional[str] = None,
     ):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = model.to(self.device)
+        resolved_device = (
+            torch.device(device)
+            if device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.model = model.to(resolved_device)
         self.optimizer = optimizer
-        self.dataset = []
-        self.loss_history = []
-        self.initial_loss = None
-        self.last_prune_epoch = 0
+        self.device = resolved_device
+        self.dataset: List[Data] = []
+        self.history: List[Dict[str, float]] = []
 
-    def add_data(self, graphs, fitnesses, task_type: str, task_features):
-        for graph, fitness_dict in zip(graphs, fitnesses):
-            data = graph.clone()
-            # sort fitness values by key
-            fitness = [
-                f[1]
-                for f in sorted(fitness_dict.items(), key=lambda item: item[0].name)
-            ]
-            data.y = torch.as_tensor(fitness, dtype=torch.float).unsqueeze(0)
-            data.task_type = torch.tensor(
-                [TASK_TYPE_TO_INDEX[task_type]], dtype=torch.long
-            )
-            if isinstance(task_features, torch.Tensor):
-                data.task_features = task_features.detach().cpu().tolist()
-            else:
-                data.task_features = list(task_features)
-            self.dataset.append(data)
+    def add_data(self, graphs: List[Data]) -> None:
+        for graph in graphs:
+            self.dataset.append(graph.clone())
+
+    def clear_dataset(self) -> None:
+        self.dataset.clear()
 
     def train(
         self,
-        epochs=1,
-        batch_size=16,
-        kl_weight=1.0,
-        fitness_weight=1.5,
-        warmup_epochs=None,
-        loss_threshold=0.9,
-        min_prune_break=5,
-        prune_amount=1,
-        min_active_dims=5,
-        stop_epsilon=1e-3,
-        verbose=True,
-    ):
+        epochs: int = 1,
+        batch_size: int = 16,
+        negative_sampling_ratio: Optional[float] = None,
+        verbose: bool = True,
+    ) -> List[Dict[str, float]]:
+        if epochs <= 0:
+            raise ValueError("epochs must be a positive integer.")
+        if not self.dataset:
+            raise ValueError("No graphs available to train on. Call add_data first.")
+
         loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
-        epoch = 1
-        num_loss_terms = 5
-        prev_loss_terms = torch.zeros(num_loss_terms)
-        avg_loss_terms = torch.zeros(num_loss_terms)
 
-        def stop():
-            max_loss_term_change = (avg_loss_terms - prev_loss_terms).abs().max().item()
-            return (epochs is not None and epoch == epochs + 1) or (
-                epoch > 1 and max_loss_term_change < stop_epsilon
-            )
-
-        while not stop():
-            prev_loss_terms = avg_loss_terms.clone()
-            total_loss_terms = torch.zeros(num_loss_terms)
+        for epoch in range(1, epochs + 1):
             self.model.train()
+            batch_count = 0
+            epoch_loss = 0.0
+            metric_sums: Dict[str, float] = {}
+
             for batch in loader:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
-
-                # --- 1) forward pass ---
-                (
-                    decoded_graphs,
-                    fitness_pred,
-                    graph_latent,
-                    task_latent,
-                    mu_g,
-                    lv_g,
-                    mu_t,
-                    lv_t,
-                ) = self.model(
-                    batch.node_types,
-                    batch.edge_index,
-                    batch.node_attributes,
-                    batch.batch,
-                    batch.task_type,
-                    batch.task_features,
+                loss, _assignments, metrics = self.model(
+                    node_types=batch.node_types,
+                    edge_index=batch.edge_index,
+                    batch=batch.batch,
+                    node_attributes=batch.node_attributes,
+                    edge_type=getattr(batch, "edge_type", None),
+                    negative_sampling_ratio=negative_sampling_ratio,
                 )
-                mean_var = task_latent.var(dim=0).mean().item()
-                if mean_var < 1e-3:
-                    warn(
-                        f"Task latent collapsed (mean variance={mean_var:.2e}): Consider adding task reconstruction to cost"
-                    )
-
-                # --- 2) reconstruction losses ---
-                dense_adj = to_dense_adj(
-                    batch.edge_index, batch.batch, max_num_nodes=None
-                )
-
-                loss_adj, loss_feat = torch.tensor(0.0), torch.tensor(0.0)
-                for i, dg in enumerate(decoded_graphs):
-                    pred_types = dg["node_types"]
-                    pred_edges = dg["edge_index"]
-                    pred_attrs = dg["node_attributes"]
-                    target_types = batch.node_types[i]
-                    target_attrs = batch.node_attributes[i]
-                    num_nodes = min(
-                        len(pred_attrs), len(target_attrs)
-                    )  # compare only the overlap
-                    target_edges = dense_adj[i, :num_nodes, :num_nodes]
-
-                    # build binary adjacency preds/targets on 0..num_nodes-1
-                    no_pred_edges = True
-                    adj_pred = torch.zeros((num_nodes, num_nodes), device=self.device)
-                    for s, d in pred_edges.t().tolist():
-                        if s < num_nodes and d < num_nodes:
-                            adj_pred[s, d] = 1.0
-                            no_pred_edges = False
-                    adj_true = dense_adj[i, :num_nodes, :num_nodes]
-
-                    mask = torch.triu(torch.ones_like(adj_pred), diagonal=1).bool()
-                    if adj_pred[mask].size(0) > 0 and adj_true[mask].size(0) > 0:
-                        loss_adj += F.binary_cross_entropy_with_logits(
-                            adj_pred[mask], adj_true[mask]
-                        )
-                    elif adj_pred[mask].size(0) > 0:
-                        loss_adj += adj_pred[mask].sum()
-                    else:
-                        loss_adj += adj_true[mask].sum()
-
-                    # node feature loss
-                    def convert_string(value):
-                        if isinstance(value, str):
-                            value = self.model.attr_encoder.get_value_tensor(value)
-                        return value
-
-                    def to_tensor(value):
-                        value = convert_string(value)
-                        if not isinstance(value, torch.Tensor):
-                            value = torch.as_tensor([value], dtype=torch.float)
-                        return value
-
-                    def attribute_value_loss(value):
-                        value = convert_string(value)
-                        if isinstance(value, int):
-                            value = float(value)
-                        if isinstance(value, torch.Tensor):
-                            value = value.abs().sum()
-                        return value
-
-                    for node_idx in range(num_nodes):
-                        all_attr_names = set(pred_attrs[node_idx].keys()) | set(
-                            target_attrs[node_idx].keys()
-                        )
-                        for attr_name in all_attr_names:
-                            pred_value = pred_attrs[node_idx].get(attr_name)
-                            target_value = target_attrs[node_idx].get(attr_name)
-                            if (pred_value is not None) and (target_value is not None):
-                                loss_feat += F.mse_loss(
-                                    to_tensor(pred_value), to_tensor(target_value)
-                                )
-                            elif target_value is not None:
-                                loss_feat += attribute_value_loss(target_value)
-                            else:
-                                loss_feat += attribute_value_loss(pred_value)
-
-                loss_adj /= batch.num_graphs
-                loss_feat /= batch.num_graphs
-
-                # --- 3) ARD-KL losses ---
-                def calc_kl_div_per_dim(log_alpha, logvar, mu):
-                    # ARD-KL divergence per sample and per dim
-                    precision = torch.exp(log_alpha)
-                    var = torch.exp(logvar)
-                    # KL formula: 0.5*(-log_alpha - logvar + precision*(var + mu^2) - 1)
-                    return 0.5 * (
-                        -log_alpha - logvar + precision * (var + mu.pow(2)) - 1
-                    )
-
-                graph_kl_loss = (
-                    calc_kl_div_per_dim(self.model.log_alpha_g, lv_g, mu_g)
-                    .sum(dim=1)
-                    .mean()
-                )
-                task_kl_loss = (
-                    calc_kl_div_per_dim(self.model.log_alpha_t, lv_t, mu_t)
-                    .sum(dim=1)
-                    .mean()
-                )
-
-                # --- 4) fitness loss ---
-                loss_fitness = F.mse_loss(fitness_pred, batch.y.to(self.device))
-
-                # --- 5) total & backward ---
-                loss_terms = [
-                    loss_adj,
-                    loss_feat,
-                    kl_weight * graph_kl_loss,
-                    kl_weight * task_kl_loss,
-                    fitness_weight * loss_fitness,
-                ]
-                sum(loss_terms).backward()
+                loss.backward()
                 self.optimizer.step()
-                total_loss_terms += torch.tensor(loss_terms)
-            avg_loss_terms = total_loss_terms / len(loader)
-            self.loss_history.append(avg_loss_terms.cpu().numpy())
+
+                epoch_loss += float(loss.detach().cpu().item())
+                batch_count += 1
+
+                for key, value in metrics.items():
+                    if isinstance(value, torch.Tensor):
+                        if value.dim() == 0:
+                            metric_sums[key] = metric_sums.get(key, 0.0) + float(
+                                value.detach().cpu().item()
+                            )
+                    elif isinstance(value, (int, float)):
+                        metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+
+            if batch_count == 0:
+                raise RuntimeError("Training loader produced zero batches.")
+
+            averaged_metrics = {k: v / batch_count for k, v in metric_sums.items()}
+            averaged_metrics["loss"] = epoch_loss / batch_count
+            self.history.append(averaged_metrics)
 
             if verbose:
-                if not epochs:
-                    print(
-                        f"Epoch {epoch}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}"
-                    )
-                else:
-                    print(
-                        f"Epoch {epoch}/{epochs}, Loss terms per batch: {avg_loss_terms} = {avg_loss_terms.sum():.4f}"
-                    )
+                print(
+                    f"Epoch {epoch}/{epochs}  loss={averaged_metrics['loss']:.4f}  metrics={averaged_metrics}"
+                )
 
-            # warm-up baseline
-            if epoch == warmup_epochs:
-                self.initial_loss = avg_loss_terms.sum().item()
-
-            # pruning condition
-            if (
-                self.initial_loss is not None
-                and avg_loss_terms.sum().item() <= loss_threshold * self.initial_loss
-                and (epoch - self.last_prune_epoch) >= min_prune_break
-            ):
-                active_count = int(self.model.graph_latent_mask.sum().item())
-                if active_count > min_active_dims:
-                    self.model.prune_latent_dims(num_prune=prune_amount)
-                    self.last_prune_epoch = epoch
-                    self.initial_loss = avg_loss_terms.sum()  # reset baseline
-
-            epoch += 1
-        return self.loss_history
-
-    def resize_bottleneck(self):
-        """Rebuild all modules to permanently prune inactive dims."""
-        self.model.resize_bottleneck()
-        # reinit optimizer so it only holds new params
-        lr = self.optimizer.defaults.get("lr", 1e-3)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        print("Optimizer Reinitialized")
+        return self.history
 
 
 if __name__ == "__main__":
-    from attributes import *
+    from attributes import FloatAttribute, IntAttribute, StringAttribute
 
     num_node_types = 3
-    max_nodes = 10
-    graph_latent_dim = 32
-    fitness_dim = 2
-    task_latent_dim = graph_latent_dim - 2
-    attr_name_vocab_size = 50
-    attr_name_vocab = [generate_random_string(5) for _ in range(attr_name_vocab_size)]
-    shared_attr_vocab = SharedAttributeVocab(attr_name_vocab, 5)
+    num_relations = 2
+    num_clusters = num_node_types
+    attr_name_vocab = [generate_random_string(5) for _ in range(20)]
+    shared_attr_vocab = SharedAttributeVocab(attr_name_vocab, embedding_dim=5)
     attr_encoder = NodeAttributeDeepSetEncoder(
-        shared_attr_vocab, encoder_hdim=10, aggregator_hdim=20, out_dim=50
+        shared_attr_vocab=shared_attr_vocab,
+        encoder_hdim=16,
+        aggregator_hdim=32,
+        out_dim=32,
     )
+    model = SelfCompressingRGCNAutoEncoder(
+        num_node_types=num_node_types,
+        attr_encoder=attr_encoder,
+        num_clusters=num_clusters,
+        num_relations=num_relations,
+        hidden_dims=[64, 64],
+        dropout=0.1,
+        negative_sampling_ratio=1.0,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    graph_encoder = GraphEncoder(
-        num_node_types, attr_encoder, graph_latent_dim, hidden_dims=[32, 32]
-    )
-    task_encoder = TasksEncoder(
-        hidden_dim=16, latent_dim=task_latent_dim, type_embedding_dim=8
-    )
-    decoder = GraphDecoder(num_node_types, graph_latent_dim, shared_attr_vocab)
-    predictor = FitnessPredictor(
-        latent_dim=graph_latent_dim + task_latent_dim,
-        hidden_dim=64,
-        fitness_dim=fitness_dim,
-    )
-    model = SelfCompressingFitnessRegularizedDAGVAE(
-        graph_encoder, task_encoder, decoder, predictor
-    )
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    # Synthetic DAG generator
-    import random
-
-    def generate_random_dag(num_nodes, num_node_types, edge_prob=0.3):
-        # each node gets a random type in [0, num_node_types)
-        types = torch.randint(0, num_node_types, (num_nodes,), dtype=torch.long)
-        edges = []
-        for i in range(num_nodes):
-            for j in range(i + 1, num_nodes):
+    def generate_random_graph(num_nodes: int, edge_prob: float = 0.3) -> Data:
+        node_types = torch.randint(0, num_node_types, (num_nodes,), dtype=torch.long)
+        edges: List[List[int]] = []
+        edge_types: List[int] = []
+        for src in range(num_nodes):
+            for dst in range(num_nodes):
                 if random.random() < edge_prob:
-                    edges.append([i, j])
-        edge_index = (
-            torch.tensor(edges, dtype=torch.long).t().contiguous()
-            if edges
-            else torch.empty((2, 0), dtype=torch.long)
-        )
-        dyn_attrs = []
+                    edges.append([src, dst])
+                    edge_types.append(random.randint(0, num_relations - 1))
+        if edges:
+            edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+            edge_type = torch.tensor(edge_types, dtype=torch.long)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_type = torch.empty((0,), dtype=torch.long)
+
+        attributes_per_node = []
         for _ in range(num_nodes):
-            attributes = {}
-            for _ in range(random.randint(0, 5)):
-                if random.random() <= 0.5:
-                    attributes[
-                        IntAttribute(random.choice(attr_name_vocab))
-                    ] = random.randint(0, 10)
-                if random.random() <= 0.5:
-                    attributes[FloatAttribute(random.choice(attr_name_vocab))] = (
-                        random.random() * 5.0
-                    )
-                if random.random() <= 0.5:
-                    attributes[
-                        StringAttribute(random.choice(attr_name_vocab))
-                    ] = random.choice(attr_name_vocab)
-            dyn_attrs.append(attributes)
-        return Data(node_types=types, edge_index=edge_index, node_attributes=dyn_attrs)
+            attrs: Dict[Any, Any] = {}
+            if random.random() < 0.5:
+                attrs[IntAttribute(random.choice(attr_name_vocab))] = random.randint(
+                    0, 10
+                )
+            if random.random() < 0.5:
+                attrs[FloatAttribute(random.choice(attr_name_vocab))] = (
+                    random.random() * 5.0
+                )
+            if random.random() < 0.5:
+                attrs[StringAttribute(random.choice(attr_name_vocab))] = random.choice(
+                    attr_name_vocab
+                )
+            attributes_per_node.append(attrs)
 
-    # Create synthetic dataset
-    class Metric:
-        def __init__(self, name, objective):
-            self.name = name
-            self.objective = objective
-
-    print("Generating random training data")
-
-    def generate_data(num_samples):
-        graphs, fitnesses = [], []
-        task_type = random.choice(list(TASK_FEATURE_DIMS.keys()))
-        task_features = torch.randn((TASK_FEATURE_DIMS[task_type],))
-        for _ in range(num_samples):
-            graph = generate_random_dag(
-                random.randint(3, max_nodes), num_node_types, edge_prob=0.4
-            )
-            graphs.append(graph)
-            fitnesses.append(
-                {
-                    Metric(str(i), "min"): graph.edge_index.size(1)
-                    + 0.1 * random.random()
-                    for i in range(fitness_dim)
-                }
-            )
-        return (
-            graphs,
-            fitnesses,
-            task_type,
-            torch.randn((TASK_FEATURE_DIMS[task_type],)),
+        data = Data(
+            node_types=node_types,
+            edge_index=edge_index,
+            node_attributes=attributes_per_node,
         )
+        data.edge_type = edge_type
+        return data
 
+    graphs = [
+        generate_random_graph(random.randint(5, 12), edge_prob=0.25) for _ in range(64)
+    ]
     trainer = OnlineTrainer(model, optimizer)
-    trainer.add_data(*generate_data(50))
-    print("Training")
-    trainer.train(
-        epochs=None, batch_size=8, kl_weight=0.1, warmup_epochs=10, stop_epsilon=1
-    )
-    trainer.resize_bottleneck()
-
-    # Continue training with new data
-    trainer.add_data(*generate_data(10))
-    print("Continuing training")
-    trainer.train(epochs=3, batch_size=8, kl_weight=0.1)
+    trainer.add_data(graphs)
+    trainer.train(epochs=5, batch_size=8)
