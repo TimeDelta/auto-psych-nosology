@@ -160,6 +160,12 @@ Second, a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (
 
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling. The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
 
+A practical limitation of the rGCN-SCAE architecture is that it is trained on a single, fixed multiplex graph, which constitutes only one effective training example.
+Without a distribution of graphs, the model risks overfitting to idiosyncratic topological patterns rather than learning generalizable relational principles.
+To mitigate this, multiple rGCN-SCAEs across different subgraphs were trained—**sampled by ? (TBD - maybe node hopping from random chosen nodes with number of hops determined by combination of graph connectivity metrics)**—each preserving local connectivity and type proportions and alignment between them is measured.
+    - **How to combine latent spaces afterwards to get single partition for comparison against HiTOP and RDoC?**
+This procedure reframes training as an information-theoretic compression task applied repeatedly to partially overlapping realizations of the same knowledge manifold, allowing estimation of replication reliability and consensus structure while reducing overfitting to any single instantiation.
+
 Together, hSBM offers a likelihood-grounded categorical perspective, while rGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis. The two approaches are treated as triangulating evidence: concordant structure across them increases confidence in emergent transdiagnostic clusters, whereas divergences highlight fronts for qualitative review.
 
 | Aspect                        | rGCN Self-Compressing Autoencoder (rGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (hSBM)                                                                                  |
