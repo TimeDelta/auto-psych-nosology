@@ -150,14 +150,17 @@ Only after the final partitioning is complete will alignment metrics such as nor
 This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
 
 ### Partitioning
-- Short explanation of hierarchical stochastic block model (hSBM) [19]
-- If time allows, try to do something with self-compressing auto-encoders (SCAE) like my learning-to-learn project otherwise mention this for future work since it would
-    - still use recurrent graph convolutional network (rGCN) architecture with latent dimensions #Nodes x #Clusters (start w/ #Nodes)
-    - add Louizos et al. 2018 style L0 regularization [20]
-        - add cluster gates to decide how many clusters survive
-        - add inter-cluster gates to decide which inter-cluster connections matter
-    - learn separate inter-cluster matrix per edge type (how to combine?)
-    - maybe also model absent edges in order to help prevent trivial solutions like collapse of clusters to all of one node type to one cluster for each node type
+Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [19], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels. This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits hSBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
+
+Second, a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)** tailored to the heterogeneous, typed graph. The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignment matrix. This latent space is regularized with Louizos et al.’s hard-concrete (L0) gates [20]:
+
+- **Cluster gates** drive automatic selection of the surviving latent clusters.
+- **Relation-specific inter-cluster gates and matrices** learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
+- **Absent-edge modelling via negative sampling** penalizes trivial solutions that would otherwise route every node type into its own cluster; the decoder explicitly contrasts observed edges with sampled non-edges drawn within each graph.
+
+Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling. The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
+
+Together, hSBM offers a likelihood-grounded categorical perspective, while rGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis. The two approaches are treated as triangulating evidence: concordant structure across them increases confidence in emergent transdiagnostic clusters, whereas divergences highlight fronts for qualitative review.
 
 | Aspect                        | rGCN Self-Compressing Autoencoder (rGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (hSBM)                                                                                  |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
