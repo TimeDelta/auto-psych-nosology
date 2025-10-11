@@ -80,6 +80,7 @@ _FALLBACK_RELATION_RULES: Tuple[Tuple[Set[str], Set[str], str], ...] = (
     ({"Symptom"}, {"Diagnosis", "Symptom"}, "predicts"),
 )
 
+# recognized named entities lemmatized before check
 _GENERIC_SPAN_BLOCKLIST_DEFAULT = [
     "adverse effect",
     "side effect",
@@ -89,12 +90,22 @@ _GENERIC_SPAN_BLOCKLIST_DEFAULT = [
     "problem",
     "study",
     "this study",
-    "study",
     "the symptom description",
     "symptom description",
     "the brain",
     "brain",
     "the chasm",
+    "patient",
+    "control",
+    "participant",
+    "subject",
+    "human",
+    "donor",
+    "disease relevant cell",
+    "efficacy of compound",
+    "Medium to large effect size",
+    "The open access option",
+    "Randomization in step",
 ]
 
 
@@ -185,16 +196,6 @@ class RelationInference:
 
 @dataclass
 class ExtractionConfig:
-    ner_exclude_terms: Set[str] = field(
-        default_factory=lambda: {
-            term.strip().lower()
-            for term in os.getenv(
-                "NER_EXCLUDE_TERMS",
-                "patient,patients,control,controls,participant,participants,subject,subjects,human,humans,donor,donors",
-            ).split(",")
-            if term.strip()
-        }
-    )
     stanza_lang: str = field(default_factory=lambda: os.getenv("STANZA_LANG", "en"))
     stanza_processors: str = field(
         default_factory=lambda: os.getenv(
@@ -802,8 +803,6 @@ class EntityRelationExtractor:
                 raw_name = ent.get("word", "")
             raw_name = clean_entity_surface(raw_name)
             if not raw_name:
-                continue
-            if raw_name.lower() in self.config.ner_exclude_terms:
                 continue
             original_surface = raw_name
             lemma_from_ent = (ent.get("lemma") or "").strip()
