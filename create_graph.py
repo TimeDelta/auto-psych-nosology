@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import pathlib
 import time
 from dataclasses import dataclass
@@ -661,7 +662,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_logging() -> None:
+    level_name = os.getenv("AUTO_PSYCH_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        )
+    else:
+        root.setLevel(level)
+    logger.setLevel(level)
+    logger.debug("Logging configured at %s", level_name)
+
+
 if __name__ == "__main__":
+    _configure_logging()
     parser = build_arg_parser()
     args = parser.parse_args()
 
