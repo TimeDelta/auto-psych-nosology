@@ -52,6 +52,42 @@ _FALLBACK_RELATION_RULES: Tuple[Tuple[Set[str], Set[str], str], ...] = (
     ({"Symptom"}, {"Diagnosis", "Symptom"}, "predicts"),
 )
 
+_GENERIC_SPAN_BLOCKLIST_DEFAULT = [
+    "adverse effect",
+    "side effect",
+    "brain organoid",
+    "product",
+    "treatment",
+    "problem",
+    "study",
+    "this study",
+    "study",
+    "the symptom description",
+    "symptom description",
+    "the brain",
+    "brain",
+    "the chasm",
+]
+
+
+def _default_generic_span_blocklist() -> Set[str]:
+    raw = os.getenv("NER_GENERIC_SPAN_BLOCKLIST", None)
+    if not raw:
+        stop_words = _GENERIC_SPAN_BLOCKLIST_DEFAULT
+    else:
+        stop_words = raw.split(",")
+    blocklist: Set[str] = set()
+    for term in stop_words:
+        cleaned = canonical_entity_key(term)
+        if cleaned:
+            blocklist.add(cleaned)
+        else:
+            stripped = term.strip().lower()
+            if stripped:
+                blocklist.add(stripped)
+    return blocklist
+
+
 _RELATION_MODE = "nli"
 _NLI_MODEL_NAME = "pritamdeka/PubMedBERT-MNLI-MedNLI"
 _SUBSTANTIVE_REL_TEMPLATES = {
@@ -155,6 +191,9 @@ class ExtractionConfig:
     nli_model_name: str = _NLI_MODEL_NAME
     relation_role_constraints: Dict[str, Dict[str, Set[str]]] = field(
         default_factory=lambda: dict(RELATION_ROLE_CONSTRAINTS)
+    )
+    generic_span_blocklist: Set[str] = field(
+        default_factory=_default_generic_span_blocklist
     )
 
 
@@ -717,6 +756,13 @@ class EntityRelationExtractor:
             canonical_display = (
                 canonical_entity_display(lemma_hint or raw_name) or raw_name
             )
+            if canonical_key and canonical_key in self.config.generic_span_blocklist:
+                logger.debug(
+                    "Skipping generic entity span '%s' (canonical key: %s)",
+                    raw_name,
+                    canonical_key,
+                )
+                continue
             record = entities.get(canonical_key)
             if record is None:
                 label = ent.get("entity_group", "")

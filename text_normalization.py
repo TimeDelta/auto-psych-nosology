@@ -34,7 +34,9 @@ _WORD_RE = re.compile(r"[A-Za-z]+")
 
 
 def clean_entity_surface(name: str) -> str:
-    return re.sub(r"\s+", " ", (name or "").strip())
+    cleaned = re.sub(r"\s+|[^a-zA-Z_0-9]", " ", (name or "").strip())
+    cleaned = re.sub(r"'s", "", (cleaned or ""))
+    return re.sub(r" - ", "-", (cleaned or ""))
 
 
 def _apply_case_pattern(original: str, base_lower: str) -> str:
