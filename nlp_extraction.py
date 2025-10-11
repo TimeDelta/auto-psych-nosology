@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -34,6 +35,33 @@ logger.addHandler(logging.NullHandler())
 _LOG_LEVEL_NAME = os.getenv("AUTO_PSYCH_LOG_LEVEL", "INFO").strip().upper()
 logger.setLevel(getattr(logging, _LOG_LEVEL_NAME, logging.INFO))
 logging.getLogger("stanza").setLevel(logging.INFO)
+
+
+def _log_step_duration(
+    step: str,
+    start_time: float,
+    *,
+    paper: Optional[str] = None,
+    details: Optional[str] = None,
+) -> None:
+    elapsed = time.perf_counter() - start_time
+    detail_suffix = f" ({details})" if details else ""
+    if paper:
+        logger.debug(
+            "[timing] %s completed in %.3f seconds for %s%s",
+            step,
+            elapsed,
+            paper,
+            detail_suffix,
+        )
+    else:
+        logger.debug(
+            "[timing] %s completed in %.3f seconds%s",
+            step,
+            elapsed,
+            detail_suffix,
+        )
+
 
 RELATION_ROLE_CONSTRAINTS: Dict[str, Dict[str, Set[str]]] = {
     "treats": {"subject": {"Treatment"}, "object": {"Diagnosis", "Symptom"}},
@@ -129,7 +157,6 @@ def _stanza_ner_packages() -> List[str]:
                 "anatem",
                 "jnlpba",
                 "linnaeus",
-                "ncbi_disease",
                 "i2b2",
             ]
         )
@@ -210,6 +237,7 @@ class EntityRelationExtractor:
         self._nli_tokenizer = nli_tokenizer
         self._nli_model = nli_model
         self._nli_lock = threading.Lock()
+        self._relation_type_cache: Dict[Tuple[str, str], bool] = {}
 
     def _stanza_use_gpu(self) -> bool:
         if os.getenv("STANZA_USE_GPU", "").strip() == "0":
@@ -436,6 +464,33 @@ class EntityRelationExtractor:
             if subj_type in subj_candidates and obj_type in obj_candidates:
                 return predicate
         return None
+
+    def _pair_has_potential_relation(self, type_a: str, type_b: str) -> bool:
+        cache_key = (type_a, type_b)
+        cached = self._relation_type_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        possible = False
+        for predicate in self.config.relation_role_constraints:
+            if self._relation_allowed_for_types(
+                predicate, type_a, type_b
+            ) or self._relation_allowed_for_types(predicate, type_b, type_a):
+                possible = True
+                break
+
+        if not possible:
+            for subj_candidates, obj_candidates, _ in _FALLBACK_RELATION_RULES:
+                if (type_a in subj_candidates and type_b in obj_candidates) or (
+                    type_b in subj_candidates and type_a in obj_candidates
+                ):
+                    possible = True
+                    break
+
+        self._relation_type_cache[cache_key] = possible
+        # store symmetric result to avoid recomputation
+        self._relation_type_cache[(type_b, type_a)] = possible
+        return possible
 
     def _coref_mention_info(
         self, doc: "stanza.Document", mention: Any
@@ -691,6 +746,7 @@ class EntityRelationExtractor:
         return results
 
     def extract(self, meta: Dict[str, Any], text: str) -> Optional[PaperExtraction]:
+        overall_start = time.perf_counter()
         paper_label = (
             meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
         )
@@ -699,13 +755,39 @@ class EntityRelationExtractor:
                 "Skipping paper %s: no text available after preprocessing.",
                 paper_label,
             )
+            _log_step_duration(
+                "extract.total",
+                overall_start,
+                paper=paper_label,
+                details="result=no_text",
+            )
             return None
         try:
+            ner_start = time.perf_counter()
             ner_results = self._ner_pipeline(text)
+            _log_step_duration(
+                "extract.ner_pipeline",
+                ner_start,
+                paper=paper_label,
+                details=f"ner_results={len(ner_results)}",
+            )
         except Exception:
+            _log_step_duration(
+                "extract.ner_pipeline",
+                ner_start,
+                paper=paper_label,
+                details="error=true",
+            )
             logger.exception("Skipping paper %s: NER pipeline failed.", paper_label)
+            _log_step_duration(
+                "extract.total",
+                overall_start,
+                paper=paper_label,
+                details="result=ner_error",
+            )
             return None
 
+        entity_start = time.perf_counter()
         entities: Dict[str, NodeRecord] = {}
         for ent in ner_results:
             coref_info = ent.get("coref_antecedent") or None
@@ -811,8 +893,20 @@ class EntityRelationExtractor:
             ):
                 name_candidates.append(original_surface)
             self._update_record_forms(record, name_candidates)
+        _log_step_duration(
+            "extract.entity_postprocess",
+            entity_start,
+            paper=paper_label,
+            details=f"unique_entities={len(entities)}",
+        )
         if not entities:
             logger.info("Skipping paper %s: no entities detected.", paper_label)
+            _log_step_duration(
+                "extract.total",
+                overall_start,
+                paper=paper_label,
+                details="result=no_entities",
+            )
             return None
 
         node_records = list(entities.values())
@@ -822,13 +916,27 @@ class EntityRelationExtractor:
             for record in node_records
         }
 
+        relation_start = time.perf_counter()
         relations: List[RelationRecord] = []
+        relation_attempts = 0
+        skipped_pairs = 0
         for i in range(len(node_records)):
             for j in range(i + 1, len(node_records)):
                 subj = node_records[i].canonical_name
                 obj = node_records[j].canonical_name
                 subj_type = node_records[i].node_type
                 obj_type = node_records[j].node_type
+                if not self._pair_has_potential_relation(subj_type, obj_type):
+                    skipped_pairs += 1
+                    logger.debug(
+                        "Skipping relation pair %s (%s) ↔ %s (%s): no compatible predicates",
+                        subj,
+                        subj_type,
+                        obj,
+                        obj_type,
+                    )
+                    continue
+                relation_attempts += 1
                 context = self._pick_sentence_context(
                     text, surface_lookup[subj], surface_lookup[obj]
                 )
@@ -971,7 +1079,15 @@ class EntityRelationExtractor:
                         qualifiers=qualifiers,
                     )
                 )
-        return PaperExtraction(
+        _log_step_duration(
+            "extract.relation_inference",
+            relation_start,
+            paper=paper_label,
+            details=(
+                f"attempts={relation_attempts}, relations={len(relations)}, skipped={skipped_pairs}"
+            ),
+        )
+        result = PaperExtraction(
             paper_id=meta.get("id", ""),
             doi=meta.get("doi"),
             title=meta.get("title", ""),
@@ -980,6 +1096,13 @@ class EntityRelationExtractor:
             nodes=node_records,
             relations=relations,
         )
+        _log_step_duration(
+            "extract.total",
+            overall_start,
+            paper=paper_label,
+            details=(f"nodes={len(node_records)}, relations={len(relations)}"),
+        )
+        return result
 
     def _surface_form(self, record: NodeRecord, text: str) -> str:
         forms = record.normalizations.get("surface_forms", [])

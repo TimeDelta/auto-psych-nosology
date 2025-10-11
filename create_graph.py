@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import pathlib
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -30,6 +32,14 @@ from models import PaperExtraction
 from nlp_extraction import EntityRelationExtractor
 from openalex_client import DEFAULT_FILTER, fetch_candidate_records
 from sections import extract_results_and_discussion
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+
+def _log_step_duration(step: str, start_time: float) -> None:
+    elapsed = time.perf_counter() - start_time
+    logger.debug("[timing] %s completed in %.3f seconds", step, elapsed)
 
 
 @dataclass
@@ -525,16 +535,25 @@ class KnowledgeGraphPipeline:
             print("[warn] No extractions; exiting.")
             return
 
+        start_time = time.perf_counter()
         nodes_df, relations_df, papers_df = accum_extractions(paper_level)
+        _log_step_duration("accum_extractions", start_time)
         print(
             f"[info] {len(papers_df)} papers, {len(nodes_df)} node mentions, {len(relations_df)} relations"
         )
+        start_time = time.perf_counter()
         graph = build_multilayer_graph(nodes_df, relations_df)
+        _log_step_duration("build_multilayer_graph", start_time)
         weighted_graph: Optional[nx.Graph] = None
         if config.project_to_weighted:
+            start_time = time.perf_counter()
             weighted_graph = project_to_weighted_graph(graph)
+            _log_step_duration("project_to_weighted_graph", start_time)
+        else:
+            logger.debug("[timing] project_to_weighted_graph skipped (flag disabled)")
 
         output_prefix = config.data_dir / config.out_prefix
+        start_time = time.perf_counter()
         save_tables(
             nodes_df,
             relations_df,
@@ -543,6 +562,7 @@ class KnowledgeGraphPipeline:
             output_prefix,
             projected=weighted_graph,
         )
+        _log_step_duration("save_tables", start_time)
         persist_checkpoint(status="complete")
 
         if config.eval_nodes:
