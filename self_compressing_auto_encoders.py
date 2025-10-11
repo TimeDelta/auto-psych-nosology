@@ -1,5 +1,6 @@
 import math
 import random
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from warnings import warn
 
@@ -457,6 +458,17 @@ class ClusteredGraphReconstructor(nn.Module):
         return recon_loss, info
 
 
+@dataclass
+class PartitionResult:
+    """Container holding a hard partition derived from rGCN-SCAE outputs."""
+
+    node_to_cluster: torch.LongTensor
+    active_clusters: torch.LongTensor
+    cluster_members: Dict[int, torch.LongTensor]
+    gate_values: torch.Tensor
+    assignments: torch.Tensor
+
+
 class SelfCompressingRGCNAutoEncoder(nn.Module):
     """Self-compressing AE with rGCN encoder, L0 cluster gates, and relation gates."""
 
@@ -470,6 +482,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         type_embedding_dim: Optional[int] = None,
         dropout: float = 0.0,
         negative_sampling_ratio: float = 1.0,
+        allow_self_loops: bool = False,
         l0_cluster_weight: float = 1e-3,
         l0_inter_weight: float = 1e-3,
     ) -> None:
@@ -487,6 +500,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             num_relations=num_relations,
             num_clusters=num_clusters,
             negative_sampling_ratio=negative_sampling_ratio,
+            allow_self_loops=allow_self_loops,
         )
         self.l0_cluster_weight = l0_cluster_weight
         self.l0_inter_weight = l0_inter_weight
@@ -533,6 +547,89 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         }
         metrics.update({k: v for k, v in dec_info.items() if "loss" in k})
         return total_loss, assignments, metrics
+
+    @staticmethod
+    def hard_partition(
+        assignments: torch.Tensor,
+        cluster_gate_values: torch.Tensor,
+        gate_threshold: float = 0.5,
+        min_cluster_size: int = 1,
+    ) -> PartitionResult:
+        """Translate latent assignments + gate activations into a discrete partition.
+
+        Args:
+            assignments: Soft assignment matrix of shape [num_nodes, num_clusters].
+            cluster_gate_values: Gate activations (sample or expectation) of shape
+                [num_clusters] or [1, num_clusters].
+            gate_threshold: Minimum gate value required to mark a cluster as active.
+            min_cluster_size: Optional minimum number of nodes per cluster
+                (clusters falling below are suppressed and their nodes reassigned).
+
+        Returns:
+            PartitionResult with per-node hard labels and active cluster metadata.
+        """
+
+        if assignments.dim() != 2:
+            raise ValueError(
+                "assignments must be a 2D tensor [num_nodes, num_clusters]."
+            )
+
+        gate_vals = cluster_gate_values.squeeze()
+        if gate_vals.dim() != 1 or gate_vals.numel() != assignments.size(1):
+            raise ValueError(
+                "cluster_gate_values must broadcast to [num_clusters] matching assignments."
+            )
+
+        # Determine active clusters based on threshold; ensure at least one cluster survives.
+        active_mask = gate_vals >= gate_threshold
+        if active_mask.sum() == 0:
+            # fallback: keep the cluster with the strongest gate value
+            active_mask[gate_vals.argmax()] = True
+
+        active_indices = torch.nonzero(active_mask, as_tuple=False).view(-1)
+        num_clusters = assignments.size(1)
+
+        masked_assignments = assignments.clone()
+        inactive_mask = ~active_mask
+        if inactive_mask.any():
+            masked_assignments[:, inactive_mask] = torch.finfo(assignments.dtype).min
+
+        max_vals, node_labels = masked_assignments.max(dim=1)
+
+        # Handle rows where all active clusters were suppressed (e.g., numerical issues).
+        unresolved = torch.isinf(max_vals)
+        if unresolved.any():
+            fallback = assignments[unresolved].argmax(dim=1)
+            node_labels[unresolved] = fallback
+
+        if min_cluster_size > 1:
+            counts = torch.bincount(node_labels, minlength=num_clusters)
+            small_clusters = (counts < min_cluster_size) & active_mask
+            if small_clusters.any():
+                keepers = active_mask.clone()
+                keepers[small_clusters] = False
+                if keepers.sum() == 0:
+                    # fallback: keep the cluster with max gate even if it is small
+                    keepers[gate_vals.argmax()] = True
+                active_mask = keepers
+                active_indices = torch.nonzero(active_mask, as_tuple=False).view(-1)
+                masked_assignments = assignments.clone()
+                masked_assignments[:, ~active_mask] = torch.finfo(assignments.dtype).min
+                _, node_labels = masked_assignments.max(dim=1)
+
+        cluster_members: Dict[int, torch.LongTensor] = {}
+        for idx in active_indices.tolist():
+            member_idx = torch.nonzero(node_labels == idx, as_tuple=False).view(-1)
+            if member_idx.numel() > 0:
+                cluster_members[idx] = member_idx
+
+        return PartitionResult(
+            node_to_cluster=node_labels.cpu(),
+            active_clusters=active_indices.cpu(),
+            cluster_members={k: v.cpu() for k, v in cluster_members.items()},
+            gate_values=gate_vals.detach().cpu(),
+            assignments=assignments.detach().cpu(),
+        )
 
 
 class GraphEncoder(nn.Module):
@@ -915,7 +1012,7 @@ class OnlineTrainer:
                     node_types=batch.node_types,
                     edge_index=batch.edge_index,
                     batch=batch.batch,
-                    node_attributes=batch.node_attributes,
+                    node_attributes=getattr(batch, "node_attributes", None),
                     edge_type=getattr(batch, "edge_type", None),
                     negative_sampling_ratio=negative_sampling_ratio,
                 )
