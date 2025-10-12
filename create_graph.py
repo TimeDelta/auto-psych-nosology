@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import pathlib
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,7 +31,7 @@ from graph_build import (
 )
 from graph_export import save_tables
 from models import PaperExtraction
-from nlp_extraction import EntityRelationExtractor
+from nlp_extraction import EntityRelationExtractor, ExtractionConfig
 from openalex_client import DEFAULT_FILTER, fetch_candidate_records
 from sections import extract_results_and_discussion
 
@@ -41,6 +42,61 @@ logger.addHandler(logging.NullHandler())
 def _log_step_duration(step: str, start_time: float) -> None:
     elapsed = time.perf_counter() - start_time
     logger.debug("[timing] %s completed in %.3f seconds", step, elapsed)
+
+
+def _ensure_spacy_model_available(model_name: Optional[str]) -> None:
+    if not model_name:
+        return
+    try:
+        import spacy
+    except Exception:  # pragma: no cover
+        logger.debug("spaCy not installed; skipping automatic model setup.")
+        return
+
+    try:
+        spacy.load(model_name)
+        return
+    except Exception:
+        pass
+
+    scispacy_urls = {
+        "en_core_sci_sm": "https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.1/en_core_sci_sm-0.5.1.tar.gz",
+        "en_core_sci_scibert": "https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.1/en_core_sci_scibert-0.5.1.tar.gz",
+    }
+    url = scispacy_urls.get(model_name)
+    if not url:
+        logger.debug(
+            "No known download URL for spaCy model %s; skipping auto-install.",
+            model_name,
+        )
+        return
+
+    cmd = ["python3.10", "-m", "pip", "install", url]
+    try:
+        logger.info("spaCy model %s not found; attempting pip install.", model_name)
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "pip install for %s failed (code %s): %s",
+                model_name,
+                result.returncode,
+                result.stderr.strip(),
+            )
+            return
+        spacy.load(model_name)
+        logger.info("Successfully installed spaCy model %s via pip.", model_name)
+    except Exception as exc:
+        logger.warning(
+            "Automatic install of spaCy model %s failed (%s); proceeding without it.",
+            model_name,
+            exc,
+        )
 
 
 @dataclass
@@ -62,7 +118,12 @@ class PipelineConfig:
 
 class KnowledgeGraphPipeline:
     def __init__(self, extractor: Optional[EntityRelationExtractor] = None) -> None:
-        self.extractor = extractor or EntityRelationExtractor()
+        if extractor is not None:
+            self.extractor = extractor
+        else:
+            extractor_config = ExtractionConfig()
+            _ensure_spacy_model_available(extractor_config.spacy_model)
+            self.extractor = EntityRelationExtractor(config=extractor_config)
 
     def _load_gold_nodes(self, path: pathlib.Path) -> List[str]:
         with open(path, "r", encoding="utf-8") as handle:
@@ -488,11 +549,6 @@ class KnowledgeGraphPipeline:
                 print("[warn] Interrupted by user; saving checkpoint before exit.")
                 persist_checkpoint(status="interrupted")
                 raise
-            except Exception as exc:
-                label = meta.get("title") or meta.get("id") or record_id
-                print(
-                    f"[error] Unexpected failure while processing '{label}': {exc}. Skipping."
-                )
             finally:
                 completed_ids.add(record_id)
                 attempted_since_checkpoint += 1

@@ -12,9 +12,11 @@ pydantic
 python-dotenv
 readability-lxml
 scispacy
+https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.1/en_core_sci_scibert-0.5.1.tar.gz
 spacy
 sentence-transformers
 stanza>=1.7.0
 torch
 tqdm
-transformers
+transformers==4.45.2
+tokenizers==0.20.3

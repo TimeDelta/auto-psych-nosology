@@ -2,9 +2,78 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set, Type, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+try:  # pragma: no cover - import guard for Pydantic v1 compatibility
+    from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+    _PYDANTIC_V2 = True
+except ImportError:  # pragma: no cover
+    from pydantic import BaseModel, Extra, Field, root_validator
+
+    ConfigDict = None  # type: ignore[assignment]
+    _PYDANTIC_V2 = False
+
+    def model_validator(*, mode: str):  # type: ignore[override]
+        if mode != "after":
+            raise NotImplementedError(
+                "Only mode='after' is supported when using Pydantic < 2."
+            )
+
+        def _decorator(func):
+            def _wrapper(cls, values):
+                instance = cls.construct(**values)
+                result = func(instance)
+                if isinstance(result, cls):
+                    return result.dict()
+                if result is None:
+                    return values
+                return result
+
+            return root_validator(pre=False, allow_reuse=True)(_wrapper)
+
+        return _decorator
+
+
+ModelT = TypeVar("ModelT", bound="StrictBaseModel")
+
+
+if _PYDANTIC_V2:
+
+    class StrictBaseModel(BaseModel):
+        """Base model that forbids extra fields across Pydantic versions."""
+
+        model_config = ConfigDict(extra="forbid")  # type: ignore[arg-type]
+
+        @classmethod
+        def _model_validate(cls: Type[ModelT], data: Any) -> ModelT:
+            return cls.model_validate(data)
+
+        def _model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            return super().model_dump(*args, **kwargs)
+
+else:
+
+    class StrictBaseModel(BaseModel):
+        """Base model shim that emulates Pydantic v2 APIs for v1 installs."""
+
+        class Config:
+            extra = Extra.forbid
+
+        @classmethod
+        def model_validate(cls: Type[ModelT], data: Any) -> ModelT:  # type: ignore[override]
+            return cls.parse_obj(data)
+
+        @classmethod
+        def _model_validate(cls: Type[ModelT], data: Any) -> ModelT:
+            return cls.model_validate(data)
+
+        def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
+            return self.dict(*args, **kwargs)
+
+        def _model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            return self.model_dump(*args, **kwargs)
+
 
 NODE_TYPES: Set[str] = {
     "Symptom",
@@ -35,10 +104,8 @@ EVIDENCE_RELATIONS: Set[str] = {
 }
 
 
-class ClaimDescriptor(BaseModel):
+class ClaimDescriptor(StrictBaseModel):
     """Structured description of the claim an evidence edge is about."""
-
-    model_config = ConfigDict(extra="forbid")
 
     type: Literal[
         "causal",
@@ -93,10 +160,8 @@ class ClaimDescriptor(BaseModel):
     )
 
 
-class NodeRecord(BaseModel):
+class NodeRecord(StrictBaseModel):
     """Normalized node extracted from a document."""
-
-    model_config = ConfigDict(extra="forbid")
 
     canonical_name: str = Field(
         ..., description="Primary name for the entity as used in the paper."
@@ -112,10 +177,8 @@ class NodeRecord(BaseModel):
     )
 
 
-class RelationRecord(BaseModel):
+class RelationRecord(StrictBaseModel):
     """Relation between two extracted nodes."""
-
-    model_config = ConfigDict(extra="forbid")
 
     subject: str = Field(..., description="Canonical name of subject node")
     predicate: str = Field(..., description=f"One of {sorted(list(REL_TYPES))}")
@@ -153,10 +216,8 @@ class RelationRecord(BaseModel):
         return self
 
 
-class PaperExtraction(BaseModel):
+class PaperExtraction(StrictBaseModel):
     """Container with nodes and relations extracted from a single document."""
-
-    model_config = ConfigDict(extra="forbid")
 
     paper_id: str
     doi: Optional[str] = None

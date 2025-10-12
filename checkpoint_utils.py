@@ -8,11 +8,34 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Type, TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from models import PaperExtraction
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    """Serialize a Pydantic model regardless of major version."""
+
+    if hasattr(model, "_model_dump"):
+        return model._model_dump(exclude_none=True)
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=True)
+    return model.dict(exclude_none=True)
+
+
+def _model_validate(model_cls: Type[ModelT], data: Mapping[str, Any]) -> ModelT:
+    """Instantiate a Pydantic model regardless of major version."""
+
+    if hasattr(model_cls, "_model_validate"):
+        return model_cls._model_validate(data)
+    if hasattr(model_cls, "model_validate"):
+        return model_cls.model_validate(data)
+    return model_cls.parse_obj(data)
+
 
 CHECKPOINT_ARG_KEYS = [
     "query",
@@ -81,7 +104,7 @@ def checkpoint_extraction_id(extraction: PaperExtraction) -> str:
     if base:
         return base
     fallback = json.dumps(
-        extraction.model_dump(mode="json", by_alias=True),
+        _model_dump(extraction),
         sort_keys=True,
         default=str,
     )
@@ -116,7 +139,7 @@ def load_checkpoint_state(path: pathlib.Path) -> Optional[CheckpointState]:
     raw_extractions = payload.get("extractions") or []
     for index, data in enumerate(raw_extractions):
         try:
-            extractions.append(PaperExtraction.model_validate(data))
+            extractions.append(_model_validate(PaperExtraction, data))
         except ValidationError as exc:
             if isinstance(data, dict) and "relations" in data:
                 fixed = dict(data)
@@ -125,7 +148,7 @@ def load_checkpoint_state(path: pathlib.Path) -> Optional[CheckpointState]:
                         list(fixed.get("relations") or [])
                     )
                     fixed["relations"] = fixed_relations
-                    extractions.append(PaperExtraction.model_validate(fixed))
+                    extractions.append(_model_validate(PaperExtraction, fixed))
                     continue
                 except Exception:
                     pass
@@ -157,10 +180,7 @@ def save_checkpoint_state(path: pathlib.Path, state: CheckpointState) -> None:
     payload = {
         "metadata": metadata,
         "records": state.records,
-        "extractions": [
-            extraction.model_dump(mode="json", by_alias=True)
-            for extraction in state.extractions
-        ],
+        "extractions": [_model_dump(extraction) for extraction in state.extractions],
         "completed_ids": sorted(state.completed_ids),
     }
     path.parent.mkdir(parents=True, exist_ok=True)

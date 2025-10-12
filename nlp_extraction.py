@@ -10,9 +10,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import spacy
 import stanza
 import torch
 from nltk.tokenize import sent_tokenize
+from scispacy.linking import EntityLinker
+from spacy.lang.en.stop_words import STOP_WORDS as _SPACY_STOP_WORDS
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from models import (
@@ -106,24 +109,57 @@ _GENERIC_SPAN_BLOCKLIST_DEFAULT = [
     "Medium to large effect size",
     "The open access option",
     "Randomization in step",
+    "CRISPR",
+    "cell",
+    "clinical practice set",
+    "learn algorithm",
+    "collect datum",
+    "it customize hardware",
+    "very low probability",
+    "adaptive trial design",
+    "illness",
+    "disorder",
+    "symptom",
 ]
 
+_UMLS_SEMANTIC_TYPE_TO_NODE: Dict[str, str] = {
+    # Symptom-centric semantic types
+    "T184": "Symptom",  # Sign or Symptom
+    "T033": "Symptom",  # Finding
+    "T041": "Symptom",  # Mental Process
+    "T048": "Symptom",  # Mental or Behavioral Dysfunction
+    # Broader clinical condition types to prevent dropping key entities
+    "T047": "Diagnosis",  # Disease or Syndrome
+    "T046": "Diagnosis",  # Pathologic Function
+    "T191": "Diagnosis",  # Neoplastic Process
+    # Treatment-oriented semantic types
+    "T061": "Treatment",  # Therapeutic or Preventive Procedure
+    "T200": "Treatment",  # Clinical Drug
+    "T121": "Treatment",  # Pharmacologic Substance
+    # Biomarker / biological entity types
+    "T123": "Biomarker",  # Biologically Active Substance
+    "T109": "Biomarker",  # Organic Chemical
+    "T126": "Biomarker",  # Enzyme
+    "T127": "Biomarker",  # Vitamin
+}
 
-def _default_generic_span_blocklist() -> Set[str]:
-    raw = os.getenv("NER_GENERIC_SPAN_BLOCKLIST", None)
-    if not raw:
-        stop_words = _GENERIC_SPAN_BLOCKLIST_DEFAULT
-    else:
-        stop_words = raw.split(",")
+
+def _build_span_blocklist() -> Set[str]:
+    base_terms: Set[str] = set(_GENERIC_SPAN_BLOCKLIST_DEFAULT)
+    extra_sources = (os.getenv("NER_GENERIC_SPAN_BLOCKLIST"),)
+    for source in extra_sources:
+        if not source:
+            continue
+        base_terms.update(part.strip() for part in source.split(",") if part.strip())
+
     blocklist: Set[str] = set()
-    for term in stop_words:
-        cleaned = canonical_entity_key(term)
-        if cleaned:
-            blocklist.add(cleaned)
-        else:
-            stripped = term.strip().lower()
-            if stripped:
-                blocklist.add(stripped)
+    for term in base_terms:
+        lower = term.lower()
+        if lower:
+            blocklist.add(lower)
+        canonical = canonical_entity_key(term)
+        if canonical:
+            blocklist.add(canonical)
     return blocklist
 
 
@@ -165,10 +201,7 @@ def _stanza_ner_packages() -> List[str]:
         packages.extend(
             [
                 "bc5cdr",
-                "anatem",
                 "jnlpba",
-                "linnaeus",
-                "i2b2",
             ]
         )
     return dedupe_preserve_order(packages)
@@ -220,8 +253,36 @@ class ExtractionConfig:
     relation_role_constraints: Dict[str, Dict[str, Set[str]]] = field(
         default_factory=lambda: dict(RELATION_ROLE_CONSTRAINTS)
     )
-    generic_span_blocklist: Set[str] = field(
-        default_factory=_default_generic_span_blocklist
+    span_blocklist: Set[str] = field(default_factory=_build_span_blocklist)
+    spacy_model: Optional[str] = field(
+        default_factory=lambda: os.getenv("SPACY_BIOMED_MODEL", "en_core_sci_sm")
+    )
+    enable_ontology_filter: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_ONTOLOGY_FILTER", "0") != "0"
+    )
+    ontology_min_score: float = field(
+        default_factory=lambda: float(os.getenv("ONTOLOGY_MIN_SCORE", "0.5"))
+    )
+    spacy_linker_name: str = field(
+        default_factory=lambda: os.getenv("SPACY_LINKER_NAME", "umls_context")
+    )
+    prefilter_model_name: Optional[str] = field(
+        default_factory=lambda: (  # cross-encoder/nli-deberta-v3-base decimates recall but halves total time
+            os.getenv("REL_PREFILTER_MODEL", "").strip()
+            or None  # TODO: check other models
+        )
+    )
+    prefilter_min_score: float = field(
+        default_factory=lambda: float(os.getenv("REL_PREFILTER_MIN_SCORE", "0.55"))
+    )
+    prefilter_min_context_chars: int = field(
+        default_factory=lambda: int(os.getenv("REL_PREFILTER_MIN_CONTEXT_CHARS", "30"))
+    )
+    prefilter_hypothesis_template: str = field(
+        default_factory=lambda: os.getenv(
+            "REL_PREFILTER_TEMPLATE",
+            "{SUBJ} is biologically related to {OBJ}.",
+        )
     )
 
 
@@ -239,6 +300,16 @@ class EntityRelationExtractor:
         self._nli_model = nli_model
         self._nli_lock = threading.Lock()
         self._relation_type_cache: Dict[Tuple[str, str], bool] = {}
+        self._spacy_nlp = None
+        self._spacy_linker_available = False
+        self._latest_link_scores: Dict[str, float] = {}
+        self._scispacy_linker = None
+        self._umls_type_cache: Dict[str, Optional[str]] = {}
+        self._stop_words: Set[str] = set(_SPACY_STOP_WORDS)
+        self._span_blocklist = set(self.config.span_blocklist)
+        self._prefilter_model = None
+        self._prefilter_tokenizer = None
+        self._prefilter_entailment_index: Optional[int] = None
 
     def _stanza_use_gpu(self) -> bool:
         if os.getenv("STANZA_USE_GPU", "").strip() == "0":
@@ -400,7 +471,55 @@ class EntityRelationExtractor:
             contradiction=float(logits[0].item()),
         )
 
-    def categorize_entity(self, label: str) -> Optional[str]:
+    def _node_type_from_umls(self, kb_id: Optional[str]) -> Optional[str]:
+        if not kb_id or not self._scispacy_linker:
+            return None
+        cached = self._umls_type_cache.get(kb_id)
+        if kb_id in self._umls_type_cache:
+            return cached
+        node_type: Optional[str] = None
+        concept = None
+        kb = getattr(self._scispacy_linker, "kb", None)
+        if kb is not None:
+            concept = getattr(kb, "cui_to_entity", {}).get(kb_id)
+            if concept is None and hasattr(kb, "get_concept"):
+                concept = kb.get_concept(kb_id)
+        concept_name = ""
+        if concept is not None:
+            concept_name = (
+                getattr(concept, "canonical_name", "")
+                or getattr(concept, "preferred_name", "")
+                or getattr(concept, "name", "")
+            )
+            semantic_types = getattr(concept, "types", None) or getattr(
+                concept, "semantic_types", None
+            )
+            if semantic_types:
+                for tui in semantic_types:
+                    mapped = _UMLS_SEMANTIC_TYPE_TO_NODE.get(str(tui).upper())
+                    if mapped:
+                        node_type = mapped
+                        break
+        if node_type == "Symptom" and concept_name:
+            lowered = concept_name.lower()
+            if any(
+                keyword in lowered
+                for keyword in (
+                    "disorder",
+                    "disorders",
+                    "disease",
+                    "diseases",
+                    "syndrome",
+                    "syndromes",
+                )
+            ):
+                node_type = "Diagnosis"
+        self._umls_type_cache[kb_id] = node_type
+        return node_type
+
+    def categorize_entity(
+        self, label: str, kb_id: Optional[str] = None
+    ) -> Optional[str]:
         lbl = label.upper()
         direct_map = {
             "PROBLEM": "Symptom",
@@ -437,11 +556,12 @@ class EntityRelationExtractor:
             "RNA": "Biomarker",
             "GENE": "Biomarker",
             "BIOMARKER": "Biomarker",
-            #
-            "SPECIES": "Species",
         }
         if lbl in direct_map:
             return direct_map[lbl]
+        umls_type = self._node_type_from_umls(kb_id)
+        if umls_type:
+            return umls_type
         return None
 
     def _relation_allowed_for_types(
@@ -492,6 +612,172 @@ class EntityRelationExtractor:
         # store symmetric result to avoid recomputation
         self._relation_type_cache[(type_b, type_a)] = possible
         return possible
+
+    def _ensure_spacy_pipeline(self) -> Optional[Any]:
+        if spacy is None:
+            self._scispacy_linker = None
+            self._umls_type_cache = {}
+            return None
+        if self.config.spacy_model in (None, ""):
+            self._scispacy_linker = None
+            self._umls_type_cache = {}
+            return None
+        if self._spacy_nlp is not None:
+            return self._spacy_nlp
+        try:
+            nlp = spacy.load(
+                self.config.spacy_model,
+                disable=["parser", "textcat"],
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "spaCy model %s unavailable (%s); disabling spaCy integration.",
+                self.config.spacy_model,
+                exc,
+            )
+            self._scispacy_linker = None
+            self._umls_type_cache = {}
+            self._spacy_nlp = None
+            return None
+
+        try:
+            if (
+                "scispacy_linker" not in nlp.pipe_names
+                and "entity_linker" not in nlp.pipe_names
+            ):
+                nlp.add_pipe(
+                    "scispacy_linker",
+                    config={
+                        "resolve_abbreviations": True,
+                        "linker_name": self.config.spacy_linker_name,
+                    },
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "Unable to add SciSpaCy linker (%s); continuing without ontology filter.",
+                exc,
+            )
+        self._spacy_linker_available = (
+            "scispacy_linker" in nlp.pipe_names or "entity_linker" in nlp.pipe_names
+        )
+        if self._spacy_linker_available:
+            try:
+                self._scispacy_linker = nlp.get_pipe("scispacy_linker")
+            except Exception:
+                try:
+                    self._scispacy_linker = nlp.get_pipe("entity_linker")
+                except Exception:
+                    self._scispacy_linker = None
+                    self._spacy_linker_available = False
+        else:
+            self._scispacy_linker = None
+        # Reset cached UMLS lookups whenever the spaCy pipeline is rebuilt.
+        self._umls_type_cache = {}
+        self._spacy_nlp = nlp
+        return self._spacy_nlp
+
+    def _ensure_prefilter_model(self) -> None:
+        if self._prefilter_model is not None or not self.config.prefilter_model_name:
+            return
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.config.prefilter_model_name,
+                token=None,
+                use_fast=True,
+            )
+            model = AutoModelForSequenceClassification.from_pretrained(
+                self.config.prefilter_model_name,
+                token=None,
+                use_safetensors=True,
+            )
+            model.eval()
+            self._prefilter_tokenizer = tokenizer
+            self._prefilter_model = model
+            entail_idx = None
+            for idx, label in model.config.id2label.items():
+                if label.lower() == "entailment":
+                    entail_idx = idx
+                    break
+            if entail_idx is None:
+                entail_idx = (
+                    2 if model.config.num_labels >= 3 else model.config.num_labels - 1
+                )
+            self._prefilter_entailment_index = entail_idx
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "Prefilter model %s unavailable (%s); disabling fast relation filter.",
+                self.config.prefilter_model_name,
+                exc,
+            )
+            self._prefilter_model = None
+            self._prefilter_tokenizer = None
+            self._prefilter_entailment_index = None
+            self.config.prefilter_model_name = None
+
+    def _passes_entity_heuristics(
+        self,
+        surface: str,
+        tokens: Sequence[str],
+        pos_tags: Sequence[str],
+    ) -> bool:
+        surface = surface.strip()
+        if not surface:
+            return False
+        if sum(ch.isalpha() for ch in surface) == 0:
+            return False
+        if tokens:
+            stripped_tokens = [tok.lower() for tok in tokens if tok]
+            if stripped_tokens and all(
+                token in self._stop_words for token in stripped_tokens
+            ):
+                return False
+            if len(stripped_tokens) == 1:
+                token = stripped_tokens[0]
+                if len(token) < 3 or token in self._stop_words:
+                    return False
+        informative = {"NOUN", "PROPN", "ADJ", "VERB"}
+        if pos_tags and not any(tag in informative for tag in pos_tags):
+            return False
+        return True
+
+    def _passes_relation_prefilter(self, context: str, subj: str, obj: str) -> bool:
+        context = context.strip()
+        if len(context) < self.config.prefilter_min_context_chars:
+            return False
+        lower_context = context.lower()
+        subj_lower = subj.lower()
+        obj_lower = obj.lower()
+        if subj_lower not in lower_context or obj_lower not in lower_context:
+            return False
+        if not self.config.prefilter_model_name:
+            return True
+        self._ensure_prefilter_model()
+        if not (
+            self._prefilter_model
+            and self._prefilter_tokenizer
+            and self._prefilter_entailment_index is not None
+        ):
+            return True
+        hypothesis = self.config.prefilter_hypothesis_template.format(
+            SUBJ=subj,
+            OBJ=obj,
+        )
+        try:
+            inputs = self._prefilter_tokenizer(
+                context,
+                hypothesis,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )
+            with torch.no_grad():
+                logits = self._prefilter_model(**inputs).logits[0]
+            probs = torch.softmax(logits, dim=-1)
+            score = probs[self._prefilter_entailment_index].item()
+            return score >= self.config.prefilter_min_score
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Prefilter scoring failed (%s); allowing pair.", exc)
+            return True
 
     def _coref_mention_info(
         self, doc: "stanza.Document", mention: Any
@@ -686,52 +972,112 @@ class EntityRelationExtractor:
     def _ner_pipeline(self, text: str) -> List[Dict[str, Any]]:
         if not text.strip():
             return []
+
+        self._latest_link_scores = {}
+        spacy_entities: Dict[str, List[Dict[str, Any]]] = {}
+        spacy_allowed_keys: Optional[Set[str]] = None
+        spacy_nlp = self._ensure_spacy_pipeline()
+        if spacy_nlp is not None:
+            try:
+                spacy_doc = spacy_nlp(text)
+                for ent in spacy_doc.ents:
+                    start = ent.start_char
+                    end = ent.end_char
+                    label = getattr(ent, "label_", "")
+                    tokens = [token.text for token in ent]
+                    lemmas = [
+                        getattr(token, "lemma_", "") or token.text for token in ent
+                    ]
+                    pos_tags = [getattr(token, "pos_", "").upper() for token in ent]
+                    canonical = canonical_entity_key(ent.text)
+                    kb_id = None
+                    link_score = None
+                    if self._spacy_linker_available:
+                        kb_ents = getattr(ent._, "kb_ents", None)
+                        if kb_ents:
+                            kb_id, link_score = kb_ents[0]
+                    entry = {
+                        "start": start,
+                        "end": end,
+                        "entity_group": label,
+                        "word": ent.text,
+                        "source_package": f"spacy:{self.config.spacy_model}",
+                        "lemma": " ".join(lemmas).strip(),
+                        "upos": pos_tags,
+                        "xpos": [getattr(token, "tag_", "") for token in ent],
+                        "tokens": tokens,
+                        "coref_antecedent": None,
+                        "canonical_key": canonical,
+                        "ontology_score": link_score,
+                        "kb_id": kb_id,
+                    }
+                    key = canonical or f"{start}:{end}:{label}"
+                    spacy_entities.setdefault(key, []).append(entry)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "spaCy extraction failed (%s); disabling spaCy integration.",
+                    exc,
+                )
+                self._spacy_nlp = None
+                spacy_entities = {}
+
+        if spacy_entities:
+            for key, entries in spacy_entities.items():
+                best = max(entries, key=lambda item: item.get("ontology_score") or 0.0)
+                canonical = best.get("canonical_key")
+                score = best.get("ontology_score")
+                if canonical and score is not None:
+                    self._latest_link_scores[canonical] = score
+
         pipelines = self._ensure_stanza_pipelines()
-        if not pipelines:
-            return []
         results: List[Dict[str, Any]] = []
-        seen_spans: Set[Tuple[int, int, str]] = set()
-        for pkg_display, pipeline in pipelines:
-            doc = pipeline(text)
-            coref_map = self._build_coref_reference_map(doc)
-            entities = getattr(doc, "ents", None)
-            if entities is None:
-                entities = getattr(doc, "entities", [])
-            for ent in entities:
-                start = getattr(ent, "start_char", None)
-                end = getattr(ent, "end_char", None)
-                label = getattr(ent, "type", "")
-                words = getattr(ent, "words", [])
-                lemmas: List[str] = []
-                upos: List[str] = []
-                xpos: List[str] = []
-                tokens: List[str] = []
-                for word in words:
-                    token = getattr(word, "text", "")
-                    if token:
-                        tokens.append(token)
-                    lemma = getattr(word, "lemma", "")
-                    if lemma:
-                        lemmas.append(lemma)
-                    elif token:
-                        lemmas.append(token)
-                    pos = getattr(word, "upos", "")
-                    if pos:
-                        upos.append(pos)
-                    xpos_tag = getattr(word, "xpos", "")
-                    if xpos_tag:
-                        xpos.append(xpos_tag)
-                if start is not None and end is not None:
-                    key = (start, end, label)
-                    if key in seen_spans:
-                        continue
-                    seen_spans.add(key)
-                if start is not None and end is not None:
-                    coref_info = coref_map.get((start, end))
-                else:
-                    coref_info = None
-                results.append(
-                    {
+        seen_spans: Set[Tuple[int, int, str, str]] = set()
+
+        if pipelines:
+            for pkg_display, pipeline in pipelines:
+                doc = pipeline(text)
+                coref_map = self._build_coref_reference_map(doc)
+                entities = getattr(doc, "ents", None)
+                if entities is None:
+                    entities = getattr(doc, "entities", [])
+                for ent in entities:
+                    start = getattr(ent, "start_char", None)
+                    end = getattr(ent, "end_char", None)
+                    label = getattr(ent, "type", "")
+                    words = getattr(ent, "words", [])
+                    lemmas: List[str] = []
+                    upos: List[str] = []
+                    xpos: List[str] = []
+                    tokens: List[str] = []
+                    for word in words:
+                        token = getattr(word, "text", "")
+                        if token:
+                            tokens.append(token)
+                        lemma = getattr(word, "lemma", "")
+                        if lemma:
+                            lemmas.append(lemma)
+                        elif token:
+                            lemmas.append(token)
+                        pos = getattr(word, "upos", "")
+                        if pos:
+                            upos.append(pos)
+                        xpos_tag = getattr(word, "xpos", "")
+                        if xpos_tag:
+                            xpos.append(xpos_tag)
+                    if start is not None and end is not None:
+                        key = (start, end, label, pkg_display)
+                        if key in seen_spans:
+                            continue
+                        seen_spans.add(key)
+                    canonical = canonical_entity_key(getattr(ent, "text", ""))
+                    if spacy_allowed_keys is not None:
+                        if not canonical or canonical not in spacy_allowed_keys:
+                            continue
+                    if start is not None and end is not None:
+                        coref_info = coref_map.get((start, end))
+                    else:
+                        coref_info = None
+                    result = {
                         "start": start,
                         "end": end,
                         "entity_group": label,
@@ -742,8 +1088,25 @@ class EntityRelationExtractor:
                         "xpos": xpos,
                         "tokens": tokens,
                         "coref_antecedent": coref_info,
+                        "canonical_key": canonical,
+                        "ontology_score": self._latest_link_scores.get(canonical),
                     }
-                )
+                    results.append(result)
+
+        if spacy_entities and not pipelines:
+            for entries in spacy_entities.values():
+                for entry in entries:
+                    key = (
+                        entry.get("start"),
+                        entry.get("end"),
+                        entry.get("entity_group"),
+                        entry.get("source_package"),
+                    )
+                    if key in seen_spans:
+                        continue
+                    seen_spans.add(key)
+                    results.append(entry)
+
         return results
 
     def extract(self, meta: Dict[str, Any], text: str) -> Optional[PaperExtraction]:
@@ -790,6 +1153,7 @@ class EntityRelationExtractor:
 
         entity_start = time.perf_counter()
         entities: Dict[str, NodeRecord] = {}
+        link_scores = dict(self._latest_link_scores)
         for ent in ner_results:
             coref_info = ent.get("coref_antecedent") or None
             if (
@@ -804,6 +1168,12 @@ class EntityRelationExtractor:
             raw_name = clean_entity_surface(raw_name)
             if not raw_name:
                 continue
+            if raw_name.lower() in self._span_blocklist:
+                continue
+            tokens = ent.get("tokens") or []
+            pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
+            if not self._passes_entity_heuristics(raw_name, tokens, pos_tags):
+                continue
             original_surface = raw_name
             lemma_from_ent = (ent.get("lemma") or "").strip()
             lemma_override: Optional[str] = None
@@ -811,43 +1181,35 @@ class EntityRelationExtractor:
                 antecedent_text = clean_entity_surface(coref_info.get("text") or "")
                 if (
                     antecedent_text
-                    and antecedent_text.lower() not in self.config.ner_exclude_terms
+                    and antecedent_text.lower() not in self._span_blocklist
+                    and self._passes_entity_heuristics(
+                        antecedent_text, tokens, pos_tags
+                    )
                 ):
                     raw_name = antecedent_text
                     lemma_override = canonical_entity_display(antecedent_text)
-            tokens = ent.get("tokens") or []
-            pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
-            if pos_tags:
-                informative = {"NOUN", "PROPN", "VERB", "ADJ"}
-                banned = {"PRON", "DET", "PART", "INTJ", "SYM", "PUNCT"}
-                if not any(tag in informative for tag in pos_tags):
-                    continue
-                if all(tag in banned for tag in pos_tags):
-                    continue
-                noun_like = {"NOUN", "PROPN"}
-                if not any(tag in noun_like for tag in pos_tags):
-                    token_count = len(tokens) if tokens else len(raw_name.split())
-                    if token_count <= 1:
-                        continue
+
             lemma_hint = lemma_override or lemma_from_ent
             lemma_source = lemma_hint if lemma_hint else raw_name
             canonical_key = canonical_entity_key(lemma_source)
-            if not canonical_key:
+            if not canonical_key or canonical_key in self._span_blocklist:
                 continue
             canonical_display = (
                 canonical_entity_display(lemma_hint or raw_name) or raw_name
             )
-            if canonical_key and canonical_key in self.config.generic_span_blocklist:
-                logger.debug(
-                    "Skipping generic entity span '%s' (canonical key: %s)",
-                    raw_name,
-                    canonical_key,
-                )
-                continue
+            ontology_score = ent.get("ontology_score")
+            if ontology_score is None:
+                ontology_score = link_scores.get(canonical_key)
+            label = ent.get("entity_group", "")
+            if label.upper() == "ENTITY":
+                if self.config.ontology_min_score > 0.0 and (
+                    ontology_score is None
+                    or ontology_score < self.config.ontology_min_score
+                ):
+                    continue
             record = entities.get(canonical_key)
             if record is None:
-                label = ent.get("entity_group", "")
-                node_type = self.categorize_entity(label)
+                node_type = self.categorize_entity(label, ent.get("kb_id"))
                 if not node_type:
                     continue
                 record = NodeRecord(
@@ -884,6 +1246,12 @@ class EntityRelationExtractor:
                 record.normalizations["tokens"] = dedupe_preserve_order(
                     list(existing_tokens) + tokens
                 )
+            kb_id = ent.get("kb_id")
+            if kb_id:
+                umls_ids = record.normalizations.get("umls_ids", [])
+                record.normalizations["umls_ids"] = dedupe_preserve_order(
+                    list(umls_ids) + [kb_id]
+                )
             name_candidates = [raw_name, canonical_display]
             if (
                 coref_info
@@ -918,7 +1286,9 @@ class EntityRelationExtractor:
         relation_start = time.perf_counter()
         relations: List[RelationRecord] = []
         relation_attempts = 0
+        candidate_pairs = 0
         skipped_pairs = 0
+        prefilter_skipped = 0
         for i in range(len(node_records)):
             for j in range(i + 1, len(node_records)):
                 subj = node_records[i].canonical_name
@@ -935,10 +1305,14 @@ class EntityRelationExtractor:
                         obj_type,
                     )
                     continue
-                relation_attempts += 1
+                candidate_pairs += 1
                 context = self._pick_sentence_context(
                     text, surface_lookup[subj], surface_lookup[obj]
                 )
+                if not self._passes_relation_prefilter(context, subj, obj):
+                    prefilter_skipped += 1
+                    continue
+                relation_attempts += 1
                 relation_inf, evidence_inf = self.classify_relation_via_nli(
                     context, subj, obj
                 )
@@ -1063,7 +1437,7 @@ class EntityRelationExtractor:
                         }
                     )
                     if evidence_descriptor:
-                        qualifiers["evidence_claim"] = evidence_descriptor.model_dump(
+                        qualifiers["evidence_claim"] = evidence_descriptor._model_dump(
                             exclude_none=True
                         )
                 relations.append(
@@ -1083,7 +1457,9 @@ class EntityRelationExtractor:
             relation_start,
             paper=paper_label,
             details=(
-                f"attempts={relation_attempts}, relations={len(relations)}, skipped={skipped_pairs}"
+                f"attempts={relation_attempts}, relations={len(relations)}, "
+                f"skipped_types={skipped_pairs}, prefilter_skipped={prefilter_skipped}, "
+                f"candidates={candidate_pairs}"
             ),
         )
         result = PaperExtraction(
