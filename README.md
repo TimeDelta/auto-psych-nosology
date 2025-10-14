@@ -235,7 +235,7 @@ $$
 | $D_{\mathrm{KL}}(q\|p)$ | Kullback–Leibler divergence measuring how far the posterior deviates from the prior. |
 
 #### Limitations
-A practical limitation of the rGCN-SCAE architecture is that it is trained on a single, fixed multiplex graph, which constitutes only one effective training example.
+A practical limitation of the basic rGCN-SCAE approach is that it would be trained on a single, fixed multiplex graph.
 Without a distribution of graphs, the model risks overfitting to idiosyncratic topological patterns rather than learning generalizable relational principles.
 To mitigate this, a dataset was be created with different subgraphs-**sampled by ? (TBD - maybe node hopping from random chosen nodes with number of hops determined by combination of graph connectivity metrics)**—each preserving local connectivity and type proportions and alignment between them is measured.
 Parameters of the rGCN-SCAE were shared across subgraphs to maintain a single shared partitioning in the latent space.
