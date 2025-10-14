@@ -137,11 +137,33 @@ This family of models gives interpretable, DSM-like partitions together with pri
 This was used as a baseline.
 
 Second, a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)** tailored to the heterogeneous, typed graph.
-The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignment matrix. This latent space is regularized with Louizos et al.’s hard-concrete (L0) gates [20]:
-
+The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignment matrix.
+This latent space is regularized with Louizos et al.’s hard-concrete (L0) gates [20]:
 - **Cluster gates** drive automatic selection of the surviving latent clusters.
 - **Relation-specific inter-cluster gates and matrices** learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
-- **Absent-edge modelling via negative sampling** penalizes trivial solutions that would otherwise route every node type into its own cluster; the decoder explicitly contrasts observed edges with sampled non-edges drawn within each graph.
+
+Additionally, absent-edge modeling via negative sampling penalizes trivial solutions that would otherwise route every node type into its own cluster; the decoder explicitly contrasts observed edges with sampled non-edges drawn within each graph.
+The decoder contrasts observed edges with sampled non-edges.
+That means clusters that lump everything together will get penalized because they will incorrectly predict connections between random node pairs that are not actually linked.
+Mathematically, this is an additional loss term:
+
+$$
+\mathcal{L}
+= -\sum_{(i,j)\in E} \log \sigma\big(z_i^\top W z_j\big) - \sum_{(i',j')\notin E} \log \big[1-\sigma\!\big(z_{i'}^\top W z_{j'}\big)\big]
+$$
+
+| Symbol                                      | Meaning                                                                                                                                                                                                                                                      |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| $E$                                       | The set of observed positive edges in the multiplex graph. Each edge (i,j) indicates a real relation between node (i) and node (j).                                                                                                                      |
+| $(i', j') \notin E$                       | A set of *absent* edges (negative samples) — pairs of nodes that are *not* connected in the observed graph. These are drawn randomly (or stratified by node type) during training to contrast with positives.                                              |
+| $z_i \in \mathbb{R}^d$                    | Latent embedding vector for node (i) produced by the encoder (the rGCN-SCAE). Dimension (d) is the latent feature size.                                                                                                                                      |
+| $W \in \mathbb{R}^{d \times d}$           | Learnable relation (or global decoder) weight matrix that maps latent interactions to a scalar edge score. In a multiplex graph, there may be one such matrix per relation type (W_r).                                                                       |
+| $\sigma(\cdot)$                           | Logistic sigmoid function, $(\sigma(x) = 1/(1 + e^{-x}))$, mapping inner products to edge probabilities.                                                                                                                                                       |
+| $\log \sigma(z_i^\top W z_j)$             | Log-probability that the observed edge (i,j) is correctly reconstructed.                                                                                                                                                                                   |
+| $\log [1 - \sigma(z_{i'}^\top W z_{j'})]$ | Log-probability that a *non-edge* is correctly predicted as absent.                                                                                                                                                                                          |
+| $\mathcal{L}$                             | Total reconstruction loss — the binary cross-entropy objective over both observed and sampled absent edges. Minimizing $(\mathcal{L})$ trains embeddings $(z_i)$ so that connected nodes have high dot products, while unconnected ones have low similarity. |
+
+Intuitively, the first term rewards high similarity for real edges while the second penalizes the model when it predicts high similarity for random, non-existent connections.
 
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
 The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
