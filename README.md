@@ -179,6 +179,7 @@ $$
 = -\frac{1}{N} \sum_{i=1}^{N}\sum_{k=1}^{K} p_{ik}\,\log p_{ik}
 $$
 
+#### Limitations
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
 The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
 
