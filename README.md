@@ -171,13 +171,34 @@ However, this is not enough to prevent all situations of structure collapse.
 For example, a situation could arise where local structure collapses but global does not.
 The model could produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure — all symptoms in one, all treatments in another, etc.
 Negative sampling does not penalize this because such coarse partitions can still separate positives from random negatives effectively.
-Entropy regularization on the cluster assignment matrix maintains sufficient dispersion across latent clusters because the term is minimized when each node belongs entirely to one cluster.
+Entropy regularization on the cluster assignment matrix counteracts this tendency by discouraging prematurely confident, low-entropy assignments.
+It maintains dispersion across latent clusters by keeping node-to-cluster probabilities sufficiently soft during early training, ensuring that multiple clusters remain active and receive gradient signal until the structure is well-formed.
 Mathematically, this loss term is:
 
 $$
 \mathcal{L}_H
 = -\frac{1}{N} \sum_{i=1}^{N}\sum_{k=1}^{K} p_{ik}\,\log p_{ik}
 $$
+
+However, the entropy regularization only handles local degeneracy because it acts locally.
+For global degeneracy, a Dirichlet prior loss term is used because it constrains the aggregate cluster sizes across all nodes, discouraging the emergence of a few dominant mega-clusters while allowing moderate, data-driven variation in cluster sizes.
+This global prior complements the local entropy term by balancing overall cluster utilization, ensuring that each cluster contributes meaningfully to the reconstruction objective without enforcing strict uniformity.
+Mathematically, this loss term is:
+
+$$
+\mathcal{L}_{\text{Dirichlet}}
+= -\sum_{k=1}^{K} (\alpha_k - 1)\,
+  \log\!\left(
+    \frac{1}{N}\sum_{i=1}^{N} p_{ik}
+  \right)
+$$
+
+| Symbol     | Meaning                                                                                                     |
+| ---------- | ----------------------------------------------------------------------------------------------------------- |
+| $K$        | Maximum number of latent clusters.                                                                          |
+| $N$        | Number of nodes (data points).                                                                              |
+| $p_{ik}$   | Soft assignment probability of node ( i ) to cluster ( k ).                                                 |
+| $\alpha_k$ | Concentration parameter of the Dirichlet prior; values ( < 1 ) encourage balanced but non-uniform clusters. |
 
 #### Limitations
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
