@@ -145,7 +145,7 @@ This latent space is regularized with Louizos et al.’s hard-concrete (L0) gate
 Additionally, absent-edge modeling via negative sampling penalizes trivial solutions that would otherwise route every node type into its own cluster; the decoder explicitly contrasts observed edges with sampled non-edges drawn within each graph.
 The decoder contrasts observed edges with sampled non-edges.
 That means clusters that lump everything together will get penalized because they will incorrectly predict connections between random node pairs that are not actually linked.
-Mathematically, this is an additional loss term:
+Mathematically, this is an additional loss term for each relation type:
 
 $$
 \mathcal{L}
