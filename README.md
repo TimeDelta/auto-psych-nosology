@@ -141,6 +141,8 @@ The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignme
 This latent space is partitioned by Louizos et al.’s hard-concrete (L0) gates [20].
 Cluster gates drive automatic selection of the surviving latent clusters.
 Relation-specific inter-cluster gates and matrices learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
+Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
+The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
 
 #### Preventing Trivial Solutions
 Absent-edge modeling via negative sampling penalizes trivial solutions that would otherwise route every node type into its own cluster.
@@ -201,9 +203,6 @@ $$
 | $\alpha_k$ | Concentration parameter of the Dirichlet prior; values ( < 1 ) encourage balanced but non-uniform clusters. |
 
 #### Limitations
-Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
-The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
-
 A practical limitation of the rGCN-SCAE architecture is that it is trained on a single, fixed multiplex graph, which constitutes only one effective training example.
 Without a distribution of graphs, the model risks overfitting to idiosyncratic topological patterns rather than learning generalizable relational principles.
 To mitigate this, a dataset was be created with different subgraphs-**sampled by ? (TBD - maybe node hopping from random chosen nodes with number of hops determined by combination of graph connectivity metrics)**—each preserving local connectivity and type proportions and alignment between them is measured.
