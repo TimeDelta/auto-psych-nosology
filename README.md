@@ -138,11 +138,13 @@ This was used as a baseline.
 
 Second, a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)** tailored to the heterogeneous, typed graph.
 The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignment matrix.
-This latent space is regularized with Louizos et al.’s hard-concrete (L0) gates [20]:
-- **Cluster gates** drive automatic selection of the surviving latent clusters.
-- **Relation-specific inter-cluster gates and matrices** learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
+This latent space is partitioned by Louizos et al.’s hard-concrete (L0) gates [20].
+Cluster gates drive automatic selection of the surviving latent clusters.
+Relation-specific inter-cluster gates and matrices learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
 
-Additionally, absent-edge modeling via negative sampling penalizes trivial solutions that would otherwise route every node type into its own cluster; the decoder explicitly contrasts observed edges with sampled non-edges drawn within each graph.
+#### Preventing Trivial Solutions
+Absent-edge modeling via negative sampling penalizes trivial solutions that would otherwise route every node type into its own cluster.
+The decoder explicitly contrasts observed edges with sampled non-edges drawn within each subgraph.
 The decoder contrasts observed edges with sampled non-edges.
 That means clusters that lump everything together will get penalized because they will incorrectly predict connections between random node pairs that are not actually linked.
 Mathematically, this is an additional loss term for each relation type:
@@ -165,6 +167,18 @@ $$
 
 Intuitively, the first term rewards high similarity for real edges while the second penalizes the model when it predicts high similarity for random, non-existent connections.
 
+However, this is not enough to prevent all situations of structure collapse.
+For example, a situation could arise where local structure collapses but global does not.
+The model could produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure — all symptoms in one, all treatments in another, etc.
+Negative sampling does not penalize this because such coarse partitions can still separate positives from random negatives effectively.
+Entropy regularization on the cluster assignment matrix maintains sufficient dispersion across latent clusters because the term is minimized when each node belongs entirely to one cluster.
+Mathematically, this loss term is:
+
+$$
+\mathcal{L}_H
+= -\frac{1}{N} \sum_{i=1}^{N}\sum_{k=1}^{K} p_{ik}\,\log p_{ik}
+$$
+
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
 The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
 
@@ -173,6 +187,7 @@ Without a distribution of graphs, the model risks overfitting to idiosyncratic t
 To mitigate this, a dataset was be created with different subgraphs-**sampled by ? (TBD - maybe node hopping from random chosen nodes with number of hops determined by combination of graph connectivity metrics)**—each preserving local connectivity and type proportions and alignment between them is measured.
 Parameters of the rGCN-SCAE were shared across subgraphs to maintain a single shared partitioning in the latent space.
 Since node attributes (text-derived embeddings, types, biomarkers, etc.) are stable across subgraphs, meaningful structure can still be derived despite the lack of full context in each training example.
+The final partitioning is derived from running the full knowledge graph through the trained rGCN-SCAE.
 This procedure reframes training as an information-theoretic compression task applied repeatedly to partially overlapping realizations of the same knowledge manifold, allowing estimation of replication reliability and consensus structure while reducing overfitting to any single instantiation.
 
 Together, hSBM offers a likelihood-grounded categorical perspective, while rGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
