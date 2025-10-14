@@ -144,16 +144,16 @@ Relation-specific inter-cluster gates and matrices learn which cluster-to-cluste
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
 The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
 
-#### Preventing Trivial Solutions
-Absent-edge modeling via negative sampling penalizes trivial solutions that would otherwise route every node type into its own cluster.
-The decoder explicitly contrasts observed edges with sampled non-edges drawn within each subgraph.
-The decoder contrasts observed edges with sampled non-edges.
+#### Preventing Trivial / Degenerate Solutions
+Five primary forms of degenerate or trivial solutions are guarded against in this model: uniform embeddings, local collapse, global collapse, decoder memorization, and latent drift.
+AAbsent-edge modeling via negative sampling penalizes trivial solutions such as uniform embeddings that would otherwise predict every node pair as connected.
+The decoder explicitly contrasts observed edges with sampled non-edges drawn within each subgraph, forcing the model to assign distinct embeddings that separate real from spurious connections.
 That means clusters that lump everything together will get penalized because they will incorrectly predict connections between random node pairs that are not actually linked.
 Mathematically, this is an additional loss term for each relation type:
 
 $$
 \mathcal{L}
-= -\sum_{(i,j)\in E} \log \sigma\big(z_i^\top W z_j\big) - \sum_{(i',j')\notin E} \log \big[1-\sigma\!\big(z_{i'}^\top W z_{j'}\big)\big]
+= -\sum_{(i,j)\in E} \log \sigma\big(z_i^\top W z_j\big) - \sum_{(i',j')\notin E} \log \big[1-\sigma\big(z_{i'}^\top W z_{j'}\big)\big]
 $$
 
 | Symbol                                      | Meaning                                                                                                                                                                                                                                                      |
@@ -162,7 +162,7 @@ $$
 | $(i', j') \notin E$                       | A set of *absent* edges (negative samples) — pairs of nodes that are *not* connected in the observed graph. These are drawn randomly (or stratified by node type) during training to contrast with positives.                                              |
 | $z_i \in \mathbb{R}^d$                    | Latent embedding vector for node (i) produced by the encoder (the rGCN-SCAE). Dimension (d) is the latent feature size.                                                                                                                                      |
 | $W \in \mathbb{R}^{d \times d}$           | Learnable relation (or global decoder) weight matrix that maps latent interactions to a scalar edge score. In a multiplex graph, there may be one such matrix per relation type (W_r).                                                                       |
-| $\sigma(\cdot)$                           | Logistic sigmoid function, $(\sigma(x) = 1/(1 + e^{-x}))$, mapping inner products to edge probabilities.                                                                                                                                                       |
+| $\sigma(\cdot)$                           | Logistic sigmoid function, $\sigma(x) = 1/(1 + e^{-x})$, mapping inner products to edge probabilities.                                                                                                                                                       |
 | $\log \sigma(z_i^\top W z_j)$             | Log-probability that the observed edge (i,j) is correctly reconstructed.                                                                                                                                                                                   |
 | $\log [1 - \sigma(z_{i'}^\top W z_{j'})]$ | Log-probability that a *non-edge* is correctly predicted as absent.                                                                                                                                                                                          |
 | $\mathcal{L}$                             | Total reconstruction loss — the binary cross-entropy objective over both observed and sampled absent edges. Minimizing $(\mathcal{L})$ trains embeddings $(z_i)$ so that connected nodes have high dot products, while unconnected ones have low similarity. |
@@ -178,19 +178,24 @@ It maintains dispersion across latent clusters by keeping node-to-cluster probab
 Mathematically, this loss term is:
 
 $$
-\mathcal{L}_H
-= -\frac{1}{N} \sum_{i=1}^{N}\sum_{k=1}^{K} p_{ik}\,\log p_{ik}
+\mathcal{L}_H = -\frac{1}{N} \sum_{i=1}^{N}\sum_{k=1}^{K} p_{ik}\,\log p_{ik}
 $$
+
+| Symbol     | Meaning                                                                                                     |
+| ---------- | ----------------------------------------------------------------------------------------------------------- |
+| $K$        | Maximum number of latent clusters.                                                                          |
+| $N$        | Number of nodes (data points).                                                                              |
+| $p_{ik}$   | Soft assignment probability of node ( i ) to cluster ( k ).                                                 |
 
 However, the entropy regularization only handles local degeneracy because it acts locally.
 For global degeneracy, a Dirichlet prior loss term is used because it constrains the aggregate cluster sizes across all nodes, discouraging the emergence of a few dominant mega-clusters while allowing moderate, data-driven variation in cluster sizes.
 This global prior complements the local entropy term by balancing overall cluster utilization, ensuring that each cluster contributes meaningfully to the reconstruction objective without enforcing strict uniformity.
-Mathematically, this loss term is:
+The equation for this loss term is:
 
 $$
 \mathcal{L}_{\text{Dirichlet}}
 = -\sum_{k=1}^{K} (\alpha_k - 1)\,
-  \log\!\left(
+  \log\left(
     \frac{1}{N}\sum_{i=1}^{N} p_{ik}
   \right)
 $$
@@ -201,6 +206,33 @@ $$
 | $N$        | Number of nodes (data points).                                                                              |
 | $p_{ik}$   | Soft assignment probability of node ( i ) to cluster ( k ).                                                 |
 | $\alpha_k$ | Concentration parameter of the Dirichlet prior; values ( < 1 ) encourage balanced but non-uniform clusters. |
+
+Even with these local and global regularizers, the decoder can still exploit trivial optima by memorizing adjacency patterns rather than learning meaningful structure.
+This can occur when embeddings or decoder weights grow unbounded, allowing perfect reconstruction without informative latent geometry.
+To prevent this *reconstruction-dominant collapse*, an embedding norm regularization term is added to constrain latent magnitude and encourage geometric smoothness:
+
+$$
+\mathcal{L}_{\text{norm}} = \frac{\lambda_z}{N}\sum_{i=1}^{N} \|z_i\|_2^2
+$$
+
+| Symbol        | Meaning                                                                                 |
+| ------------- | --------------------------------------------------------------------------------------- |
+| $\lambda_z$   | Weight controlling the strength of embedding norm regularization.                       |
+| $\|z_i\|_2^2$ | Squared L2 norm of the embedding vector for node $(i)$, penalizing large magnitudes.    |
+
+Finally, the latent posterior distribution could much drift or the latent space might collapse into a narrow region.
+To prevent this, a simple Kullback–Leibler divergence loss term is added:
+
+$$
+\mathcal{L}_{\text{KLD}}
+= D_{\mathrm{KL}}\big(q(z_i) \,\|\, p(z)\big)
+$$
+
+| Symbol                  | Meaning                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------ |
+| $q(z_i)$                | Approximate posterior distribution of latent embedding for node $(i)$.               |
+| $p(z)$                  | Prior distribution, typically $\mathcal{N}(0,I)$.                                    |
+| $D_{\mathrm{KL}}(q\|p)$ | Kullback–Leibler divergence measuring how far the posterior deviates from the prior. |
 
 #### Limitations
 A practical limitation of the rGCN-SCAE architecture is that it is trained on a single, fixed multiplex graph, which constitutes only one effective training example.
