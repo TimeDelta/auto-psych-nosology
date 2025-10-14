@@ -12,6 +12,9 @@
     - [Graph Creation](#graph-creation)
     - [Preventing Biased Alignment](#preventing-biased-alignment)
     - [Partitioning](#partitioning)
+        - [Preventing Trivial / Degenerate Solutions](#preventing-trivial--degenerate-solutions)
+        - [Limitations](#limitations)
+        - [Comparison](#comparison)
 - [Abbreviations](#abbreviations)
 - [References](#references)
 
