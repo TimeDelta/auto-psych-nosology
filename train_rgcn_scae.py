@@ -6,7 +6,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch_geometric.data import Data
@@ -153,6 +153,12 @@ def train_scae_on_graph(
     min_cluster_size: int = 1,
     device: Optional[str] = None,
     verbose: bool = True,
+    entropy_weight: float = 1e-3,
+    dirichlet_alpha: Optional[Sequence[float]] = None,
+    dirichlet_weight: float = 1e-3,
+    embedding_norm_weight: float = 1e-4,
+    kld_weight: float = 1e-3,
+    entropy_eps: float = 1e-12,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
         num_clusters = graph.data.node_types.numel()
@@ -167,6 +173,13 @@ def train_scae_on_graph(
         out_dim=attr_encoder_dims[2],
     )
 
+    if dirichlet_alpha is None:
+        dirichlet_param: Union[float, Sequence[float]] = 0.5
+    elif len(dirichlet_alpha) == 1:
+        dirichlet_param = dirichlet_alpha[0]
+    else:
+        dirichlet_param = dirichlet_alpha
+
     model = SelfCompressingRGCNAutoEncoder(
         num_node_types=len(graph.node_type_index),
         attr_encoder=attr_encoder,
@@ -176,6 +189,12 @@ def train_scae_on_graph(
         type_embedding_dim=type_embedding_dim,
         negative_sampling_ratio=negative_sampling_ratio,
         allow_self_loops=True,
+        entropy_weight=entropy_weight,
+        dirichlet_alpha=dirichlet_param,
+        dirichlet_weight=dirichlet_weight,
+        embedding_norm_weight=embedding_norm_weight,
+        kld_weight=kld_weight,
+        entropy_eps=entropy_eps,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -265,6 +284,43 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--negative-sampling", type=float, default=1.0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--entropy-weight",
+        type=float,
+        default=1e-3,
+        help="Weight applied to the entropy regularizer",
+    )
+    parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Dirichlet concentration parameter(s); provide one value or K values",
+    )
+    parser.add_argument(
+        "--dirichlet-weight",
+        type=float,
+        default=1e-3,
+        help="Weight for the Dirichlet prior regularizer",
+    )
+    parser.add_argument(
+        "--embedding-norm-weight",
+        type=float,
+        default=1e-4,
+        help="Weight for the embedding norm regularizer",
+    )
+    parser.add_argument(
+        "--kld-weight",
+        type=float,
+        default=1e-3,
+        help="Weight for the KL divergence regularizer",
+    )
+    parser.add_argument(
+        "--entropy-eps",
+        type=float,
+        default=1e-12,
+        help="Numerical floor for entropy/Dirichlet calculations",
+    )
     return parser
 
 
@@ -284,6 +340,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         min_cluster_size=args.min_cluster_size,
         device=args.device,
         verbose=not args.quiet,
+        entropy_weight=args.entropy_weight,
+        dirichlet_alpha=args.dirichlet_alpha,
+        dirichlet_weight=args.dirichlet_weight,
+        embedding_norm_weight=args.embedding_norm_weight,
+        kld_weight=args.kld_weight,
+        entropy_eps=args.entropy_eps,
     )
 
     save_partition(partition, args.out, graph)

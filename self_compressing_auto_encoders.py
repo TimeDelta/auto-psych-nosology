@@ -1,7 +1,7 @@
 import math
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from warnings import warn
 
 import torch
@@ -482,9 +482,14 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         type_embedding_dim: Optional[int] = None,
         dropout: float = 0.0,
         negative_sampling_ratio: float = 1.0,
-        allow_self_loops: bool = False,
         l0_cluster_weight: float = 1e-3,
         l0_inter_weight: float = 1e-3,
+        entropy_weight: float = 1e-3,
+        dirichlet_alpha: Union[float, Sequence[float]] = 0.5,
+        dirichlet_weight: float = 1e-3,
+        embedding_norm_weight: float = 1e-4,
+        kld_weight: float = 1e-3,
+        entropy_eps: float = 1e-12,
     ) -> None:
         super().__init__()
         self.encoder = RGCNClusterEncoder(
@@ -500,10 +505,23 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             num_relations=num_relations,
             num_clusters=num_clusters,
             negative_sampling_ratio=negative_sampling_ratio,
-            allow_self_loops=allow_self_loops,
         )
         self.l0_cluster_weight = l0_cluster_weight
         self.l0_inter_weight = l0_inter_weight
+        self.entropy_weight = float(entropy_weight)
+        self.dirichlet_weight = float(dirichlet_weight)
+        self.embedding_norm_weight = float(embedding_norm_weight)
+        self.kld_weight = float(kld_weight)
+        self.entropy_eps = float(entropy_eps)
+
+        alpha_tensor = torch.as_tensor(dirichlet_alpha, dtype=torch.float)
+        if alpha_tensor.dim() == 0:
+            alpha_tensor = alpha_tensor.repeat(num_clusters)
+        elif alpha_tensor.numel() != num_clusters:
+            raise ValueError(
+                "dirichlet_alpha must be scalar or have one entry per cluster"
+            )
+        self.register_buffer("dirichlet_alpha", alpha_tensor)
 
     def forward(
         self,
@@ -534,7 +552,53 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         sparsity_loss = (
             self.l0_cluster_weight * cluster_l0 + self.l0_inter_weight * inter_l0
         )
-        total_loss = recon_loss + sparsity_loss
+
+        assignment_probs = assignments.clamp_min(self.entropy_eps)
+        entropy_term = (assignment_probs * assignment_probs.log()).sum(dim=1).mean()
+        entropy_loss = self.entropy_weight * entropy_term
+
+        cluster_usage = assignment_probs.mean(dim=0)
+        dirichlet_loss = (
+            -self.dirichlet_weight
+            * (
+                (self.dirichlet_alpha - 1.0)
+                * torch.log(cluster_usage.clamp_min(self.entropy_eps))
+            ).sum()
+        )
+
+        node_embeddings = enc_info.get("node_embeddings")
+        if node_embeddings is None or node_embeddings.numel() == 0:
+            embedding_norm_loss = assignments.new_tensor(0.0)
+            kld_loss = assignments.new_tensor(0.0)
+            latent_mean = assignments.new_tensor(0.0)
+            latent_var = assignments.new_tensor(0.0)
+        else:
+            embedding_norm_loss = (
+                self.embedding_norm_weight * node_embeddings.pow(2).sum(dim=1).mean()
+            )
+
+            mean_vec = node_embeddings.mean(dim=0)
+            if node_embeddings.size(0) > 1:
+                var_vec = node_embeddings.var(dim=0, unbiased=False)
+            else:
+                var_vec = torch.zeros_like(mean_vec)
+            var_vec = var_vec.clamp_min(self.entropy_eps)
+            kld_loss = (
+                0.5
+                * self.kld_weight
+                * (mean_vec.pow(2) + var_vec - var_vec.log() - 1.0).sum()
+            )
+            latent_mean = mean_vec.detach()
+            latent_var = var_vec.detach()
+
+        total_loss = (
+            recon_loss
+            + sparsity_loss
+            + entropy_loss
+            + dirichlet_loss
+            + embedding_norm_loss
+            + kld_loss
+        )
 
         metrics: Dict[str, torch.Tensor] = {
             "total_loss": total_loss.detach(),
@@ -544,6 +608,14 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             "inter_l0": inter_l0.detach(),
             "cluster_gate_sample": enc_info["cluster_gate_sample"],
             "inter_gate_sample": dec_info["inter_gate_sample"],
+            "entropy_loss": entropy_loss.detach(),
+            "assignment_entropy": (-entropy_term).detach(),
+            "dirichlet_loss": dirichlet_loss.detach(),
+            "embedding_norm_loss": embedding_norm_loss.detach(),
+            "kld_loss": kld_loss.detach(),
+            "cluster_usage": cluster_usage.detach(),
+            "latent_mean": latent_mean,
+            "latent_var": latent_var,
         }
         metrics.update({k: v for k, v in dec_info.items() if "loss" in k})
         return total_loss, assignments, metrics
