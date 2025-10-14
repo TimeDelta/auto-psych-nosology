@@ -191,6 +191,7 @@ Since node attributes (text-derived embeddings, types, biomarkers, etc.) are sta
 The final partitioning is derived from running the full knowledge graph through the trained rGCN-SCAE.
 This procedure reframes training as an information-theoretic compression task applied repeatedly to partially overlapping realizations of the same knowledge manifold, allowing estimation of replication reliability and consensus structure while reducing overfitting to any single instantiation.
 
+#### Comparison
 Together, hSBM offers a likelihood-grounded categorical perspective, while rGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
 The two approaches are treated as triangulating evidence: concordant structure across them increases confidence in emergent transdiagnostic clusters, whereas divergences highlight fronts for qualitative review.
 
