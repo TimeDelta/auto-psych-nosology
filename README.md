@@ -1,7 +1,6 @@
 # Automated Psychiatric Nosology via Partitioning of Multiplex Graph Generated from Mining Scientific Papers for Findings
 ## Table of Contents
 - [Code Notes](#code-notes)
-- [Introduction](#introduction)
 - [Background / Literature Review](#background--literature-review)
     - [Biomarkers of Psychopathology](#biomarkers-of-psychopathology)
     - [Transdiagnostic Dimensions](#transdiagnostic-dimensions)
@@ -20,23 +19,6 @@
 - This project uses python 3.10
 - Must install [graph tool](https://graph-tool.skewed.de) in order to run the [create_hSBM_partitions.py](./create_hSBM_partitions.py) script.
 - In order to use this for something other than psychiatry, must change `"concepts.id:C61535369",` filter part in [openalex_client.py](./openalex_client.py)
-
-## Introduction
-Psychiatric classification remains dominated by categorical systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM) and the International Classification of Diseases (ICD).
-While clinically useful, these frameworks have been widely criticized for high comorbidity, arbitrary diagnostic thresholds, and limited biological validity. Meta-analytic research increasingly demonstrates that psychiatric disorders rarely conform to discrete boundaries, but instead share overlapping symptoms and biological substrates.
-
-In response, dimensional alternatives have emerged.
-The Hierarchical Taxonomy of Psychopathology (HiTOP) organizes symptoms into empirically derived spectra, while the Research Domain Criteria (RDoC) links psychopathology to neural and behavioral systems.
-Both frameworks move beyond categorical diagnoses and capture transdiagnostic variance more effectively, yet neither has been universally adopted.
-A central challenge remains: integrating dimensional constructs with diverse biological and clinical findings in a manner that is both valid and scalable.
-
-Automated methods—ranging from clustering of genetic risk variants to network-based analyses of neuroimaging—demonstrate that algorithmic approaches can yield biologically coherent groupings that differ from traditional nosologies.
-However, applications in psychiatry have thus far been limited in scope, often relying on predefined categories or single modalities, raising concerns about reproducing existing biases rather than discovering new structure.
-
-This study introduces a proof-of-concept approach for automated psychiatric nosology.
-By mining the scientific literature into a multiplex graph of symptoms, treatments, biomarkers, and outcomes, and partitioning it using information-theoretic methods, it tests whether a dimensional framework can be derived without reliance on DSM, ICD, HiTOP, or RDoC categories.
-The resulting structures are evaluated for parsimony, stability, and alignment with existing dimensional models.
-The goal is to assess whether a data-driven, integrative method can approximate or extend current frameworks, offering psychiatry a more biologically grounded and reproducible classification system without the overhead of manually building the nosology.
 
 ## Background / Literature Review
 Psychiatric nosology has long been dominated by categorical systems such as the DSM and the ICD.
