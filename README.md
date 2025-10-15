@@ -144,6 +144,9 @@ The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignme
 This latent space is partitioned by Louizos et al.’s hard-concrete (L0) gates [20].
 Cluster gates drive automatic selection of the surviving latent clusters.
 Relation-specific inter-cluster gates and matrices learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
+For each relation type, a distinct decoder is trained to reconstruct edges of that type from the shared latent embeddings.
+This design allows relation-specific geometries to be learned while maintaining a common latent space.
+A single decoder conditioned on relation embeddings would instead force all relation types to share one generative function, often leading to interference and loss of type specificity.
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
 The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
 
@@ -236,6 +239,10 @@ $$
 | $q(z_i)$                | Approximate posterior distribution of latent embedding for node $(i)$.               |
 | $p(z)$                  | Prior distribution, typically $\mathcal{N}(0,I)$.                                    |
 | $D_{\mathrm{KL}}(q\|p)$ | Kullback–Leibler divergence measuring how far the posterior deviates from the prior. |
+
+#### Stability and Regularization
+Training rGCN-SCAE models on multiplex graphs can exhibit several characteristic failure modes.
+Detailed mitigation strategies and hyperparameter guidelines are provided in [`training_stability.md`](training_stability.md).
 
 #### Adaptive Subgraph Sampling to Mitigate Overfitting
 A practical limitation of the basic rGCN-SCAE approach is that it would be trained on a single, fixed multiplex graph.
