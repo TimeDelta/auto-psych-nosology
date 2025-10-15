@@ -253,7 +253,7 @@ For each seed s, a composite score $g(s) = z(c_s) + z(\kappa_s) - z(\deg_s)$ to 
 | $g(s)$                          | The **composite connectivity score** used to adaptively choose hop radius.    | Higher $g(s)$ → larger $r(s)$; encourages exploring sparser regions more deeply.                                                                                                           |
 | $r(s)$                          | The **hop radius** (1–3) used to define the ego-net subgraph around seed s.   | Determined by scaling $g(s)$ via $\alpha$ and clamping to the range [1,3]).                                                                                                                |
 
-Each resulting subgraph consisted of the induced r-ball around the seed node, preserving local connectivity patterns and approximate node-type proportions without enforcing a fixed target size.
+Each resulting subgraph consisted of the induced r-ball around the seed nodes, preserving local connectivity patterns and approximate node-type proportions without enforcing a fixed target size.
 This connectivity-aware hopping strategy generates a controlled distribution of partially overlapping ego-net subgraphs that collectively cover the full multiplex network, ensuring exposure to diverse local structures while maintaining coherence across samples.
 
 Parameters of the rGCN-SCAE were shared across subgraphs to maintain a single shared partitioning in the latent space.
