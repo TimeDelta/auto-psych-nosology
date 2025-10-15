@@ -1,5 +1,6 @@
 import math
 import random
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from warnings import warn
@@ -7,12 +8,71 @@ from warnings import warn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Sampler
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import MessagePassing, RGCNConv, global_mean_pool
+from torch_geometric.nn import GraphNorm, MessagePassing, RGCNConv, global_mean_pool
 from torch_geometric.utils import degree, softmax
 
 from utility import generate_random_string
+
+
+# Ensure every node carries a graph id so per-graph reductions stay size-aware.
+def _ensure_batch_vector(
+    batch: Optional[torch.LongTensor], num_nodes: int, device: torch.device
+) -> torch.LongTensor:
+    if batch is not None:
+        return batch
+    return torch.zeros(num_nodes, dtype=torch.long, device=device)
+
+
+# Fast scatter add used to average metrics per graph without padding tensors.
+def _scatter_add_1d(
+    values: torch.Tensor, index: torch.Tensor, dim_size: int
+) -> torch.Tensor:
+    out = torch.zeros(dim_size, device=values.device, dtype=values.dtype)
+    out.index_add_(0, index, values)
+    return out
+
+
+# Helper that normalizes node/edge sums by the true graph size to keep losses
+# invariant to the number of nodes/edges seen in each mini-batch element.
+def _per_graph_mean(
+    values: torch.Tensor, batch: torch.Tensor, num_graphs: int, eps: float = 1e-12
+) -> torch.Tensor:
+    sums = _scatter_add_1d(values, batch, num_graphs)
+    counts = _scatter_add_1d(torch.ones_like(values), batch, num_graphs)
+    means = torch.zeros_like(sums)
+    mask = counts > 0
+    means[mask] = sums[mask] / counts[mask].clamp_min(eps)
+    return means
+
+
+# Standardize Laplacian positional encodings per graph to avoid scale drift when
+# graphs of very different orders share a batch.
+def _standardize_positional_encodings(
+    pos_enc: torch.Tensor, batch: torch.Tensor, num_graphs: int
+) -> torch.Tensor:
+    if pos_enc.numel() == 0:
+        return pos_enc
+    device = pos_enc.device
+    feat_dim = pos_enc.size(1)
+    standardized = torch.zeros_like(pos_enc)
+    for graph_id in range(num_graphs):
+        mask = batch == graph_id
+        if mask.sum() == 0:
+            continue
+        graph_pe = pos_enc[mask]
+        mean = graph_pe.mean(dim=0, keepdim=True)
+        std = graph_pe.std(dim=0, unbiased=False, keepdim=True)
+        std = std.clamp_min(1e-6)
+        standardized[mask] = (graph_pe - mean) / std
+    if standardized.shape[1] < feat_dim:
+        pad = torch.zeros(
+            (standardized.size(0), feat_dim - standardized.shape[1]), device=device
+        )
+        standardized = torch.cat([standardized, pad], dim=1)
+    return standardized
 
 
 class SharedAttributeVocab(nn.Module):
@@ -195,7 +255,7 @@ class InterClusterGate(nn.Module):
 
 
 class RGCNClusterEncoder(nn.Module):
-    """Recurrent relational GCN encoder producing node-to-cluster assignments."""
+    """Relational GCN feature encoder with size-robust normalization."""
 
     def __init__(
         self,
@@ -205,18 +265,23 @@ class RGCNClusterEncoder(nn.Module):
         hidden_dims: Optional[List[int]] = None,
         num_relations: int = 1,
         type_embedding_dim: Optional[int] = None,
+        positional_dim: int = 0,
         dropout: float = 0.0,
+        use_graphnorm: bool = True,
     ) -> None:
         super().__init__()
         hidden_dims = hidden_dims or [128, 128]
         self.attr_encoder = attr_encoder
-        self.num_clusters = num_clusters
         self.num_relations = max(1, num_relations)
         self.dropout = dropout
+        self.positional_dim = positional_dim
+        self.use_graphnorm = use_graphnorm
         embed_dim = type_embedding_dim or attr_encoder.out_dim
+        # Keep type embeddings compact so node identity features don't balloon.
         self.node_type_embedding = nn.Embedding(num_node_types, embed_dim)
-        in_dim = embed_dim + attr_encoder.out_dim
+        in_dim = embed_dim + attr_encoder.out_dim + positional_dim
         self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
         for hidden_dim in hidden_dims:
             self.convs.append(
                 RGCNConv(
@@ -227,9 +292,14 @@ class RGCNClusterEncoder(nn.Module):
                     bias=True,
                 )
             )
+            # Prefer GraphNorm/LayerNorm over BatchNorm so batches mixing tiny and
+            # huge graphs produce well-behaved statistics as requested.
+            if use_graphnorm:
+                self.norms.append(GraphNorm(hidden_dim))
+            else:
+                self.norms.append(nn.LayerNorm(hidden_dim))
             in_dim = hidden_dim
-        self.cluster_assign = nn.Linear(in_dim, num_clusters)
-        self.cluster_gate = ClusterGate(num_clusters)
+        self.output_dim = in_dim
 
     def _prepare_edge_type(
         self,
@@ -248,45 +318,77 @@ class RGCNClusterEncoder(nn.Module):
         batch: Optional[torch.LongTensor] = None,
         node_attributes: Optional[List[List[Dict[str, Any]]]] = None,
         edge_type: Optional[torch.LongTensor] = None,
+        positional_encodings: Optional[torch.Tensor] = None,
+        edge_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = node_types.device
+        batch_vec = _ensure_batch_vector(batch, node_types.size(0), device)
+        num_graphs = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 1
+
         type_embedding = self.node_type_embedding(node_types)
 
         if node_attributes and len(node_attributes) > 0:
-            attr_embedding = torch.stack(
-                [
-                    self.attr_encoder(attrs).to(device)
-                    for graph_attrs in node_attributes
-                    for attrs in graph_attrs
-                ],
-                dim=0,
-            )
+            # Allow already-collated per-node dicts or per-graph lists from PyG.
+            if isinstance(node_attributes[0], dict):
+                attr_embedding = torch.stack(
+                    [self.attr_encoder(attrs).to(device) for attrs in node_attributes],
+                    dim=0,
+                )
+            else:
+                attr_embedding = torch.stack(
+                    [
+                        self.attr_encoder(attrs).to(device)
+                        for graph_attrs in node_attributes
+                        for attrs in graph_attrs
+                    ],
+                    dim=0,
+                )
         else:
             attr_embedding = torch.zeros(
                 (node_types.size(0), self.attr_encoder.out_dim), device=device
             )
 
-        x = torch.cat([type_embedding, attr_embedding], dim=-1)
+        features = [type_embedding, attr_embedding]
+
+        if self.positional_dim > 0:
+            # Clip/pad Laplacian eigenvectors so every graph contributes R modes.
+            if positional_encodings is None:
+                positional = torch.zeros(
+                    (node_types.size(0), self.positional_dim), device=device
+                )
+            else:
+                positional = positional_encodings.to(device)
+                if positional.size(1) < self.positional_dim:
+                    pad = torch.zeros(
+                        (positional.size(0), self.positional_dim - positional.size(1)),
+                        device=device,
+                    )
+                    positional = torch.cat([positional, pad], dim=1)
+                elif positional.size(1) > self.positional_dim:
+                    positional = positional[:, : self.positional_dim]
+                positional = _standardize_positional_encodings(
+                    positional, batch_vec, num_graphs
+                )
+            features.append(positional)
+
+        x = torch.cat(features, dim=-1)
         etype = self._prepare_edge_type(edge_type, edge_index.size(1), device)
-        for conv in self.convs:
-            x = F.relu(conv(x, edge_index, etype))
+        for layer_idx, conv in enumerate(self.convs):
+            x = conv(x, edge_index, etype)
+            norm = self.norms[layer_idx]
+            if isinstance(norm, GraphNorm):
+                x = norm(x, batch_vec)
+            else:
+                x = norm(x)
+            x = F.relu(x)
             if self.dropout > 0.0:
                 x = F.dropout(x, p=self.dropout, training=self.training)
 
-        cluster_logits = self.cluster_assign(x)
-        gate_sample = self.cluster_gate(training=self.training).unsqueeze(0)
-        cluster_logits = cluster_logits + torch.log(gate_sample + 1e-8)
-        assignments = F.softmax(cluster_logits, dim=-1)
-
         info = {
             "node_embeddings": x,
-            "cluster_assignments": assignments,
-            "cluster_gate_sample": gate_sample.detach(),
-            "cluster_l0": self.cluster_gate.expected_l0(),
+            "batch": batch_vec,
         }
-        if batch is not None:
-            info["batch"] = batch
-        return assignments, info
+        return x, info
 
 
 class ClusteredGraphReconstructor(nn.Module):
@@ -297,11 +399,13 @@ class ClusteredGraphReconstructor(nn.Module):
         num_relations: int,
         num_clusters: int,
         negative_sampling_ratio: float = 1.0,
+        restrict_negatives_to_types: bool = True,
     ) -> None:
         super().__init__()
         self.num_relations = max(1, num_relations)
         self.num_clusters = num_clusters
         self.negative_sampling_ratio = max(0.0, negative_sampling_ratio)
+        self.restrict_negatives_to_types = restrict_negatives_to_types
         self.inter_cluster_logits = nn.Parameter(
             torch.zeros(self.num_relations, num_clusters, num_clusters)
         )
@@ -336,17 +440,20 @@ class ClusteredGraphReconstructor(nn.Module):
         edge_index: torch.LongTensor,
         batch: Optional[torch.LongTensor],
         num_nodes: int,
+        node_types: Optional[torch.LongTensor],
         ratio: float,
-    ) -> Tuple[torch.LongTensor, torch.LongTensor]:
+    ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor]:
         if ratio <= 0.0:
             return (
                 torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
+                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
                 torch.zeros((0,), dtype=torch.long, device=edge_index.device),
             )
 
         if num_nodes == 0:
             return (
                 torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
+                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
                 torch.zeros((0,), dtype=torch.long, device=edge_index.device),
             )
 
@@ -356,8 +463,10 @@ class ClusteredGraphReconstructor(nn.Module):
 
         edge_index_cpu = edge_index.detach().cpu()
         batch_cpu = batch.detach().cpu()
+        node_types_cpu = node_types.detach().cpu() if node_types is not None else None
         neg_edges: List[Tuple[int, int]] = []
         neg_types: List[int] = []
+        neg_batch: List[int] = []
 
         for graph_id in range(num_graphs):
             node_ids = (batch_cpu == graph_id).nonzero(as_tuple=False).view(-1).tolist()
@@ -376,9 +485,31 @@ class ClusteredGraphReconstructor(nn.Module):
             target = min(available, int(math.ceil(num_pos * ratio)))
             attempts = 0
             seen: set[Tuple[int, int]] = set()
+            if self.restrict_negatives_to_types and node_types_cpu is not None:
+                # Sample negatives within type buckets so edge difficulty stays
+                # comparable even when graphs have uneven type distributions.
+                type_to_nodes: Dict[int, List[int]] = {}
+                for node_id in node_ids:
+                    node_type_id = int(node_types_cpu[node_id])
+                    type_to_nodes.setdefault(node_type_id, []).append(node_id)
             while len(seen) < target and attempts < max(100, target * 10):
-                u = random.choice(node_ids)
-                v = random.choice(node_ids)
+                if (
+                    self.restrict_negatives_to_types
+                    and node_types_cpu is not None
+                    and len(node_ids) > 1
+                ):
+                    valid_types = [
+                        t for t, members in type_to_nodes.items() if len(members) > 0
+                    ]
+                    if not valid_types:
+                        break
+                    type_id = random.choice(valid_types)
+                    candidates = type_to_nodes[type_id]
+                    u = random.choice(candidates)
+                    v = random.choice(candidates)
+                else:
+                    u = random.choice(node_ids)
+                    v = random.choice(node_ids)
                 attempts += 1
                 pair = (u, v)
                 if pair in pos_edges or pair in seen:
@@ -387,10 +518,12 @@ class ClusteredGraphReconstructor(nn.Module):
             for u, v in seen:
                 neg_edges.append((u, v))
                 neg_types.append(random.randrange(self.num_relations))
+                neg_batch.append(graph_id)
 
         if not neg_edges:
             return (
                 torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
+                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
                 torch.zeros((0,), dtype=torch.long, device=edge_index.device),
             )
 
@@ -402,7 +535,10 @@ class ClusteredGraphReconstructor(nn.Module):
         neg_type_tensor = torch.tensor(
             neg_types, dtype=torch.long, device=edge_index.device
         )
-        return neg_edge_tensor, neg_type_tensor
+        neg_batch_tensor = torch.tensor(
+            neg_batch, dtype=torch.long, device=edge_index.device
+        )
+        return neg_edge_tensor, neg_type_tensor, neg_batch_tensor
 
     def forward(
         self,
@@ -411,6 +547,7 @@ class ClusteredGraphReconstructor(nn.Module):
         batch: Optional[torch.LongTensor] = None,
         edge_type: Optional[torch.LongTensor] = None,
         negative_sampling_ratio: Optional[float] = None,
+        node_types: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = assignments.device
         ratio = (
@@ -418,42 +555,92 @@ class ClusteredGraphReconstructor(nn.Module):
             if negative_sampling_ratio is None
             else negative_sampling_ratio
         )
+        batch_vec = _ensure_batch_vector(
+            batch, assignments.size(0), device=assignments.device
+        )
+        num_graphs = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 1
+
         if edge_type is None:
             edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=device)
         weights, gate_sample = self._inter_weights(training=self.training)
 
         if edge_index.size(1) == 0:
-            pos_loss = assignments.new_tensor(0.0)
             pos_logits = torch.empty(0, device=device)
+            pos_losses = torch.empty(0, device=device)
+            pos_batch = torch.empty(0, dtype=torch.long, device=device)
         else:
             pos_logits = self._edge_logits(assignments, edge_index, edge_type, weights)
-            pos_loss = F.binary_cross_entropy_with_logits(
-                pos_logits, torch.ones_like(pos_logits)
+            pos_losses = F.binary_cross_entropy_with_logits(
+                pos_logits, torch.ones_like(pos_logits), reduction="none"
             )
+            pos_batch = batch_vec[edge_index[0]]
 
-        neg_edges, neg_types = self._sample_negative_edges(
-            edge_index, batch, assignments.size(0), ratio
+        neg_edges, neg_types, neg_batch = self._sample_negative_edges(
+            edge_index, batch_vec, assignments.size(0), node_types, ratio
         )
         if neg_edges.size(1) == 0:
-            neg_loss = assignments.new_tensor(0.0)
             neg_logits = torch.empty(0, device=device)
+            neg_losses = torch.empty(0, device=device)
         else:
             neg_logits = self._edge_logits(assignments, neg_edges, neg_types, weights)
-            neg_loss = F.binary_cross_entropy_with_logits(
-                neg_logits, torch.zeros_like(neg_logits)
+            neg_losses = F.binary_cross_entropy_with_logits(
+                neg_logits, torch.zeros_like(neg_logits), reduction="none"
             )
 
-        recon_loss = pos_loss + neg_loss
+        # Average positive edge loss per graph so sparse and dense subgraphs
+        # contribute equally regardless of |E|.
+        pos_sum = (
+            _scatter_add_1d(pos_losses, pos_batch, num_graphs)
+            if pos_losses.numel() > 0
+            else torch.zeros(num_graphs, device=device)
+        )
+        pos_counts = (
+            _scatter_add_1d(torch.ones_like(pos_losses), pos_batch, num_graphs)
+            if pos_losses.numel() > 0
+            else torch.zeros(num_graphs, device=device)
+        )
+        pos_avg = torch.zeros(num_graphs, device=device)
+        mask = pos_counts > 0
+        pos_avg[mask] = pos_sum[mask] / pos_counts[mask]
+
+        if neg_losses.numel() > 0:
+            # Normalize negatives against requested ratio to keep contrastive
+            # pressure constant across size buckets.
+            neg_sum = _scatter_add_1d(neg_losses, neg_batch, num_graphs)
+            neg_counts = _scatter_add_1d(
+                torch.ones_like(neg_losses), neg_batch, num_graphs
+            )
+        else:
+            neg_sum = torch.zeros(num_graphs, device=device)
+            neg_counts = torch.zeros(num_graphs, device=device)
+
+        neg_expected = ratio * pos_counts
+        neg_term = torch.zeros(num_graphs, device=device)
+        valid_neg = neg_expected > 0
+        neg_term[valid_neg] = neg_sum[valid_neg] / neg_expected[valid_neg].clamp_min(
+            1e-8
+        )
+
+        graph_losses = pos_avg + neg_term
+        recon_loss = (
+            graph_losses.mean()
+            if graph_losses.numel() > 0
+            else assignments.new_tensor(0.0)
+        )
+
         info: Dict[str, torch.Tensor] = {
-            "pos_loss": pos_loss.detach(),
-            "neg_loss": neg_loss.detach(),
-            "num_negatives": torch.tensor(neg_edges.size(1), device=device),
+            "graph_losses": graph_losses.detach(),
+            "graph_pos_loss": pos_avg.detach(),
+            "graph_neg_loss": neg_term.detach(),
+            "pos_edge_counts": pos_counts.detach(),
+            "neg_edge_counts": neg_counts.detach(),
+            "num_negatives": neg_counts.sum().detach(),
             "inter_l0": self.inter_cluster_gate.expected_l0(),
             "inter_gate_sample": gate_sample.detach(),
         }
         if pos_logits.numel() > 0:
             info["pos_logits"] = pos_logits.detach()
-        if neg_edges.size(1) > 0:
+        if neg_logits.numel() > 0:
             info["neg_logits"] = neg_logits.detach()
         return recon_loss, info
 
@@ -490,6 +677,17 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         embedding_norm_weight: float = 1e-4,
         kld_weight: float = 1e-3,
         entropy_eps: float = 1e-12,
+        positional_dim: int = 0,
+        assignment_temperature: float = 0.1,
+        sinkhorn_iterations: int = 3,
+        sinkhorn_epsilon: float = 1e-3,
+        prototype_momentum: float = 0.1,
+        restrict_negatives_to_types: bool = True,
+        consistency_weight: float = 1e-3,
+        memory_bank_momentum: float = 0.5,
+        memory_bank_max_size: int = 50000,
+        use_virtual_node: bool = False,
+        virtual_node_weight: float = 0.1,
     ) -> None:
         super().__init__()
         self.encoder = RGCNClusterEncoder(
@@ -497,14 +695,16 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             attr_encoder=attr_encoder,
             num_clusters=num_clusters,
             hidden_dims=hidden_dims,
-            num_relations=num_relations,
+            num_relations=num_relations + (1 if use_virtual_node else 0),
             type_embedding_dim=type_embedding_dim,
+            positional_dim=positional_dim,
             dropout=dropout,
         )
         self.decoder = ClusteredGraphReconstructor(
-            num_relations=num_relations,
+            num_relations=num_relations + (1 if use_virtual_node else 0),
             num_clusters=num_clusters,
             negative_sampling_ratio=negative_sampling_ratio,
+            restrict_negatives_to_types=restrict_negatives_to_types,
         )
         self.l0_cluster_weight = l0_cluster_weight
         self.l0_inter_weight = l0_inter_weight
@@ -513,6 +713,39 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         self.embedding_norm_weight = float(embedding_norm_weight)
         self.kld_weight = float(kld_weight)
         self.entropy_eps = float(entropy_eps)
+        self.assignment_temperature = assignment_temperature
+        self.sinkhorn_iterations = sinkhorn_iterations
+        self.sinkhorn_epsilon = sinkhorn_epsilon
+        self.prototype_momentum = prototype_momentum
+        self.consistency_weight = consistency_weight
+        self.use_virtual_node = use_virtual_node
+        self.virtual_node_weight = virtual_node_weight
+
+        self.cluster_gate = ClusterGate(num_clusters)
+        self.num_clusters = num_clusters
+        self.num_relations = num_relations + (1 if use_virtual_node else 0)
+        self.restrict_negatives_to_types = restrict_negatives_to_types
+        self.memory_bank_momentum = memory_bank_momentum
+        self.memory_bank_max_size = memory_bank_max_size
+        self._memory_bank: "OrderedDict[Any, torch.Tensor]" = OrderedDict()
+        self._memory_counts: "OrderedDict[Any, int]" = OrderedDict()
+        self.virtual_relation_id = (
+            (num_relations + (1 if use_virtual_node else 0) - 1)
+            if use_virtual_node
+            else None
+        )
+
+        if use_virtual_node:
+            self.virtual_node_type_id = self.encoder.node_type_embedding.num_embeddings
+            self._extend_node_type_embedding()
+        else:
+            self.virtual_node_type_id = None
+
+        # Prototypes live in encoder feature space; orthogonal init helps spread
+        # clusters before Sinkhorn balancing kicks in.
+        prototype_dim = self.encoder.output_dim
+        self.prototype_bank = nn.Parameter(torch.zeros(num_clusters, prototype_dim))
+        nn.init.orthogonal_(self.prototype_bank)
 
         alpha_tensor = torch.as_tensor(dirichlet_alpha, dtype=torch.float)
         if alpha_tensor.dim() == 0:
@@ -523,6 +756,175 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             )
         self.register_buffer("dirichlet_alpha", alpha_tensor)
 
+    def _extend_node_type_embedding(self) -> None:
+        old_embedding = self.encoder.node_type_embedding
+        device = old_embedding.weight.device
+        mean_vec = old_embedding.weight.data.mean(dim=0, keepdim=True)
+        new_weight = torch.cat([old_embedding.weight.data, mean_vec], dim=0)
+        new_embedding = nn.Embedding.from_pretrained(new_weight, freeze=False)
+        self.encoder.node_type_embedding = new_embedding.to(device)
+
+    # Balanced Sinkhorn keeps cluster usage roughly uniform within a batch so
+    # tiny graphs cannot collapse all assignments into a single prototype.
+    def _sinkhorn_balancing(self, logits: torch.Tensor) -> torch.Tensor:
+        if logits.numel() == 0:
+            return logits
+        Q = logits / max(self.sinkhorn_epsilon, 1e-6)
+        Q = Q - Q.max(dim=1, keepdim=True).values
+        Q = torch.exp(Q)
+        Q = Q + self.entropy_eps
+        target_mass = logits.size(0) / max(float(self.num_clusters), 1.0)
+        for _ in range(max(self.sinkhorn_iterations, 1)):
+            Q = Q / Q.sum(dim=1, keepdim=True).clamp_min(self.entropy_eps)
+            col_sum = Q.sum(dim=0, keepdim=True)
+            Q = Q / (col_sum / target_mass).clamp_min(self.entropy_eps)
+        Q = Q / Q.sum(dim=1, keepdim=True).clamp_min(self.entropy_eps)
+        return Q
+
+    def _balanced_assignments(
+        self,
+        node_embeddings: torch.Tensor,
+        gate_sample: torch.Tensor,
+        real_mask: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> torch.Tensor:
+        prototypes = F.normalize(self.prototype_bank, dim=-1)
+        normalized_nodes = F.normalize(node_embeddings, dim=-1)
+        logits = normalized_nodes @ prototypes.t()
+        logits = logits / max(self.assignment_temperature, 1e-6)
+        logits = logits + torch.log(gate_sample.unsqueeze(0) + self.entropy_eps)
+        assignments = torch.zeros_like(logits)
+        valid_idx = real_mask.nonzero(as_tuple=False).view(-1)
+        if valid_idx.numel() > 0:
+            valid_logits = logits[valid_idx]
+            balanced = self._sinkhorn_balancing(valid_logits)
+            assignments[valid_idx] = balanced
+        inactive_idx = (~real_mask).nonzero(as_tuple=False).view(-1)
+        if inactive_idx.numel() > 0:
+            mean_assign = (
+                assignments[valid_idx].mean(dim=0, keepdim=True)
+                if valid_idx.numel() > 0
+                else torch.full(
+                    (1, self.num_clusters),
+                    1.0 / self.num_clusters,
+                    device=assignments.device,
+                )
+            )
+            assignments[inactive_idx] = mean_assign
+        return assignments
+
+    # EMA prototypes avoid exploding gradients when graph sizes vary widely.
+    def _update_prototypes(
+        self,
+        assignments: torch.Tensor,
+        node_embeddings: torch.Tensor,
+        real_mask: torch.Tensor,
+    ) -> None:
+        if assignments.numel() == 0 or real_mask.sum() == 0:
+            return
+        with torch.no_grad():
+            valid_assign = assignments[real_mask]
+            valid_emb = node_embeddings[real_mask]
+            mass = valid_assign.sum(dim=0, keepdim=True).t().clamp_min(1e-6)
+            proto_update = (valid_assign.t() @ valid_emb) / mass
+            self.prototype_bank.data.mul_(1 - self.prototype_momentum).add_(
+                self.prototype_momentum * proto_update
+            )
+            self.prototype_bank.data = F.normalize(self.prototype_bank.data, dim=-1)
+
+    def _convert_node_ids(
+        self, node_ids: Optional[Union[torch.Tensor, Sequence[Any]]]
+    ) -> Optional[List[Any]]:
+        if node_ids is None:
+            return None
+        if isinstance(node_ids, torch.Tensor):
+            flat = node_ids.detach().cpu().view(-1)
+            if flat.dtype.is_floating_point:
+                return [float(x) for x in flat.tolist()]
+            return flat.tolist()
+        if isinstance(node_ids, (list, tuple)):
+            return list(node_ids)
+        return None
+
+    # Memory bank ties repeated node ids together to align embeddings across
+    # overlapping subgraphs regardless of batch composition.
+    def _memory_consistency_loss(
+        self,
+        node_ids: Optional[Sequence[Any]],
+        node_embeddings: torch.Tensor,
+        real_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int]:
+        # Memory bank reuses a momentum-smoothed target so repeated node ids stay
+        # aligned across subgraphs that may never share a batch. Without it,
+        # assignments on overlapping graphs can diverge just because of sampling.
+        if node_ids is None or self.consistency_weight <= 0.0:
+            return node_embeddings.new_tensor(0.0), 0
+        overlap_indices: List[int] = []
+        targets: List[torch.Tensor] = []
+        for idx, node_id in enumerate(node_ids):
+            if not real_mask[idx]:
+                continue
+            if node_id in self._memory_bank:
+                overlap_indices.append(idx)
+                targets.append(self._memory_bank[node_id].to(node_embeddings.device))
+        if not overlap_indices:
+            return node_embeddings.new_tensor(0.0), 0
+        current = node_embeddings[overlap_indices]
+        target = torch.stack(targets, dim=0)
+        loss = F.mse_loss(current, target, reduction="mean")
+        return loss * self.consistency_weight, len(overlap_indices)
+
+    def _update_memory_bank(
+        self,
+        node_ids: Optional[Sequence[Any]],
+        node_embeddings: torch.Tensor,
+        real_mask: torch.Tensor,
+    ) -> None:
+        if node_ids is None:
+            return
+        for idx, node_id in enumerate(node_ids):
+            if not real_mask[idx]:
+                continue
+            embedding = node_embeddings[idx].detach().cpu()
+            if node_id in self._memory_bank:
+                old = self._memory_bank[node_id]
+                updated = (
+                    1 - self.memory_bank_momentum
+                ) * old + self.memory_bank_momentum * embedding
+                self._memory_bank[node_id] = updated
+                self._memory_counts[node_id] = self._memory_counts.get(node_id, 0) + 1
+                self._memory_bank.move_to_end(node_id)
+            else:
+                if len(self._memory_bank) >= self.memory_bank_max_size:
+                    self._memory_bank.popitem(last=False)
+                    self._memory_counts.popitem(last=False)
+                self._memory_bank[node_id] = embedding
+                self._memory_counts[node_id] = 1
+
+    # Lightweight virtual node adds graph-level context without scaling sums by
+    # |V|, stabilizing deeper message passing on small graphs.
+    def _inject_virtual_context(
+        self, node_embeddings: torch.Tensor, batch: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_virtual_node or node_embeddings.numel() == 0:
+            return node_embeddings, torch.ones(
+                node_embeddings.size(0), dtype=torch.bool, device=node_embeddings.device
+            )
+        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+        counts = _scatter_add_1d(
+            torch.ones_like(batch, dtype=torch.float), batch, num_graphs
+        ).clamp_min(1.0)
+        graph_sum = torch.zeros(
+            (num_graphs, node_embeddings.size(1)), device=node_embeddings.device
+        )
+        graph_sum.index_add_(0, batch, node_embeddings)
+        graph_mean = graph_sum / counts.unsqueeze(-1)
+        node_embeddings = node_embeddings + self.virtual_node_weight * graph_mean[batch]
+        real_mask = torch.ones(
+            node_embeddings.size(0), dtype=torch.bool, device=node_embeddings.device
+        )
+        return node_embeddings, real_mask
+
     def forward(
         self,
         node_types: torch.LongTensor,
@@ -531,31 +933,65 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         node_attributes: Optional[List[List[Dict[str, Any]]]] = None,
         edge_type: Optional[torch.LongTensor] = None,
         negative_sampling_ratio: Optional[float] = None,
+        positional_encodings: Optional[torch.Tensor] = None,
+        edge_weight: Optional[torch.Tensor] = None,
+        node_ids: Optional[Union[torch.Tensor, Sequence[Any]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        assignments, enc_info = self.encoder(
+        node_embeddings, enc_info = self.encoder(
             node_types=node_types,
             edge_index=edge_index,
             batch=batch,
             node_attributes=node_attributes,
             edge_type=edge_type,
+            positional_encodings=positional_encodings,
+            edge_weight=edge_weight,
         )
+        batch_vec = enc_info.get("batch")
+        if batch_vec is None:
+            batch_vec = _ensure_batch_vector(
+                batch, node_types.size(0), node_types.device
+            )
+        # Blend in optional virtual node context before assignment balancing.
+        node_embeddings, real_mask = self._inject_virtual_context(
+            node_embeddings, batch_vec
+        )
+        gate_sample = self.cluster_gate(training=self.training)
+        assignments = self._balanced_assignments(
+            node_embeddings, gate_sample, real_mask, batch_vec
+        )
+        if self.training:
+            self._update_prototypes(assignments, node_embeddings, real_mask)
+
+        node_ids_list = self._convert_node_ids(node_ids)
         recon_loss, dec_info = self.decoder(
             assignments=assignments,
             edge_index=edge_index,
-            batch=batch,
+            batch=batch_vec,
             edge_type=edge_type,
             negative_sampling_ratio=negative_sampling_ratio,
+            node_types=node_types,
         )
 
-        cluster_l0 = enc_info["cluster_l0"].sum()
+        cluster_l0 = self.cluster_gate.expected_l0().sum()
         inter_l0 = dec_info["inter_l0"].sum()
         sparsity_loss = (
             self.l0_cluster_weight * cluster_l0 + self.l0_inter_weight * inter_l0
         )
 
-        assignment_probs = assignments.clamp_min(self.entropy_eps)
-        entropy_term = (assignment_probs * assignment_probs.log()).sum(dim=1).mean()
-        entropy_loss = self.entropy_weight * entropy_term
+        effective_assignments = assignments[real_mask]
+        if effective_assignments.numel() == 0:
+            effective_assignments = assignments
+        assignment_probs = effective_assignments.clamp_min(self.entropy_eps)
+        num_graphs = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 1
+        # Compute entropy per graph so small graphs don't dominate regularizer.
+        entropy_per_node = (assignment_probs * assignment_probs.log()).sum(dim=1)
+        entropy_graph = _per_graph_mean(
+            entropy_per_node,
+            batch_vec[real_mask],
+            num_graphs,
+            eps=self.entropy_eps,
+        )
+        entropy_loss = self.entropy_weight * entropy_graph.mean()
 
         cluster_usage = assignment_probs.mean(dim=0)
         dirichlet_loss = (
@@ -566,30 +1002,58 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             ).sum()
         )
 
-        node_embeddings = enc_info.get("node_embeddings")
         if node_embeddings is None or node_embeddings.numel() == 0:
             embedding_norm_loss = assignments.new_tensor(0.0)
             kld_loss = assignments.new_tensor(0.0)
             latent_mean = assignments.new_tensor(0.0)
             latent_var = assignments.new_tensor(0.0)
+            kld_per_graph = torch.zeros(num_graphs, device=assignments.device)
+            embedding_norm_graph = torch.zeros(num_graphs, device=assignments.device)
         else:
+            # Penalize encoder outputs per graph mean to avoid bias toward
+            # larger components in the batch.
+            embed_norm = node_embeddings.pow(2).sum(dim=1)
+            embedding_norm_graph = _per_graph_mean(
+                embed_norm[real_mask],
+                batch_vec[real_mask],
+                num_graphs,
+                eps=self.entropy_eps,
+            )
             embedding_norm_loss = (
-                self.embedding_norm_weight * node_embeddings.pow(2).sum(dim=1).mean()
+                self.embedding_norm_weight * embedding_norm_graph.mean()
             )
 
-            mean_vec = node_embeddings.mean(dim=0)
-            if node_embeddings.size(0) > 1:
-                var_vec = node_embeddings.var(dim=0, unbiased=False)
-            else:
-                var_vec = torch.zeros_like(mean_vec)
-            var_vec = var_vec.clamp_min(self.entropy_eps)
-            kld_loss = (
+            ones = torch.ones(node_embeddings.size(0), device=node_embeddings.device)
+            counts = _scatter_add_1d(
+                ones[real_mask],
+                batch_vec[real_mask],
+                num_graphs,
+            ).clamp_min(1.0)
+            graph_sum = torch.zeros(
+                num_graphs, node_embeddings.size(1), device=node_embeddings.device
+            )
+            graph_sq_sum = torch.zeros_like(graph_sum)
+            graph_sum.index_add_(0, batch_vec[real_mask], node_embeddings[real_mask])
+            graph_sq_sum.index_add_(
+                0,
+                batch_vec[real_mask],
+                node_embeddings[real_mask] * node_embeddings[real_mask],
+            )
+            graph_mean = graph_sum / counts.unsqueeze(-1)
+            graph_var = graph_sq_sum / counts.unsqueeze(-1) - graph_mean.pow(2)
+            graph_var = graph_var.clamp_min(self.entropy_eps)
+            kld_per_graph = (
                 0.5
                 * self.kld_weight
-                * (mean_vec.pow(2) + var_vec - var_vec.log() - 1.0).sum()
-            )
-            latent_mean = mean_vec.detach()
-            latent_var = var_vec.detach()
+                * (graph_mean.pow(2) + graph_var - graph_var.log() - 1.0)
+            ).sum(dim=1)
+            kld_loss = kld_per_graph.mean()
+            latent_mean = graph_mean.detach()
+            latent_var = graph_var.detach()
+
+        consistency_loss, overlap_count = self._memory_consistency_loss(
+            node_ids_list, node_embeddings, real_mask
+        )
 
         total_loss = (
             recon_loss
@@ -598,7 +1062,10 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             + dirichlet_loss
             + embedding_norm_loss
             + kld_loss
+            + consistency_loss
         )
+
+        self._update_memory_bank(node_ids_list, node_embeddings, real_mask)
 
         metrics: Dict[str, torch.Tensor] = {
             "total_loss": total_loss.detach(),
@@ -606,18 +1073,26 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             "sparsity_loss": sparsity_loss.detach(),
             "cluster_l0": cluster_l0.detach(),
             "inter_l0": inter_l0.detach(),
-            "cluster_gate_sample": enc_info["cluster_gate_sample"],
+            "cluster_gate_sample": gate_sample.detach(),
             "inter_gate_sample": dec_info["inter_gate_sample"],
             "entropy_loss": entropy_loss.detach(),
-            "assignment_entropy": (-entropy_term).detach(),
+            "assignment_entropy": (-entropy_graph.mean()).detach(),
             "dirichlet_loss": dirichlet_loss.detach(),
             "embedding_norm_loss": embedding_norm_loss.detach(),
             "kld_loss": kld_loss.detach(),
             "cluster_usage": cluster_usage.detach(),
             "latent_mean": latent_mean,
             "latent_var": latent_var,
+            "consistency_loss": consistency_loss.detach(),
+            "consistency_overlap": torch.tensor(
+                overlap_count, device=assignments.device
+            ),
+            "graph_entropy": entropy_graph.detach(),
+            "graph_embedding_norm": embedding_norm_graph.detach(),
+            "graph_kld": kld_per_graph.detach(),
         }
         metrics.update({k: v for k, v in dec_info.items() if "loss" in k})
+        metrics["graph_edge_loss"] = dec_info.get("graph_losses")
         return total_loss, assignments, metrics
 
     @staticmethod
@@ -1030,6 +1505,69 @@ class GraphDecoder(nn.Module):
         self.latent_dim = kept_idx.numel()
 
 
+class SizeBucketBatchSampler(Sampler[List[int]]):
+    """Groups graphs with similar node counts into shared mini-batches."""
+
+    def __init__(
+        self, sizes: Sequence[int], batch_size: int, shuffle: bool = True
+    ) -> None:
+        self.sizes = list(sizes)
+        self.batch_size = max(1, batch_size)
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = list(range(len(self.sizes)))
+        indices.sort(key=lambda idx: self.sizes[idx])
+        batches = [
+            indices[i : i + self.batch_size]
+            for i in range(0, len(indices), self.batch_size)
+        ]
+        if self.shuffle:
+            random.shuffle(batches)
+        for batch in batches:
+            yield batch
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.sizes) / self.batch_size)
+
+
+class NodeBudgetBatchSampler(Sampler[List[int]]):
+    """Creates batches capped by a total node budget."""
+
+    def __init__(
+        self, sizes: Sequence[int], node_budget: int, shuffle: bool = True
+    ) -> None:
+        if node_budget <= 0:
+            raise ValueError("node_budget must be positive")
+        self.sizes = list(sizes)
+        self.node_budget = node_budget
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = list(range(len(self.sizes)))
+        if self.shuffle:
+            random.shuffle(indices)
+        current_batch: List[int] = []
+        current_total = 0
+        for idx in indices:
+            size = max(1, int(self.sizes[idx]))
+            if current_batch and current_total + size > self.node_budget:
+                # Stop before exceeding the budget—pending graph will become the first
+                # element in the next mini-batch so nothing ever gets dropped. This
+                # keeps memory/negative sampling cost bounded when giant graphs appear.
+                yield current_batch
+                current_batch = []
+                current_total = 0
+            current_batch.append(idx)
+            current_total += size
+        if current_batch:
+            yield current_batch
+
+    def __len__(self) -> int:
+        total = sum(max(1, int(size)) for size in self.sizes)
+        return max(1, math.ceil(total / self.node_budget))
+
+
 class OnlineTrainer:
     """Minimal trainer for the self-compressing rGCN autoencoder."""
 
@@ -1049,13 +1587,21 @@ class OnlineTrainer:
         self.device = resolved_device
         self.dataset: List[Data] = []
         self.history: List[Dict[str, float]] = []
+        # Track node counts per graph so we can bucket by size or enforce budgets.
+        self._node_sizes: List[int] = []
 
     def add_data(self, graphs: List[Data]) -> None:
         for graph in graphs:
-            self.dataset.append(graph.clone())
+            clone = graph.clone()
+            self.dataset.append(clone)
+            node_count = int(
+                getattr(clone, "num_nodes", None) or clone.node_types.size(0)
+            )
+            self._node_sizes.append(node_count)
 
     def clear_dataset(self) -> None:
         self.dataset.clear()
+        self._node_sizes.clear()
 
     def train(
         self,
@@ -1063,13 +1609,29 @@ class OnlineTrainer:
         batch_size: int = 16,
         negative_sampling_ratio: Optional[float] = None,
         verbose: bool = True,
+        bucket_by_size: bool = True,
+        node_budget: Optional[int] = None,
+        shuffle: bool = True,
     ) -> List[Dict[str, float]]:
         if epochs <= 0:
             raise ValueError("epochs must be a positive integer.")
         if not self.dataset:
             raise ValueError("No graphs available to train on. Call add_data first.")
 
-        loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
+        if node_budget is not None:
+            # Node-budget sampler keeps total nodes per batch bounded to limit VRAM.
+            batch_sampler = NodeBudgetBatchSampler(
+                self._node_sizes, node_budget, shuffle=shuffle
+            )
+            loader = DataLoader(self.dataset, batch_sampler=batch_sampler)
+        elif bucket_by_size:
+            # Bucket graphs of similar size together to reduce gradient variance.
+            batch_sampler = SizeBucketBatchSampler(
+                self._node_sizes, batch_size, shuffle=shuffle
+            )
+            loader = DataLoader(self.dataset, batch_sampler=batch_sampler)
+        else:
+            loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
 
         for epoch in range(1, epochs + 1):
             self.model.train()
@@ -1080,6 +1642,28 @@ class OnlineTrainer:
             for batch in loader:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
+                positional = None
+                for candidate in (
+                    "positional_encodings",
+                    "laplacian_positional_encoding",
+                    "laplacian_eigvecs",
+                ):
+                    # Support multiple field names people use for Laplacian PEs.
+                    if hasattr(batch, candidate):
+                        positional = getattr(batch, candidate)
+                        break
+                node_ids = None
+                for candidate in (
+                    "global_node_ids",
+                    "node_ids",
+                    "original_node_ids",
+                    "node_names",
+                ):
+                    # Reuse whichever stable node identifier is present for the
+                    # overlap consistency regularizer.
+                    if hasattr(batch, candidate):
+                        node_ids = getattr(batch, candidate)
+                        break
                 loss, _assignments, metrics = self.model(
                     node_types=batch.node_types,
                     edge_index=batch.edge_index,
@@ -1087,6 +1671,9 @@ class OnlineTrainer:
                     node_attributes=getattr(batch, "node_attributes", None),
                     edge_type=getattr(batch, "edge_type", None),
                     negative_sampling_ratio=negative_sampling_ratio,
+                    positional_encodings=positional,
+                    edge_weight=getattr(batch, "edge_weight", None),
+                    node_ids=node_ids,
                 )
                 loss.backward()
                 self.optimizer.step()
@@ -1112,7 +1699,7 @@ class OnlineTrainer:
 
             if verbose:
                 print(
-                    f"Epoch {epoch}/{epochs}  loss={averaged_metrics['loss']:.4f}  metrics={averaged_metrics}"
+                    f"Epoch {epoch}/{epochs} loss={averaged_metrics['loss']:.4f} metrics={averaged_metrics}"
                 )
 
         return self.history
@@ -1184,9 +1771,27 @@ if __name__ == "__main__":
         data.edge_type = edge_type
         return data
 
-    graphs = [
-        generate_random_graph(random.randint(5, 12), edge_prob=0.25) for _ in range(64)
+    size_buckets = [
+        (6, 0.35, 12),  # small graphs: 6+/-2 nodes
+        (18, 0.25, 20),  # medium graphs: around 18 nodes
+        (36, 0.15, 48),  # large graphs: around 36 nodes
     ]
+    graphs: List[Data] = []
+    for target_nodes, edge_prob, count in size_buckets:
+        low = max(4, int(0.7 * target_nodes))
+        high = int(1.3 * target_nodes)
+        for _ in range(count):
+            graphs.append(
+                generate_random_graph(random.randint(low, high), edge_prob=edge_prob)
+            )
+    random.shuffle(graphs)
+
     trainer = OnlineTrainer(model, optimizer)
     trainer.add_data(graphs)
-    trainer.train(epochs=5, batch_size=8)
+    trainer.train(
+        epochs=5,
+        batch_size=8,
+        negative_sampling_ratio=0.5,
+        bucket_by_size=True,
+        node_budget=160,
+    )
