@@ -13,7 +13,7 @@
     - [Preventing Biased Alignment](#preventing-biased-alignment)
     - [Partitioning](#partitioning)
         - [Preventing Trivial / Degenerate Solutions](#preventing-trivial--degenerate-solutions)
-        - [Limitations](#limitations)
+        - [Adaptive Subgraph Sampling to Mitigate Overfitting](#adaptive-subgraph-sampling-to-mitigate-overfitting)
         - [Comparison](#comparison)
 - [Abbreviations](#abbreviations)
 - [References](#references)
@@ -237,7 +237,7 @@ $$
 | $p(z)$                  | Prior distribution, typically $\mathcal{N}(0,I)$.                                    |
 | $D_{\mathrm{KL}}(q\|p)$ | Kullback–Leibler divergence measuring how far the posterior deviates from the prior. |
 
-#### Limitations
+#### Adaptive Subgraph Sampling to Mitigate Overfitting
 A practical limitation of the basic rGCN-SCAE approach is that it would be trained on a single, fixed multiplex graph.
 Without a distribution of graphs, the model risks overfitting to idiosyncratic topological patterns rather than learning generalizable relational principles.
 To mitigate this, a dataset was be created with different subgraphs sampled via node-hopping from randomly chosen seed nodes with the hop radius determined adaptively from local connectivity metrics such as node degree, clustering coefficient, and k-core index in order to preserve local connectivity and type proportions.
