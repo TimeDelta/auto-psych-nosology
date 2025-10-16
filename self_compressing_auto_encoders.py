@@ -181,31 +181,48 @@ class NodeAttributeDeepSetEncoder(nn.Module):
 
 
 class HardConcreteGate(nn.Module):
-    """Louizos et al. (2018) hard-concrete gate for L0-style sparsity."""
+    """Louizos et al. (2018) hard-concrete L0 gate with stability enhancements."""
 
     def __init__(
         self,
         shape: Tuple[int, ...],
         temperature: float = 2.0 / 3.0,
-        limit_a: float = -0.1,
-        limit_b: float = 1.1,
+        stretch_epsilon: float = 0.1,
+        pre_activation_clip: float = 2.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.log_alpha = nn.Parameter(torch.zeros(shape))
         self.temperature = temperature
-        self.limit_a = limit_a
-        self.limit_b = limit_b
+        self.stretch_epsilon = stretch_epsilon
+        self.pre_activation_clip = pre_activation_clip
         self.eps = eps
+
+    @property
+    def stretch_lower_bound(self) -> float:
+        # Stretch slightly below zero to keep the relaxed support wide early on.
+        return -self.stretch_epsilon
+
+    @property
+    def stretch_upper_bound(self) -> float:
+        # Allow small overshoot above one for less biased gradients.
+        return 1.0 + self.stretch_epsilon
 
     def _sample(self, training: bool) -> torch.Tensor:
         if training:
             u = torch.rand_like(self.log_alpha)
             s = torch.log(u + self.eps) - torch.log(1 - u + self.eps)
-            z = torch.sigmoid((s + self.log_alpha) / self.temperature)
+            pre_activation = (s + self.log_alpha) / max(self.temperature, self.eps)
         else:
-            z = torch.sigmoid(self.log_alpha)
-        z = z * (self.limit_b - self.limit_a) + self.limit_a
+            pre_activation = self.log_alpha / max(self.temperature, self.eps)
+        pre_activation = pre_activation.clamp(
+            -self.pre_activation_clip, self.pre_activation_clip
+        )
+        z = torch.sigmoid(pre_activation)
+        z = (
+            z * (self.stretch_upper_bound - self.stretch_lower_bound)
+            + self.stretch_lower_bound
+        )
         return z.clamp(0.0, 1.0)
 
     def forward(self, training: Optional[bool] = None) -> torch.Tensor:
@@ -213,18 +230,31 @@ class HardConcreteGate(nn.Module):
         return self._sample(training)
 
     def expected_l0(self) -> torch.Tensor:
-        limit_ratio = -self.limit_a / self.limit_b
+        limit_ratio = -self.stretch_lower_bound / max(
+            self.stretch_upper_bound, self.eps
+        )
         limit_ratio = max(limit_ratio, self.eps)
-        threshold = self.temperature * math.log(limit_ratio)
+        threshold = max(self.temperature, self.eps) * math.log(limit_ratio)
         return torch.sigmoid(self.log_alpha - threshold)
 
 
 class ClusterGate(nn.Module):
     """Applies hard-concrete gating across clusters."""
 
-    def __init__(self, num_clusters: int, temperature: float = 2.0 / 3.0) -> None:
+    def __init__(
+        self,
+        num_clusters: int,
+        temperature: float = 2.0 / 3.0,
+        stretch_epsilon: float = 0.1,
+        pre_activation_clip: float = 2.0,
+    ) -> None:
         super().__init__()
-        self._gate = HardConcreteGate((num_clusters,), temperature=temperature)
+        self._gate = HardConcreteGate(
+            (num_clusters,),
+            temperature=temperature,
+            stretch_epsilon=stretch_epsilon,
+            pre_activation_clip=pre_activation_clip,
+        )
 
     def forward(self, training: Optional[bool] = None) -> torch.Tensor:
         return self._gate(training=training)
@@ -241,10 +271,15 @@ class InterClusterGate(nn.Module):
         num_relations: int,
         num_clusters: int,
         temperature: float = 2.0 / 3.0,
+        stretch_epsilon: float = 0.1,
+        pre_activation_clip: float = 2.0,
     ) -> None:
         super().__init__()
         self._gate = HardConcreteGate(
-            (num_relations, num_clusters, num_clusters), temperature=temperature
+            (num_relations, num_clusters, num_clusters),
+            temperature=temperature,
+            stretch_epsilon=stretch_epsilon,
+            pre_activation_clip=pre_activation_clip,
         )
 
     def forward(self, training: Optional[bool] = None) -> torch.Tensor:
@@ -268,6 +303,11 @@ class RGCNClusterEncoder(nn.Module):
         positional_dim: int = 0,
         dropout: float = 0.0,
         use_graphnorm: bool = True,
+        dropedge_rate: float = 0.0,
+        degree_dropout_rate: float = 0.0,
+        use_degree_norm: bool = True,
+        enable_relation_reweighting: bool = True,
+        relation_reweight_power: float = 0.5,
     ) -> None:
         super().__init__()
         hidden_dims = hidden_dims or [128, 128]
@@ -276,6 +316,11 @@ class RGCNClusterEncoder(nn.Module):
         self.dropout = dropout
         self.positional_dim = positional_dim
         self.use_graphnorm = use_graphnorm
+        self.dropedge_rate = max(0.0, min(1.0, dropedge_rate))
+        self.degree_dropout_rate = max(0.0, min(1.0, degree_dropout_rate))
+        self.use_degree_norm = use_degree_norm
+        self.enable_relation_reweighting = enable_relation_reweighting
+        self.relation_reweight_power = relation_reweight_power
         embed_dim = type_embedding_dim or attr_encoder.out_dim
         # Keep type embeddings compact so node identity features don't balloon.
         self.node_type_embedding = nn.Embedding(num_node_types, embed_dim)
@@ -327,6 +372,86 @@ class RGCNClusterEncoder(nn.Module):
 
         type_embedding = self.node_type_embedding(node_types)
 
+        num_nodes = node_types.size(0)
+        edge_index = edge_index.to(device)
+        if edge_type is not None:
+            edge_type = edge_type.to(device)
+        if positional_encodings is not None:
+            positional_encodings = positional_encodings.to(device)
+        if edge_weight is not None:
+            edge_weight = edge_weight.to(device)
+
+        if edge_index.numel() > 0:
+            if self.training and self.dropedge_rate > 0.0:
+                # DropEdge: randomly thin edges so deep stacks do not oversmooth.
+                keep_prob = 1.0 - self.dropedge_rate
+                mask = torch.rand(edge_index.size(1), device=device) < keep_prob
+                if mask.sum() == 0:
+                    idx = torch.randint(0, mask.numel(), (1,), device=device)
+                    mask[idx] = True
+                edge_index = edge_index[:, mask]
+                if edge_type is not None:
+                    edge_type = edge_type[mask]
+                if edge_weight is not None:
+                    edge_weight = edge_weight[mask]
+
+            if (
+                self.training
+                and self.degree_dropout_rate > 0.0
+                and edge_index.numel() > 0
+            ):
+                row = edge_index[0]
+                src_deg = degree(row, num_nodes, dtype=torch.float).to(device)
+                max_deg = src_deg.max().clamp_min(1.0)
+                # Higher-degree sources receive proportionally stronger dropout.
+                drop_prob = self.degree_dropout_rate * (src_deg[row] / max_deg)
+                keep_mask = torch.rand_like(drop_prob) > drop_prob
+                if keep_mask.sum() == 0:
+                    idx = torch.randint(0, keep_mask.numel(), (1,), device=device)
+                    keep_mask[idx] = True
+                edge_index = edge_index[:, keep_mask]
+                if edge_type is not None:
+                    edge_type = edge_type[keep_mask]
+                if edge_weight is not None:
+                    edge_weight = edge_weight[keep_mask]
+
+        etype = self._prepare_edge_type(edge_type, edge_index.size(1), device)
+
+        if edge_index.numel() > 0:
+            edge_scale = torch.ones(edge_index.size(1), device=device)
+            if (
+                self.enable_relation_reweighting
+                and etype is not None
+                and etype.numel() > 0
+            ):
+                # Reweight relations by inverse frequency so rare types influence training.
+                relation_counts = (
+                    torch.bincount(etype.detach().cpu(), minlength=self.num_relations)
+                    .to(device=device, dtype=torch.float)
+                    .clamp_min(1.0)
+                )
+                relation_scale = relation_counts.pow(-self.relation_reweight_power)
+                edge_scale = relation_scale[etype]
+        else:
+            edge_scale = torch.ones(0, device=device)
+
+        # Precompute symmetric degree normalization factors when requested.
+        if self.use_degree_norm and edge_index.numel() > 0:
+            row, col = edge_index
+            deg_row = (
+                degree(row, num_nodes, dtype=torch.float).to(device).clamp_min(1.0)
+            )
+            deg_col = (
+                degree(col, num_nodes, dtype=torch.float).to(device).clamp_min(1.0)
+            )
+            src_scale = deg_row.pow(-0.5)
+            dst_scale = deg_col.pow(-0.5)
+            if edge_scale.numel() > 0:
+                src_edge_sum = _scatter_add_1d(edge_scale, row, num_nodes)
+                src_scale = src_scale * ((src_edge_sum / deg_row).clamp_min(1e-6))
+        else:
+            src_scale = dst_scale = torch.ones(num_nodes, device=device)
+
         if node_attributes and len(node_attributes) > 0:
             # Allow already-collated per-node dicts or per-graph lists from PyG.
             if isinstance(node_attributes[0], dict):
@@ -372,9 +497,12 @@ class RGCNClusterEncoder(nn.Module):
             features.append(positional)
 
         x = torch.cat(features, dim=-1)
-        etype = self._prepare_edge_type(edge_type, edge_index.size(1), device)
+        src_scale_vec = src_scale.unsqueeze(-1)
+        dst_scale_vec = dst_scale.unsqueeze(-1)
         for layer_idx, conv in enumerate(self.convs):
+            x = x * src_scale_vec
             x = conv(x, edge_index, etype)
+            x = x * dst_scale_vec
             norm = self.norms[layer_idx]
             if isinstance(norm, GraphNorm):
                 x = norm(x, batch_vec)
@@ -400,17 +528,30 @@ class ClusteredGraphReconstructor(nn.Module):
         num_clusters: int,
         negative_sampling_ratio: float = 1.0,
         restrict_negatives_to_types: bool = True,
+        gate_temperature: float = 2.0 / 3.0,
+        gate_stretch_epsilon: float = 0.1,
+        gate_pre_activation_clip: float = 2.0,
+        enable_relation_reweighting: bool = True,
+        relation_reweight_power: float = 0.5,
     ) -> None:
         super().__init__()
         self.num_relations = max(1, num_relations)
         self.num_clusters = num_clusters
         self.negative_sampling_ratio = max(0.0, negative_sampling_ratio)
         self.restrict_negatives_to_types = restrict_negatives_to_types
+        self.enable_relation_reweighting = enable_relation_reweighting
+        self.relation_reweight_power = relation_reweight_power
         self.inter_cluster_logits = nn.Parameter(
             torch.zeros(self.num_relations, num_clusters, num_clusters)
         )
         nn.init.xavier_uniform_(self.inter_cluster_logits)
-        self.inter_cluster_gate = InterClusterGate(self.num_relations, num_clusters)
+        self.inter_cluster_gate = InterClusterGate(
+            self.num_relations,
+            num_clusters,
+            temperature=gate_temperature,
+            stretch_epsilon=gate_stretch_epsilon,
+            pre_activation_clip=gate_pre_activation_clip,
+        )
         self.absent_bias = nn.Parameter(torch.zeros(self.num_relations))
 
     def _inter_weights(self, training: bool) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -548,6 +689,7 @@ class ClusteredGraphReconstructor(nn.Module):
         edge_type: Optional[torch.LongTensor] = None,
         negative_sampling_ratio: Optional[float] = None,
         node_types: Optional[torch.LongTensor] = None,
+        negative_confidence_weight: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = assignments.device
         ratio = (
@@ -574,6 +716,16 @@ class ClusteredGraphReconstructor(nn.Module):
                 pos_logits, torch.ones_like(pos_logits), reduction="none"
             )
             pos_batch = batch_vec[edge_index[0]]
+            if self.enable_relation_reweighting and edge_type.numel() > 0:
+                rel_counts = (
+                    torch.bincount(
+                        edge_type.detach().cpu(), minlength=self.num_relations
+                    )
+                    .to(device=device, dtype=torch.float)
+                    .clamp_min(1.0)
+                )
+                rel_scale = rel_counts.pow(-self.relation_reweight_power)
+                pos_losses = pos_losses * rel_scale[edge_type]
 
         neg_edges, neg_types, neg_batch = self._sample_negative_edges(
             edge_index, batch_vec, assignments.size(0), node_types, ratio
@@ -586,6 +738,18 @@ class ClusteredGraphReconstructor(nn.Module):
             neg_losses = F.binary_cross_entropy_with_logits(
                 neg_logits, torch.zeros_like(neg_logits), reduction="none"
             )
+            if self.enable_relation_reweighting and neg_types.numel() > 0:
+                rel_counts = (
+                    torch.bincount(
+                        neg_types.detach().cpu(), minlength=self.num_relations
+                    )
+                    .to(device=device, dtype=torch.float)
+                    .clamp_min(1.0)
+                )
+                rel_scale = rel_counts.pow(-self.relation_reweight_power)
+                neg_losses = neg_losses * rel_scale[neg_types]
+            if negative_confidence_weight is not None:
+                neg_losses = neg_losses * negative_confidence_weight
 
         # Average positive edge loss per graph so sparse and dense subgraphs
         # contribute equally regardless of |E|.
@@ -638,6 +802,12 @@ class ClusteredGraphReconstructor(nn.Module):
             "inter_l0": self.inter_cluster_gate.expected_l0(),
             "inter_gate_sample": gate_sample.detach(),
         }
+        if negative_confidence_weight is not None:
+            if not torch.is_tensor(negative_confidence_weight):
+                negative_confidence_weight = torch.tensor(
+                    negative_confidence_weight, device=device
+                )
+            info["negative_confidence_weight"] = negative_confidence_weight.detach()
         if pos_logits.numel() > 0:
             info["pos_logits"] = pos_logits.detach()
         if neg_logits.numel() > 0:
@@ -688,8 +858,46 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         memory_bank_max_size: int = 50000,
         use_virtual_node: bool = False,
         virtual_node_weight: float = 0.1,
+        sparsity_warmup_steps: int = 400,
+        gate_temperature_start: Optional[float] = None,
+        gate_temperature_end: Optional[float] = None,
+        gate_temperature_anneal_steps: int = 400,
+        gate_stretch_epsilon: float = 0.1,
+        gate_pre_activation_clip: float = 2.0,
+        assignment_temperature_start: Optional[float] = None,
+        assignment_temperature_anneal_steps: int = 400,
+        gate_entropy_floor_bits: float = 0.5,
+        gate_entropy_weight: float = 1e-3,
+        assignment_entropy_floor: Optional[float] = None,
+        neg_entropy_scale: float = 1.0,
+        neg_entropy_min_bits: float = 0.1,
+        neg_entropy_max_weight: float = 5.0,
+        ema_gate_decay: float = 0.9,
+        revival_gate_threshold: float = 0.05,
+        revival_usage_threshold: float = 0.05,
+        dropedge_rate: float = 0.15,
+        degree_dropout_rate: float = 0.1,
+        degree_decorrelation_weight: float = 1e-3,
+        relation_reweight_power: float = 0.5,
+        enable_relation_reweighting: bool = True,
     ) -> None:
         super().__init__()
+        base_gate_temperature = 2.0 / 3.0
+        gate_temp_target = (
+            float(gate_temperature_end)
+            if gate_temperature_end is not None
+            else base_gate_temperature
+        )
+        gate_temp_start = (
+            float(gate_temperature_start)
+            if gate_temperature_start is not None
+            else (
+                gate_temp_target * 2.0
+                if gate_temperature_anneal_steps > 0
+                else gate_temp_target
+            )
+        )
+        gate_temp_end = gate_temp_target
         self.encoder = RGCNClusterEncoder(
             num_node_types=num_node_types,
             attr_encoder=attr_encoder,
@@ -699,29 +907,79 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             type_embedding_dim=type_embedding_dim,
             positional_dim=positional_dim,
             dropout=dropout,
+            dropedge_rate=dropedge_rate,
+            degree_dropout_rate=degree_dropout_rate,
+            use_degree_norm=True,
+            enable_relation_reweighting=enable_relation_reweighting,
+            relation_reweight_power=relation_reweight_power,
         )
         self.decoder = ClusteredGraphReconstructor(
             num_relations=num_relations + (1 if use_virtual_node else 0),
             num_clusters=num_clusters,
             negative_sampling_ratio=negative_sampling_ratio,
             restrict_negatives_to_types=restrict_negatives_to_types,
+            gate_temperature=gate_temp_start,
+            gate_stretch_epsilon=gate_stretch_epsilon,
+            gate_pre_activation_clip=gate_pre_activation_clip,
+            enable_relation_reweighting=enable_relation_reweighting,
+            relation_reweight_power=relation_reweight_power,
         )
-        self.l0_cluster_weight = l0_cluster_weight
-        self.l0_inter_weight = l0_inter_weight
+        self._base_l0_cluster_weight = float(l0_cluster_weight)
+        self._base_l0_inter_weight = float(l0_inter_weight)
+        self.l0_cluster_weight = float(l0_cluster_weight)
+        self.l0_inter_weight = float(l0_inter_weight)
         self.entropy_weight = float(entropy_weight)
         self.dirichlet_weight = float(dirichlet_weight)
         self.embedding_norm_weight = float(embedding_norm_weight)
         self.kld_weight = float(kld_weight)
         self.entropy_eps = float(entropy_eps)
-        self.assignment_temperature = assignment_temperature
+        assignment_temp_end = float(assignment_temperature)
+        self.assignment_temperature_start = (
+            float(assignment_temperature_start)
+            if assignment_temperature_start is not None
+            else (
+                assignment_temp_end * 2.0
+                if assignment_temperature_anneal_steps > 0
+                else assignment_temp_end
+            )
+        )
+        self.assignment_temperature_end = assignment_temp_end
+        self.assignment_temperature = self.assignment_temperature_start
         self.sinkhorn_iterations = sinkhorn_iterations
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.prototype_momentum = prototype_momentum
         self.consistency_weight = consistency_weight
         self.use_virtual_node = use_virtual_node
         self.virtual_node_weight = virtual_node_weight
+        self.sparsity_warmup_steps = max(0, int(sparsity_warmup_steps))
+        self.gate_temperature_start = gate_temp_start
+        self.gate_temperature_end = gate_temp_end
+        self.gate_temperature_anneal_steps = max(0, int(gate_temperature_anneal_steps))
+        self.assignment_temperature_anneal_steps = max(
+            0, int(assignment_temperature_anneal_steps)
+        )
+        self.gate_entropy_floor_bits = float(gate_entropy_floor_bits)
+        self.gate_entropy_weight = float(gate_entropy_weight)
+        self.assignment_entropy_floor = (
+            float(assignment_entropy_floor)
+            if assignment_entropy_floor is not None
+            else math.log(max(float(num_clusters), 1.0))
+        )
+        self.neg_entropy_scale = float(neg_entropy_scale)
+        self.neg_entropy_min_bits = max(float(neg_entropy_min_bits), 1e-4)
+        self.neg_entropy_max_weight = float(neg_entropy_max_weight)
+        self.ema_gate_decay = float(ema_gate_decay)
+        self.revival_gate_threshold = float(max(revival_gate_threshold, 0.0))
+        self.revival_usage_threshold = float(max(revival_usage_threshold, 0.0))
+        self.degree_decorrelation_weight = float(degree_decorrelation_weight)
+        self.enable_relation_reweighting = enable_relation_reweighting
 
-        self.cluster_gate = ClusterGate(num_clusters)
+        self.cluster_gate = ClusterGate(
+            num_clusters,
+            temperature=gate_temp_start,
+            stretch_epsilon=gate_stretch_epsilon,
+            pre_activation_clip=gate_pre_activation_clip,
+        )
         self.num_clusters = num_clusters
         self.num_relations = num_relations + (1 if use_virtual_node else 0)
         self.restrict_negatives_to_types = restrict_negatives_to_types
@@ -734,6 +992,10 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             if use_virtual_node
             else None
         )
+
+        self.register_buffer("_gate_ema", torch.ones(num_clusters, dtype=torch.float))
+        self.register_buffer("_global_step", torch.zeros(1, dtype=torch.long))
+        self.revival_logit = 0.0
 
         if use_virtual_node:
             self.virtual_node_type_id = self.encoder.node_type_embedding.num_embeddings
@@ -901,6 +1163,100 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
                 self._memory_bank[node_id] = embedding
                 self._memory_counts[node_id] = 1
 
+    def _sparsity_warmup_factor(self) -> float:
+        """Linear ramp for L0 penalties to avoid early gate collapse."""
+        if self.sparsity_warmup_steps <= 0:
+            return 1.0
+        step = int(self._global_step.item())
+        return min(1.0, (step + 1) / max(1, self.sparsity_warmup_steps))
+
+    def _apply_schedules(self) -> None:
+        """Update gate and assignment temperatures according to anneal settings."""
+        step = int(self._global_step.item())
+        if self.gate_temperature_anneal_steps <= 0:
+            gate_temp = self.gate_temperature_end
+        else:
+            progress = min(1.0, step / max(1, self.gate_temperature_anneal_steps))
+            gate_temp = (
+                self.gate_temperature_start
+                + (self.gate_temperature_end - self.gate_temperature_start) * progress
+            )
+        self.cluster_gate._gate.temperature = gate_temp
+        self.decoder.inter_cluster_gate._gate.temperature = gate_temp
+
+        if self.assignment_temperature_anneal_steps <= 0:
+            self.assignment_temperature = self.assignment_temperature_end
+        else:
+            progress = min(1.0, step / max(1, self.assignment_temperature_anneal_steps))
+            self.assignment_temperature = (
+                self.assignment_temperature_start
+                + (self.assignment_temperature_end - self.assignment_temperature_start)
+                * progress
+            )
+
+    def _smooth_gate_sample(self, gate_sample: torch.Tensor) -> torch.Tensor:
+        """EMA smooth the stochastic gates to reduce frame-to-frame jitter."""
+        if self.ema_gate_decay <= 0.0 or not self.training:
+            return gate_sample
+        ema = self._gate_ema.to(gate_sample.device)
+        smoothed = self.ema_gate_decay * gate_sample + (1.0 - self.ema_gate_decay) * ema
+        self._gate_ema.copy_(smoothed.detach())
+        return smoothed
+
+    def _revive_dead_clusters(
+        self, gate_sample: torch.Tensor, cluster_usage: torch.Tensor
+    ) -> None:
+        """Push logit mass toward rarely-open gates that still receive traffic."""
+        if self.revival_gate_threshold <= 0.0:
+            return
+        mask = (gate_sample < self.revival_gate_threshold) & (
+            cluster_usage > self.revival_usage_threshold
+        )
+        if mask.any():
+            with torch.no_grad():
+                self.cluster_gate._gate.log_alpha.data[mask] = self.revival_logit
+
+    def _degree_orthogonal_penalty(
+        self,
+        edge_index: torch.LongTensor,
+        node_embeddings: Optional[torch.Tensor],
+        real_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Penalize correlation between latent space and node degree."""
+        if (
+            self.degree_decorrelation_weight <= 0.0
+            or node_embeddings is None
+            or node_embeddings.numel() == 0
+        ):
+            zero = (
+                node_embeddings.new_tensor(0.0)
+                if node_embeddings is not None
+                else edge_index.new_zeros((), dtype=torch.float)
+            )
+            return zero, zero.detach()
+        if edge_index.numel() == 0 or real_mask.sum() == 0:
+            zero = node_embeddings.new_tensor(0.0)
+            return zero, zero.detach()
+        deg = (
+            degree(edge_index[0], node_embeddings.size(0), dtype=torch.float)
+            .to(node_embeddings.device)
+            .clamp_min(1.0)
+        )
+        selected = deg[real_mask]
+        if selected.numel() == 0:
+            zero = node_embeddings.new_tensor(0.0)
+            return zero, zero.detach()
+        log_deg = torch.log(selected)
+        latents = node_embeddings[real_mask]
+        latents_centered = latents - latents.mean(dim=0, keepdim=True)
+        log_deg_centered = log_deg - log_deg.mean()
+        cross = (latents_centered * log_deg_centered.unsqueeze(-1)).sum(dim=0)
+        denom_lat = latents_centered.pow(2).sum(dim=0).clamp_min(self.entropy_eps)
+        denom_deg = log_deg_centered.pow(2).sum().clamp_min(self.entropy_eps)
+        corr_sq = (cross.pow(2) / (denom_lat * denom_deg)).sum()
+        penalty = self.degree_decorrelation_weight * corr_sq
+        return penalty, corr_sq.detach()
+
     # Lightweight virtual node adds graph-level context without scaling sums by
     # |V|, stabilizing deeper message passing on small graphs.
     def _inject_virtual_context(
@@ -951,11 +1307,29 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             batch_vec = _ensure_batch_vector(
                 batch, node_types.size(0), node_types.device
             )
+        if self.training:
+            self._apply_schedules()
         # Blend in optional virtual node context before assignment balancing.
         node_embeddings, real_mask = self._inject_virtual_context(
             node_embeddings, batch_vec
         )
         gate_sample = self.cluster_gate(training=self.training)
+        gate_sample = self._smooth_gate_sample(gate_sample)
+        gate_probs = gate_sample.clamp_min(self.entropy_eps)
+        gate_probs = gate_probs / gate_probs.sum().clamp_min(self.entropy_eps)
+        # Encourage non-degenerate gate usage measured in information-theoretic bits.
+        gate_entropy_nats = -(gate_probs * gate_probs.log()).sum()
+        gate_entropy_bits = gate_entropy_nats / math.log(2.0)
+        gate_entropy_loss = self.gate_entropy_weight * F.relu(
+            self.gate_entropy_floor_bits - gate_entropy_bits
+        )
+        neg_conf_weight: Optional[torch.Tensor] = None
+        if self.neg_entropy_scale > 0.0:
+            # Down-weight easy negatives when gates already show high confidence.
+            inv_entropy = 1.0 / gate_entropy_bits.clamp_min(self.neg_entropy_min_bits)
+            neg_conf_weight = 1.0 + self.neg_entropy_scale * (inv_entropy - 1.0)
+            neg_conf_weight = neg_conf_weight.clamp_max(self.neg_entropy_max_weight)
+
         assignments = self._balanced_assignments(
             node_embeddings, gate_sample, real_mask, batch_vec
         )
@@ -970,13 +1344,17 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             edge_type=edge_type,
             negative_sampling_ratio=negative_sampling_ratio,
             node_types=node_types,
+            negative_confidence_weight=neg_conf_weight,
         )
 
         cluster_l0 = self.cluster_gate.expected_l0().sum()
         inter_l0 = dec_info["inter_l0"].sum()
-        sparsity_loss = (
-            self.l0_cluster_weight * cluster_l0 + self.l0_inter_weight * inter_l0
-        )
+        warmup_factor = self._sparsity_warmup_factor()
+        cluster_weight = self._base_l0_cluster_weight * warmup_factor
+        inter_weight = self._base_l0_inter_weight * warmup_factor
+        self.l0_cluster_weight = cluster_weight
+        self.l0_inter_weight = inter_weight
+        sparsity_loss = cluster_weight * cluster_l0 + inter_weight * inter_l0
 
         effective_assignments = assignments[real_mask]
         if effective_assignments.numel() == 0:
@@ -984,14 +1362,20 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         assignment_probs = effective_assignments.clamp_min(self.entropy_eps)
         num_graphs = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 1
         # Compute entropy per graph so small graphs don't dominate regularizer.
-        entropy_per_node = (assignment_probs * assignment_probs.log()).sum(dim=1)
+        entropy_per_node = -(
+            assignment_probs * assignment_probs.log().clamp_min(-1e3)
+        ).sum(dim=1)
         entropy_graph = _per_graph_mean(
             entropy_per_node,
             batch_vec[real_mask],
             num_graphs,
             eps=self.entropy_eps,
         )
-        entropy_loss = self.entropy_weight * entropy_graph.mean()
+        # Keep per-graph entropy above the target floor so assignments remain diverse.
+        entropy_loss = (
+            self.entropy_weight
+            * F.relu(self.assignment_entropy_floor - entropy_graph).mean()
+        )
 
         cluster_usage = assignment_probs.mean(dim=0)
         dirichlet_loss = (
@@ -1001,6 +1385,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
                 * torch.log(cluster_usage.clamp_min(self.entropy_eps))
             ).sum()
         )
+        self._revive_dead_clusters(gate_sample, cluster_usage)
 
         if node_embeddings is None or node_embeddings.numel() == 0:
             embedding_norm_loss = assignments.new_tensor(0.0)
@@ -1051,6 +1436,10 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             latent_mean = graph_mean.detach()
             latent_var = graph_var.detach()
 
+        degree_penalty, degree_corr = self._degree_orthogonal_penalty(
+            edge_index, node_embeddings, real_mask
+        )
+
         consistency_loss, overlap_count = self._memory_consistency_loss(
             node_ids_list, node_embeddings, real_mask
         )
@@ -1063,6 +1452,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             + embedding_norm_loss
             + kld_loss
             + consistency_loss
+            + gate_entropy_loss
+            + degree_penalty
         )
 
         self._update_memory_bank(node_ids_list, node_embeddings, real_mask)
@@ -1076,7 +1467,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             "cluster_gate_sample": gate_sample.detach(),
             "inter_gate_sample": dec_info["inter_gate_sample"],
             "entropy_loss": entropy_loss.detach(),
-            "assignment_entropy": (-entropy_graph.mean()).detach(),
+            "assignment_entropy": entropy_graph.mean().detach(),
             "dirichlet_loss": dirichlet_loss.detach(),
             "embedding_norm_loss": embedding_norm_loss.detach(),
             "kld_loss": kld_loss.detach(),
@@ -1090,9 +1481,20 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             "graph_entropy": entropy_graph.detach(),
             "graph_embedding_norm": embedding_norm_graph.detach(),
             "graph_kld": kld_per_graph.detach(),
+            "gate_entropy_loss": gate_entropy_loss.detach(),
+            "gate_entropy_bits": gate_entropy_bits.detach(),
+            "sparsity_warmup_factor": torch.tensor(
+                warmup_factor, device=assignments.device
+            ),
+            "degree_penalty": degree_penalty.detach(),
+            "degree_correlation_sq": degree_corr.detach(),
         }
+        if neg_conf_weight is not None:
+            metrics["negative_confidence_weight"] = neg_conf_weight.detach()
         metrics.update({k: v for k, v in dec_info.items() if "loss" in k})
         metrics["graph_edge_loss"] = dec_info.get("graph_losses")
+        if self.training:
+            self._global_step += 1
         return total_loss, assignments, metrics
 
     @staticmethod
@@ -1314,195 +1716,6 @@ class GraphDeconvNet(MessagePassing):
     def update(self, aggr_out: torch.Tensor) -> torch.Tensor:
         # optional nonlinearity
         return F.relu(aggr_out)
-
-
-class GraphDecoder(nn.Module):
-    """
-    Recurrent generation + GDN refinement.
-    1) Recurrently generate node embeddings & edges (GraphRNN style).
-    2) Refine embeddings via Graph Deconvolutional Nets (GDNs).
-    """
-
-    def __init__(
-        self,
-        num_node_types: int,
-        latent_dim: int,
-        shared_attr_vocab: SharedAttributeVocab,
-        hidden_dim: int = 128,
-        gdn_layers: int = 2,
-    ):
-        super().__init__()
-        self.shared_attr_vocab = shared_attr_vocab
-        self.latent_dim = latent_dim
-        # — map latent → initial Node‐RNN state
-        self.node_hidden_state_init = nn.Linear(latent_dim, hidden_dim)
-
-        # — Node‐RNN (no input, only hidden evolves)
-        self.node_rnn = nn.GRUCell(input_size=0, hidden_size=hidden_dim)
-        self.stop_head = nn.Linear(hidden_dim, 1)
-        self.node_head = nn.Linear(hidden_dim, hidden_dim)
-        self.type_head = nn.Linear(hidden_dim, num_node_types)
-        self.edge_rnn = nn.GRUCell(input_size=1, hidden_size=hidden_dim)
-        self.edge_head = nn.Linear(hidden_dim, 1)
-
-        self.attr_type_rnn = nn.GRU(input_size=1, hidden_size=hidden_dim)
-        self.attr_type_head = nn.Linear(hidden_dim, 1)
-        self.attr_name_rnn = nn.GRU(input_size=1, hidden_size=hidden_dim)
-        self.attr_name_head = nn.Linear(
-            hidden_dim, shared_attr_vocab.embedding.embedding_dim
-        )
-        self.attr_dims_head = nn.Linear(
-            hidden_dim, 1
-        )  # determine num dimensions per attr
-        self.attr_val_rnn = nn.GRU(input_size=1, hidden_size=hidden_dim)
-        self.attr_val_head = nn.Linear(
-            hidden_dim, 1
-        )  # extract value per attr dimension
-
-        # — GraphDeconvNet stack (learned spectral decoders)
-        self.gdns = nn.ModuleList(
-            [GraphDeconvNet(hidden_dim, hidden_dim) for _ in range(gdn_layers)]
-        )
-        self.max_nodes = 1000
-        self.max_attributes_per_node = 50
-
-    def forward(self, latent):
-        """
-        (num_graphs, latent_dim)
-        returns: list of graphs, each {'node_types': LongTensor[1, N],
-                                       'node_attributes': List[{name: attribute_value} x N],
-                                       'edge_index': LongTensor[2, E]}
-        """
-        device = latent.device
-        all_graphs = []
-
-        for l in range(latent.size(0)):
-            hidden_node = F.relu(self.node_hidden_state_init(latent[l])).unsqueeze(
-                0
-            )  # (hidden_dim,)
-            node_embeddings = []
-            edges = []
-            node_types = []
-            t = 0
-            while True:
-                if t > self.max_nodes:
-                    warn("max nodes reached")
-                    break
-                hidden_node = self.node_rnn(
-                    torch.zeros(hidden_node.shape[0], 0, device=device), hidden_node
-                )
-
-                # clamp for precision errors
-                p_stop = 1 - torch.sigmoid(self.stop_head(hidden_node))
-                p_stop = torch.nan_to_num(p_stop, nan=1.0).clamp(0.0, 1.0)
-                if torch.bernoulli(p_stop).item() == 0:
-                    break
-                new_node = self.node_head(hidden_node).squeeze(0)
-                node_embeddings.append(new_node)
-                node_types.append(
-                    self.type_head(new_node).argmax(dim=-1).cpu().tolist()
-                )
-
-                # edge generation to previous nodes
-                hidden_edge = hidden_node
-                edge_in = torch.zeros(1, 1, device=device)
-                for i in range(t):
-                    hidden_edge = self.edge_rnn(edge_in, hidden_edge)
-                    p_edge = torch.sigmoid(self.edge_head(hidden_edge)).view(-1)
-                    p_edge = torch.nan_to_num(p_edge, nan=0.0).clamp(0.0, 1.0)
-                    if torch.bernoulli(p_edge).item() == 1:
-                        edges.append([i, t])
-                    edge_in = p_edge.unsqueeze(0)
-                t += 1
-
-            if node_embeddings:
-                node_embeddings = torch.stack(node_embeddings, dim=0)
-                edges = torch.tensor(edges, dtype=torch.long).t().contiguous()
-            else:
-                node_embeddings = torch.zeros(
-                    (0, self.node_head.out_features), device=device
-                )
-                edges = torch.zeros((2, 0), dtype=torch.long, device=device)
-
-            # refine via graph deconvolution
-            for gdn in self.gdns:
-                node_embeddings = gdn(edges, node_embeddings)
-
-            node_attributes = []
-            for embedding in node_embeddings:
-                attrs = {}
-                name_hidden = embedding.unsqueeze(0)
-                val_hidden = None
-                t = 0
-                while True:
-                    if t > self.max_attributes_per_node:
-                        warn("max attributes per node reached")
-                        break
-                    name_input = torch.zeros(1, 1, device=device)
-                    name_out, name_hidden = self.attr_name_rnn(name_input, name_hidden)
-                    similarity_logits = torch.matmul(
-                        self.shared_attr_vocab.embedding.weight,  # [vocab_size, embedding_dim]
-                        self.attr_name_head(name_out).squeeze(
-                            0
-                        ),  # query vector [embedding_dim]
-                    )
-                    name_index = int(similarity_logits.argmax().item())
-                    if name_index == self.shared_attr_vocab.name_to_index["<EOS>"]:
-                        break
-                    elif name_index == self.shared_attr_vocab.name_to_index["<UNK>"]:
-                        name_index = len(self.shared_attr_vocab.name_to_index)
-                        name = generate_random_string(
-                            8
-                        )  # TODO: change this to the true attribute name
-                        self.shared_attr_vocab.name_to_index[name] = name_index
-                        self.shared_attr_vocab.index_to_name[name_index] = name
-                    else:
-                        name = self.shared_attr_vocab.index_to_name[name_index]
-
-                    attr_dims = max(
-                        1,
-                        int(
-                            math.ceil(F.softplus(self.attr_dims_head(embedding)).item())
-                        ),
-                    )
-                    values = []
-                    value_hidden = embedding.unsqueeze(0).unsqueeze(1)
-                    value_input = torch.zeros(1, 1, 1, device=device)
-                    for _ in range(attr_dims):
-                        value_out, value_hidden = self.attr_val_rnn(
-                            value_input, value_hidden
-                        )
-                        v = self.attr_val_head(value_out).view(-1)
-                        values.append(v)
-                        value_input = v.unsqueeze(0).unsqueeze(-1)
-                    if name in attrs:
-                        warn(name + " is already defined for currently decoding node")
-                    attrs[name] = torch.stack(values)
-                    t += 1
-                node_attributes.append(attrs)
-            all_graphs.append(
-                {
-                    "node_types": torch.as_tensor(node_types),
-                    "node_attributes": node_attributes,
-                    "edge_index": edges,
-                }
-            )
-        return all_graphs
-
-    def prune_latent_dims(self, kept_idx: torch.LongTensor):
-        """
-        Permanently remove unused latent dimensions from the node_hidden_state_init layer.
-        kept_idx: 1D LongTensor of indices to keep from the original latent vector.
-        """
-        device = self.node_hidden_state_init.weight.device
-        new_node_hidden_state_init = nn.Linear(
-            kept_idx.numel(), self.node_hidden_state_init.out_features, bias=True
-        ).to(device)
-        new_node_hidden_state_init.weight.data.copy_(old.weight.data[:, kept_idx])
-
-        new_node_hidden_state_init.bias.data.copy_(old.bias.data)
-        self.node_hidden_state_init = new_node_hidden_state_init
-        self.latent_dim = kept_idx.numel()
 
 
 class SizeBucketBatchSampler(Sampler[List[int]]):
