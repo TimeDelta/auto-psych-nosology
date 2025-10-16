@@ -881,6 +881,58 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         relation_reweight_power: float = 0.5,
         enable_relation_reweighting: bool = True,
     ) -> None:
+        """
+        Args:
+            num_node_types: Cardinality of the node-type embedding table.
+            attr_encoder: Shared attribute encoder returning per-node feature vectors.
+            num_clusters: Number of latent clusters/gates to learn.
+            num_relations: Count of observed edge types in the multiplex graph.
+            hidden_dims: Hidden dimensions for stacked RGCN layers.
+            type_embedding_dim: Optional override for the node-type embedding size.
+            dropout: Feature dropout applied after each RGCN layer.
+            negative_sampling_ratio: Target ratio of negatives per positive edge.
+            l0_cluster_weight: Base weight on the encoder cluster gate L0 penalty.
+            l0_inter_weight: Base weight on decoder inter-cluster gate sparsity.
+            entropy_weight: Strength of the per-graph assignment entropy floor.
+            dirichlet_alpha: Parameters of the Dirichlet prior on cluster usage.
+            dirichlet_weight: Scaling on the Dirichlet log-likelihood term.
+            embedding_norm_weight: Weight on per-graph latent L2 norms.
+            kld_weight: Variational penalty encouraging per-graph latent Gaussianity.
+            entropy_eps: Numerical epsilon for entropy- and norm-related clamps.
+            positional_dim: Count of positional-encoding features appended to inputs.
+            assignment_temperature: Final temperature for Sinkhorn-balanced assignments.
+            sinkhorn_iterations: Number of Sinkhorn normalisation steps per batch.
+            sinkhorn_epsilon: Stabiliser used inside the Sinkhorn log-space updates.
+            prototype_momentum: EMA coefficient for updating assignment prototypes.
+            restrict_negatives_to_types: If True, negatives are sampled within type buckets.
+            consistency_weight: Weight for memory-bank consistency across batches.
+            memory_bank_momentum: EMA factor for stored node embeddings.
+            memory_bank_max_size: Maximum number of node embeddings kept in memory bank.
+            use_virtual_node: Whether to inject a lightweight virtual node per graph.
+            virtual_node_weight: Mix-in weight for virtual-node context features.
+            sparsity_warmup_steps: Steps to ramp L0 penalties from zero to target weight.
+            gate_temperature_start: Starting temperature for hard-concrete gates.
+            gate_temperature_end: Final temperature reached after annealing.
+            gate_temperature_anneal_steps: Steps over which gate temperature anneals.
+            gate_stretch_epsilon: Stretch magnitude applied to hard-concrete bounds.
+            gate_pre_activation_clip: Clamp applied to gate pre-activations for stability.
+            assignment_temperature_start: Starting temperature for prototype assignments.
+            assignment_temperature_anneal_steps: Steps for assignment temperature anneal.
+            gate_entropy_floor_bits: Minimum desired gate entropy (bits) before penalising collapse.
+            gate_entropy_weight: Strength of the gate entropy floor penalty.
+            assignment_entropy_floor: Per-graph entropy floor for assignments (defaults to log K).
+            neg_entropy_scale: Multiplier linking gate entropy to negative-weight scaling.
+            neg_entropy_min_bits: Minimum entropy denominator used in the negative reweight term.
+            neg_entropy_max_weight: Upper bound on entropy-derived negative weights.
+            ema_gate_decay: EMA decay applied when smoothing stochastic gate samples.
+            revival_gate_threshold: Threshold below which gates are considered inactive.
+            revival_usage_threshold: Usage level needed to resurrect inactive gates.
+            dropedge_rate: Probability of dropping an edge during training (DropEdge).
+            degree_dropout_rate: Degree-proportional dropout rate for hub mitigation.
+            degree_decorrelation_weight: Weight on the penalty forcing latents to decorrelate from log degree.
+            relation_reweight_power: Power-law for relation frequency reweighting.
+            enable_relation_reweighting: Enables inverse-frequency reweighting when True.
+        """
         super().__init__()
         base_gate_temperature = 2.0 / 3.0
         gate_temp_target = (
