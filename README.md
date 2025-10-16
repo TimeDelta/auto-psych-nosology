@@ -12,6 +12,8 @@
     - [Graph Creation](#graph-creation)
     - [Preventing Biased Alignment](#preventing-biased-alignment)
     - [Partitioning](#partitioning)
+        - [Encoder Architecture](#encoder-architecture)
+        - [Decoder Architecture](#decoder-architecture)
         - [Preventing Trivial / Degenerate Solutions](#preventing-trivial--degenerate-solutions)
         - [Adaptive Subgraph Sampling to Mitigate Overfitting](#adaptive-subgraph-sampling-to-mitigate-overfitting)
         - [Comparison](#comparison)
@@ -150,9 +152,53 @@ A single decoder conditioned on relation embeddings would instead force all rela
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
 The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
 
+#### Encoder Architecture
+The encoder is designed to fuse heterogeneous node evidence into a size-robust latent representation suitable for subsequent sparsification.
+Each node is first endowed with a permutation-invariant semantic descriptor obtained from a DeepSete node attribute encoder, which implements the Zaheer et al. $\phi/\rho$ formulation.
+This component admits arbitrarily structured metadata and expands its vocabulary online, ensuring that newly mined attributes can be assimilated without retraining embeddings from scratch.
+
+The semantic descriptors are concatenated with two additional signals: (i) a learned node-type embedding that preserves categorical identity while remaining compact enough to avoid over-parameterization, and (ii) graph-aware positional embeddings derived from standardized Laplacian eigenvectors when available.
+The latter are normalized per graph to prevent variance inflation when mini-batches mix subgraphs of widely differing order.
+
+Relation-aware message passing is effected through a stack of graph convolutional layers equipped with basis decomposition across relation types.
+Each layer is followed by either `GraphNorm` (the default choice, given its empirical stability on highly unbalanced batch compositions) or `LayerNorm`, a ReLU nonlinearity, and optional dropout.
+The stack yields node embeddings that remain well-conditioned across sampling regimes, and the module returns both the embeddings and auxiliary bookkeeping tensors (e.g., batch indices) that downstream Sinkhorn balancing and gate sampling procedures consume to form temperature-controlled cluster assignment matrices.
+
+#### Decoder Architecture
+To improve expressivity while maintaining the strict size- and permutation-invariance required for subgraph-level training, the rGCN-SCAE decoder was designed using a **Deep Sets–style relational energy function** [21], [22].
+Unlike bilinear or message-passing decoders, which respectively underfit or introduce graph-size dependence, this formulation learns an invariant nonlinear mapping between pairs of latent embeddings and their relation type.
+
+Mathematically, for any relation type r and node pair (i,j):
+
+$$
+\hat{A}^{(r)}_{ij} =
+\sigma\!\Big(
+  W_o \,
+  \rho\!\Big(
+     \sum_{x \in \{\,z_i,\,z_j,\,e_r\,\}}
+     \phi(x)
+  \Big)
+\Big),
+$$
+
+where:
+- $(z_i, z_j \in \mathbb{R}^d)$ are latent node embeddings produced by the encoder,
+- $e_r$ is the learned embedding of relation type r,
+- $\phi(\cdot)$ projects each element into a shared latent space,
+- the summation (or mean) enforces permutation-invariance over the set $\{z_i,z_j,e_r\}$,
+- $\rho(\cdot)$ is a small multilayer perceptron mapping the pooled vector to a scalar edge energy,
+- $W_o$ is a linear projection converting that energy to a logit, and
+- $\sigma(\cdot)$ is the sigmoid function mapping logits to edge probabilities.
+
+This construction ensures identical edge likelihoods regardless of node ordering and independence from batch size or subgraph composition.
+Implementation-wise, the decoder consists of two shared MLPs with hidden width 128–256 and ReLU activations.
+A relation embedding table provides $e_r$ for each edge type.
+Because the entire function operates on latent vectors rather than adjacency statistics, the reconstruction loss remains strictly size-invariant.
+This Deep Sets–based architecture preserves efficiency and stability for contrastive training while providing sufficient capacity to model relation-specific nonlinearities and higher-order dependencies.
+
 #### Preventing Trivial / Degenerate Solutions
 Five primary forms of degenerate or trivial solutions are guarded against in this model: uniform embeddings, local collapse, global collapse, decoder memorization, and latent drift.
-AAbsent-edge modeling via negative sampling penalizes trivial solutions such as uniform embeddings that would otherwise predict every node pair as connected.
+Absent-edge modeling via negative sampling penalizes trivial solutions such as uniform embeddings that would otherwise predict every node pair as connected.
 The decoder explicitly contrasts observed edges with sampled non-edges drawn within each subgraph, forcing the model to assign distinct embeddings that separate real from spurious connections.
 That means clusters that lump everything together will get penalized because they will incorrectly predict connections between random node pairs that are not actually linked.
 Mathematically, this is an additional loss term for each relation type:
@@ -251,7 +297,7 @@ To mitigate this, a dataset was be created with different subgraphs sampled via 
 For each seed s, a composite score $g(s) = z(c_s) + z(\kappa_s) - z(\deg_s)$ to select a hop radius $r(s) = \mathrm{clamp}_{[1,3]}(1 + \alpha g(s))$, encouraging larger neighborhoods in sparse or weakly clustered regions and smaller ones near dense hubs.
 
 | Symbol                          | Meaning                                                                       | Notes                                                                                                                                                                                      |
-| :------------------------------ | :---------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | $s$                             | The **seed node** from which the local subgraph (ego-net) is grown.           | Chosen randomly, optionally stratified by node degree or type.                                                                                                                             |
 | $c_s$                           | The **local clustering coefficient** of node s.                               | Measures how interconnected $s$’s neighbors are. In undirected projection form:$c_s = \frac{2T_s}{k_s(k_s-1)}$, where $T_s$ = number of triangles through s.                         |
 | $\kappa_s$                      | The **k-core index** (or **core number**) of node s.                          | Largest integer k such that s belongs to the k-core subgraph (all nodes with degree ≥ k). Reflects local structural “embeddedness.”                                                  |
@@ -310,3 +356,5 @@ The two approaches are treated as triangulating evidence: concordant structure a
 1. D. Drysdale et al., “Resting-state connectivity biomarkers define neurophysiological subtypes of depression,” Nat. Med., vol. 23, pp. 28–38, 2017.
 1. T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership stochastic blockmodels for multiple networks and experimental interventions,” in Handbook of Mixed Membership Models and Their Applications, E. Airoldi, D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman & Hall/CRC Press, 2014, pp. 463–488.
 1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
+1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
+1. C. Feinauer and C. Lucibello, “Reconstruction of Pairwise Interactions Using Energy-Based Models,” in Proc. Mach. Learn. Res., vol. 145, 2022, pp. 1–17.
