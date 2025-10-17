@@ -200,8 +200,8 @@ def _stanza_ner_packages() -> List[str]:
     else:
         packages.extend(
             [
-                "bc5cdr",
-                "jnlpba",
+                # "bc5cdr",
+                # "jnlpba",
             ]
         )
     return dedupe_preserve_order(packages)
@@ -258,10 +258,10 @@ class ExtractionConfig:
         default_factory=lambda: os.getenv("SPACY_BIOMED_MODEL", "en_core_sci_sm")
     )
     enable_ontology_filter: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_ONTOLOGY_FILTER", "0") != "0"
+        default_factory=lambda: os.getenv("ENABLE_ONTOLOGY_FILTER", "1") != "0"
     )
     ontology_min_score: float = field(
-        default_factory=lambda: float(os.getenv("ONTOLOGY_MIN_SCORE", "0.5"))
+        default_factory=lambda: float(os.getenv("ONTOLOGY_MIN_SCORE", "0.75"))
     )
     spacy_linker_name: str = field(
         default_factory=lambda: os.getenv("SPACY_LINKER_NAME", "umls_context")
@@ -518,7 +518,10 @@ class EntityRelationExtractor:
         return node_type
 
     def categorize_entity(
-        self, label: str, kb_id: Optional[str] = None
+        self,
+        label: str,
+        kb_id: Optional[str] = None,
+        surface_hint: Optional[str] = None,
     ) -> Optional[str]:
         lbl = label.upper()
         direct_map = {
@@ -562,7 +565,151 @@ class EntityRelationExtractor:
         umls_type = self._node_type_from_umls(kb_id)
         if umls_type:
             return umls_type
+        inferred = self._infer_node_type_from_surface(surface_hint)
+        if inferred:
+            return inferred
         return None
+
+    def _infer_node_type_from_surface(self, surface: Optional[str]) -> Optional[str]:
+        if not surface:
+            return None
+        text = surface.strip().lower()
+        if not text:
+            return None
+        tokens = re.findall(r"[a-z]+", text)
+        token_set = set(tokens)
+
+        def contains(keywords: Iterable[str]) -> bool:
+            return any(keyword in text or keyword in token_set for keyword in keywords)
+
+        diagnosis_keywords = {
+            "disorder",
+            "syndrome",
+            "disease",
+            "diagnosis",
+            "condition",
+            "illness",
+            "psychosis",
+        }
+        treatment_keywords = {
+            "therapy",
+            "treatment",
+            "medication",
+            "drug",
+            "pharmac",
+            "intervention",
+            "ssri",
+            "antidepressant",
+        }
+        symptom_keywords = {
+            "symptom",
+            "pain",
+            "anxiety",
+            "anxious",
+            "depress",
+            "mania",
+            "manic",
+            "fatigue",
+            "insomnia",
+            "hallucination",
+            "stress",
+            "trauma",
+            "fear",
+        }
+        measure_keywords = {
+            "scale",
+            "questionnaire",
+            "inventory",
+            "survey",
+            "assessment",
+            "score",
+            "index",
+            "instrument",
+        }
+        biomarker_keywords = {
+            "biomarker",
+            "gene",
+            "protein",
+            "rna",
+            "dna",
+            "marker",
+            "cytokine",
+            "enzyme",
+        }
+
+        if (
+            contains(measure_keywords)
+            or text.endswith(" scale")
+            or text.endswith(" inventory")
+        ):
+            return "Measure"
+        if contains(treatment_keywords) or text.endswith(" therapy"):
+            return "Treatment"
+        if contains(diagnosis_keywords) or text.endswith(" disorder"):
+            return "Diagnosis"
+        if contains(symptom_keywords):
+            return "Symptom"
+        if contains(biomarker_keywords):
+            return "Biomarker"
+        if any(ch.isalpha() for ch in text):
+            return "Symptom"
+        return None
+
+    def _fallback_chunk_entities(self, text: str) -> List[Dict[str, Any]]:
+        matches = list(re.finditer(r"[A-Za-z][A-Za-z'’\-]*", text))
+        if not matches:
+            return []
+        words = [(m.group(), m.start(), m.end()) for m in matches]
+        max_window = 5
+        used_spans: List[Tuple[int, int]] = []
+        fallback_entities: List[Dict[str, Any]] = []
+
+        def span_overlaps(start: int, end: int) -> bool:
+            for s, e in used_spans:
+                if start < e and end > s:
+                    return True
+            return False
+
+        for window in range(max_window, 0, -1):
+            i = 0
+            while i <= len(words) - window:
+                span_start = words[i][1]
+                span_end = words[i + window - 1][2]
+                if span_overlaps(span_start, span_end):
+                    i += 1
+                    continue
+                surface = clean_entity_surface(text[span_start:span_end])
+                if not surface:
+                    i += 1
+                    continue
+                tokens = [token for token, _, _ in words[i : i + window]]
+                if not self._passes_entity_heuristics(surface, tokens, []):
+                    i += 1
+                    continue
+                node_type = self.categorize_entity("ENTITY", None, surface_hint=surface)
+                if not node_type:
+                    i += 1
+                    continue
+                used_spans.append((span_start, span_end))
+                fallback_entities.append(
+                    {
+                        "start": span_start,
+                        "end": span_end,
+                        "entity_group": node_type,
+                        "word": surface,
+                        "source_package": "fallback:surface",
+                        "lemma": surface,
+                        "upos": [],
+                        "xpos": [],
+                        "tokens": tokens,
+                        "coref_antecedent": None,
+                        "canonical_key": canonical_entity_key(surface),
+                        "ontology_score": None,
+                        "kb_id": None,
+                    }
+                )
+                i += window
+        return fallback_entities
 
     def _relation_allowed_for_types(
         self, predicate: str, subj_type: str, obj_type: str
@@ -1107,6 +1254,20 @@ class EntityRelationExtractor:
                     seen_spans.add(key)
                     results.append(entry)
 
+        if not results:
+            fallback = self._fallback_chunk_entities(text)
+            for entry in fallback:
+                key = (
+                    entry.get("start"),
+                    entry.get("end"),
+                    entry.get("entity_group"),
+                    entry.get("source_package"),
+                )
+                if key in seen_spans:
+                    continue
+                seen_spans.add(key)
+                results.append(entry)
+
         return results
 
     def extract(self, meta: Dict[str, Any], text: str) -> Optional[PaperExtraction]:
@@ -1209,7 +1370,11 @@ class EntityRelationExtractor:
                     continue
             record = entities.get(canonical_key)
             if record is None:
-                node_type = self.categorize_entity(label, ent.get("kb_id"))
+                node_type = self.categorize_entity(
+                    label,
+                    ent.get("kb_id"),
+                    surface_hint=lemma_source,
+                )
                 if not node_type:
                     continue
                 record = NodeRecord(
