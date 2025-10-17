@@ -1,1581 +1,707 @@
-"""Entity and relation extraction using Stanza NER and a biomedical NLI model."""
+"""BioMedKG ingestion and psychiatric subgraph extraction utilities."""
 
 from __future__ import annotations
 
+import json
 import logging
-import os
 import re
-import threading
-import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence
 
-import spacy
-import stanza
-import torch
-from nltk.tokenize import sent_tokenize
-from scispacy.linking import EntityLinker
-from spacy.lang.en.stop_words import STOP_WORDS as _SPACY_STOP_WORDS
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import networkx as nx
+import polars as pl
 
-from models import (
-    EVIDENCE_RELATIONS,
-    ClaimDescriptor,
-    NodeRecord,
-    PaperExtraction,
-    RelationRecord,
-)
-from text_normalization import (
-    canonical_entity_display,
-    canonical_entity_key,
-    clean_entity_surface,
-    dedupe_preserve_order,
+from psychiatry_scoring import (
+    PsychiatricRelevanceScorer,
+    PsychiatricScoringConfig,
+    build_default_scoring_config,
 )
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-_LOG_LEVEL_NAME = os.getenv("AUTO_PSYCH_LOG_LEVEL", "INFO").strip().upper()
-logger.setLevel(getattr(logging, _LOG_LEVEL_NAME, logging.INFO))
-logging.getLogger("stanza").setLevel(logging.INFO)
-
-
-def _log_step_duration(
-    step: str,
-    start_time: float,
-    *,
-    paper: Optional[str] = None,
-    details: Optional[str] = None,
-) -> None:
-    elapsed = time.perf_counter() - start_time
-    detail_suffix = f" ({details})" if details else ""
-    if paper:
-        logger.debug(
-            "[timing] %s completed in %.3f seconds for %s%s",
-            step,
-            elapsed,
-            paper,
-            detail_suffix,
-        )
-    else:
-        logger.debug(
-            "[timing] %s completed in %.3f seconds%s",
-            step,
-            elapsed,
-            detail_suffix,
-        )
-
-
-RELATION_ROLE_CONSTRAINTS: Dict[str, Dict[str, Set[str]]] = {
-    "treats": {"subject": {"Treatment"}, "object": {"Diagnosis", "Symptom"}},
-    "biomarker_for": {"subject": {"Biomarker"}, "object": {"Diagnosis", "Symptom"}},
-    "measure_of": {"subject": {"Measure"}, "object": {"Diagnosis", "Symptom"}},
-    "predicts": {
-        "subject": {"Biomarker", "Measure", "Symptom"},
-        "object": {"Diagnosis", "Symptom"},
-    },
-}
-
-_FALLBACK_RELATION_RULES: Tuple[Tuple[Set[str], Set[str], str], ...] = (
-    ({"Treatment"}, {"Diagnosis", "Symptom"}, "treats"),
-    ({"Biomarker"}, {"Diagnosis", "Symptom"}, "biomarker_for"),
-    ({"Measure"}, {"Diagnosis", "Symptom"}, "measure_of"),
-    ({"Symptom"}, {"Diagnosis", "Symptom"}, "predicts"),
+_DEFAULT_PATTERNS: tuple[str, ...] = (
+    r"(?i)psychi",
+    r"(?i)mental",
+    r"(?i)depress",
+    r"(?i)bipolar",
+    r"(?i)schizo",
+    r"(?i)anxiety",
+    r"(?i)adhd",
+    r"(?i)attention deficit",
+    r"(?i)autism",
+    r"(?i)asperger",
+    r"(?i)obsessive(?:-)?compulsive",
+    r"(?i)ocd",
+    r"(?i)post[- ]traumatic",
+    r"(?i)ptsd",
+    r"(?i)mood disorder",
+    r"(?i)personality disorder",
+    r"(?i)eating disorder",
+    r"(?i)suicid",
+    r"(?i)panic disorder",
+    r"(?i)psychosis",
 )
 
-# recognized named entities lemmatized before check
-_GENERIC_SPAN_BLOCKLIST_DEFAULT = [
-    "adverse effect",
-    "side effect",
-    "brain organoid",
-    "product",
-    "treatment",
-    "problem",
-    "study",
-    "this study",
-    "the symptom description",
-    "symptom description",
-    "the brain",
-    "brain",
-    "the chasm",
-    "patient",
-    "control",
-    "participant",
-    "subject",
-    "human",
-    "donor",
-    "disease relevant cell",
-    "efficacy of compound",
-    "Medium to large effect size",
-    "The open access option",
-    "Randomization in step",
-    "CRISPR",
-    "cell",
-    "clinical practice set",
-    "learn algorithm",
-    "collect datum",
-    "it customize hardware",
-    "very low probability",
-    "adaptive trial design",
-    "illness",
-    "disorder",
-    "symptom",
-]
-
-_UMLS_SEMANTIC_TYPE_TO_NODE: Dict[str, str] = {
-    # Symptom-centric semantic types
-    "T184": "Symptom",  # Sign or Symptom
-    "T033": "Symptom",  # Finding
-    "T041": "Symptom",  # Mental Process
-    "T048": "Symptom",  # Mental or Behavioral Dysfunction
-    # Broader clinical condition types to prevent dropping key entities
-    "T047": "Diagnosis",  # Disease or Syndrome
-    "T046": "Diagnosis",  # Pathologic Function
-    "T191": "Diagnosis",  # Neoplastic Process
-    # Treatment-oriented semantic types
-    "T061": "Treatment",  # Therapeutic or Preventive Procedure
-    "T200": "Treatment",  # Clinical Drug
-    "T121": "Treatment",  # Pharmacologic Substance
-    # Biomarker / biological entity types
-    "T123": "Biomarker",  # Biologically Active Substance
-    "T109": "Biomarker",  # Organic Chemical
-    "T126": "Biomarker",  # Enzyme
-    "T127": "Biomarker",  # Vitamin
+_DEFAULT_RELATION_CONSTRAINTS: dict[str, tuple[set[str], set[str]]] = {
+    "drug_disease": ({"drug"}, {"disease"}),
+    "disease_drug": ({"disease"}, {"drug"}),
+    "disease_gene": ({"disease"}, {"gene", "protein", "gene/protein"}),
+    "gene_disease": ({"gene", "protein", "gene/protein"}, {"disease"}),
+    "drug_gene": ({"drug"}, {"gene", "protein", "gene/protein"}),
+    "gene_drug": ({"gene", "protein", "gene/protein"}, {"drug"}),
+    "drug_sideeffect": ({"drug"}, {"sideeffect", "symptom"}),
+    "sideeffect_drug": ({"sideeffect", "symptom"}, {"drug"}),
 }
 
 
-def _build_span_blocklist() -> Set[str]:
-    base_terms: Set[str] = set(_GENERIC_SPAN_BLOCKLIST_DEFAULT)
-    extra_sources = (os.getenv("NER_GENERIC_SPAN_BLOCKLIST"),)
-    for source in extra_sources:
-        if not source:
-            continue
-        base_terms.update(part.strip() for part in source.split(",") if part.strip())
-
-    blocklist: Set[str] = set()
-    for term in base_terms:
-        lower = term.lower()
-        if lower:
-            blocklist.add(lower)
-        canonical = canonical_entity_key(term)
-        if canonical:
-            blocklist.add(canonical)
-    return blocklist
+def _truncate_text(expr: pl.Expr, limit: int, *, alias: str) -> pl.Expr:
+    return (
+        pl.when(expr.is_null())
+        .then(pl.lit(None))
+        .otherwise(expr.cast(pl.Utf8).str.slice(0, limit))
+        .alias(alias)
+    )
 
 
-_RELATION_MODE = "nli"
-_NLI_MODEL_NAME = "pritamdeka/PubMedBERT-MNLI-MedNLI"
-_SUBSTANTIVE_REL_TEMPLATES = {
-    "treats": "{SUBJ} treats {OBJ}.",
-    "biomarker_for": "{SUBJ} is a biomarker for {OBJ}.",
-    "measure_of": "{SUBJ} is a measure of {OBJ}.",
-    "predicts": "{SUBJ} predicts {OBJ}.",
-}
-_SUBSTANTIVE_REL_TEMPLATES_REV = {
-    "treats": "{OBJ} treats {SUBJ}.",
-    "biomarker_for": "{OBJ} is a biomarker for {SUBJ}.",
-    "measure_of": "{OBJ} is a measure of {SUBJ}.",
-    "predicts": "{OBJ} predicts {SUBJ}.",
-}
-_EVIDENCE_REL_TEMPLATES = {
-    "supports": "{SUBJ} is positively associated with {OBJ}.",
-    "contradicts": "{SUBJ} is negatively associated with {OBJ}.",
-    "replicates": "{SUBJ} replicates findings reported for {OBJ}.",
-    "null_reported": "{SUBJ} reports null findings with respect to {OBJ}.",
-}
-
-_REL_DIRECTION_PENALTY = float(os.getenv("RELATION_NLI_REVERSE_PENALTY", "0.5"))
-_REL_SCORE_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_SCORE", "0.05"))
-_REL_MARGIN_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_MARGIN", "0.04"))
-_REL_ENTAILMENT_THRESHOLD = float(os.getenv("RELATION_NLI_MIN_ENT", "0.6"))
-_REL_REVERSE_GAP = float(os.getenv("RELATION_NLI_REVERSE_GAP", "0.05"))
-
-
-def _stanza_ner_packages() -> List[str]:
-    packages: List[str] = []
-
-    configured = os.getenv("STANZA_NER_PACKAGES", "").strip()
-    if configured:
-        packages.extend(pkg.strip() for pkg in configured.split("|") if pkg.strip())
-    else:
-        packages.extend(
-            [
-                "bc5cdr",
-                "jnlpba",
-            ]
-        )
-    return dedupe_preserve_order(packages)
-
-
-@dataclass
-class NliScores:
-    entailment: float
-    neutral: float
-    contradiction: float
-
-    @property
-    def signal(self) -> float:
-        return self.entailment - self.contradiction
-
-
-@dataclass
-class RelationInference:
-    label: str
-    entailment: float
-    score: float
-    margin: float
-    reverse_entailment: float = 0.0
+def _ensure_file(path: Path, description: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"{description} not found at {path}")
 
 
 @dataclass
 class ExtractionConfig:
-    stanza_lang: str = field(default_factory=lambda: os.getenv("STANZA_LANG", "en"))
-    stanza_processors: str = field(
-        default_factory=lambda: os.getenv(
-            "STANZA_PROCESSORS", "tokenize,mwt,pos,lemma,depparse,ner,coref"
-        )
+    """Configuration for building a psychiatric subgraph from BioMedKG."""
+
+    kg_path: Path = Path("data/primekg_kg.csv")
+    data_dir: Path = Path("data")
+    disease_features_path: Path | None = None
+    drug_features_path: Path | None = None
+    protein_features_path: Path | None = None
+    dna_features_path: Path | None = None
+    allowed_relations: set[str] | None = None
+    psychiatric_patterns: Sequence[str] = field(
+        default_factory=lambda: _DEFAULT_PATTERNS
     )
-    stanza_tokenize_pkg: str = field(
-        default_factory=lambda: os.getenv("STANZA_TOKENIZE_PACKAGE", "").strip()
-        or "default"
-    )
-    stanza_ner_packages: Sequence[str] = field(
-        default_factory=lambda: _stanza_ner_packages()
-    )
-    stanza_extra_packages: Sequence[str] = field(
-        default_factory=lambda: [
-            pkg.strip()
-            for pkg in os.getenv("STANZA_EXTRA_PACKAGES", "").split("|")
-            if pkg.strip()
-        ]
-    )
-    nli_model_name: str = _NLI_MODEL_NAME
-    relation_role_constraints: Dict[str, Dict[str, Set[str]]] = field(
-        default_factory=lambda: dict(RELATION_ROLE_CONSTRAINTS)
-    )
-    span_blocklist: Set[str] = field(default_factory=_build_span_blocklist)
-    spacy_model: Optional[str] = field(
-        default_factory=lambda: os.getenv("SPACY_BIOMED_MODEL", "en_core_sci_sm")
-    )
-    enable_ontology_filter: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_ONTOLOGY_FILTER", "0") != "0"
-    )
-    ontology_min_score: float = field(
-        default_factory=lambda: float(os.getenv("ONTOLOGY_MIN_SCORE", "0.5"))
-    )
-    spacy_linker_name: str = field(
-        default_factory=lambda: os.getenv("SPACY_LINKER_NAME", "umls_context")
-    )
-    prefilter_model_name: Optional[str] = field(
-        default_factory=lambda: (  # cross-encoder/nli-deberta-v3-base decimates recall but halves total time
-            os.getenv("REL_PREFILTER_MODEL", "").strip()
-            or None  # TODO: check other models
-        )
-    )
-    prefilter_min_score: float = field(
-        default_factory=lambda: float(os.getenv("REL_PREFILTER_MIN_SCORE", "0.55"))
-    )
-    prefilter_min_context_chars: int = field(
-        default_factory=lambda: int(os.getenv("REL_PREFILTER_MIN_CONTEXT_CHARS", "30"))
-    )
-    prefilter_hypothesis_template: str = field(
-        default_factory=lambda: os.getenv(
-            "REL_PREFILTER_TEMPLATE",
-            "{SUBJ} is biologically related to {OBJ}.",
-        )
-    )
+    metadata_truncate: int = 750
+    neighbor_hops: int = 1
+    include_reverse_edges: bool = False
+    relation_role_constraints: Mapping[
+        str, tuple[Sequence[str], Sequence[str]]
+    ] | None = None
+
+    psychiatric_mondo_ids: Sequence[str] | None = None
+    psychiatric_group_labels: Sequence[str] | None = None
+    psychiatric_drug_categories: Sequence[str] | None = None
+    psychiatric_text_prototypes: Sequence[str] | None = None
+    psychiatric_score_weights: Mapping[str, float] | None = None
+    psychiatric_score_threshold: float = 0.6
+
+    @property
+    def resolved_disease_features_path(self) -> Path:
+        if self.disease_features_path is not None:
+            return self.disease_features_path
+        return self.data_dir / "modalities" / "disease_feature_base.csv"
+
+    @property
+    def resolved_drug_features_path(self) -> Path:
+        if self.drug_features_path is not None:
+            return self.drug_features_path
+        return self.data_dir / "modalities" / "drug_feature_base.csv"
+
+    @property
+    def resolved_protein_features_path(self) -> Path:
+        if self.protein_features_path is not None:
+            return self.protein_features_path
+        return self.data_dir / "modalities" / "protein_aminoacid_sequence.csv"
+
+    @property
+    def resolved_dna_features_path(self) -> Path:
+        if self.dna_features_path is not None:
+            return self.dna_features_path
+        return self.data_dir / "modalities" / "protein_dna_sequence.csv"
 
 
 class EntityRelationExtractor:
-    def __init__(
-        self,
-        config: Optional[ExtractionConfig] = None,
-        stanza_pipelines: Optional[List[Tuple[str, "stanza.Pipeline"]]] = None,
-        nli_tokenizer=None,
-        nli_model=None,
-    ) -> None:
-        self.config = config or ExtractionConfig()
-        self._pipelines = stanza_pipelines
-        self._nli_tokenizer = nli_tokenizer
-        self._nli_model = nli_model
-        self._nli_lock = threading.Lock()
-        self._relation_type_cache: Dict[Tuple[str, str], bool] = {}
-        self._spacy_nlp = None
-        self._spacy_linker_available = False
-        self._latest_link_scores: Dict[str, float] = {}
-        self._scispacy_linker = None
-        self._umls_type_cache: Dict[str, Optional[str]] = {}
-        self._stop_words: Set[str] = set(_SPACY_STOP_WORDS)
-        self._span_blocklist = set(self.config.span_blocklist)
-        self._prefilter_model = None
-        self._prefilter_tokenizer = None
-        self._prefilter_entailment_index: Optional[int] = None
+    """Build a psychiatric-focused knowledge graph slice from BioMedKG."""
 
-    def _stanza_use_gpu(self) -> bool:
-        if os.getenv("STANZA_USE_GPU", "").strip() == "0":
-            use_gpu = False
-        else:
-            use_gpu = torch.cuda.is_available()
-        logger.debug("Stanza GPU enabled: %s", use_gpu)
-        return use_gpu
-
-    def _parse_package_spec(self, spec: str) -> Optional[Any]:
-        spec = (spec or "").strip()
-        if not spec:
-            return None
-        if any(ch in spec for ch in "=;,"):
-            cfg: Dict[str, str] = {}
-            for part in re.split(r"[;,]", spec):
-                part = part.strip()
-                if not part or "=" not in part:
-                    continue
-                key, value = part.split("=", 1)
-                cfg[key.strip()] = value.strip()
-            return cfg or None
-        return spec
-
-    def _build_stanza_package_candidates(self) -> List[Any]:
-        forced = os.getenv("STANZA_FORCE_PACKAGE", "").strip()
-        if forced:
-            parsed = self._parse_package_spec(forced)
-            candidates = [parsed] if parsed else []
-            logger.debug("Forced Stanza package candidates: %s", candidates)
-            return candidates
-
-        candidates: List[Any] = []
-        base_tokenize_pkg = self.config.stanza_tokenize_pkg
-
-        def normalize_candidate(value: Any) -> Any:
-            if isinstance(value, str):
-                return {"tokenize": base_tokenize_pkg, "ner": value}
-            if isinstance(value, dict):
-                candidate = dict(value)
-                candidate.setdefault("tokenize", base_tokenize_pkg)
-                return candidate
-            return value
-
-        for pkg in self.config.stanza_ner_packages:
-            parsed = self._parse_package_spec(pkg) if isinstance(pkg, str) else pkg
-            if not parsed:
-                continue
-            candidate = normalize_candidate(parsed)
-            if candidate not in candidates:
-                candidates.append(candidate)
-        for extra in self.config.stanza_extra_packages:
-            parsed = self._parse_package_spec(extra)
-            if not parsed:
-                continue
-            candidate = normalize_candidate(parsed)
-            if candidate not in candidates:
-                candidates.append(candidate)
-        for fallback in ("craft", "mimic"):
-            candidate = normalize_candidate(fallback)
-            if candidate not in candidates:
-                candidates.append(candidate)
-        logger.debug("Stanza package candidates: %s", candidates)
-        return candidates
-
-    def _ensure_stanza_pipelines(self) -> List[Tuple[str, "stanza.Pipeline"]]:
-        if self._pipelines is not None:
-            return self._pipelines
-        lang = self.config.stanza_lang
-        raw_processors = self.config.stanza_processors
-        if isinstance(raw_processors, str):
-            proc_parts = [
-                part.strip() for part in raw_processors.split(",") if part.strip()
-            ]
-        else:
-            proc_parts = list(raw_processors or [])
-        if "parse" in proc_parts and "depparse" not in proc_parts:
-            proc_parts = [
-                "depparse" if part == "parse" else part for part in proc_parts
-            ]
-        processors = ",".join(proc_parts)
-        pipelines: List[Tuple[str, "stanza.Pipeline"]] = []
-        for package in self._build_stanza_package_candidates():
-            pkg_display = (
-                package
-                if isinstance(package, str)
-                else ", ".join(f"{k}={v}" for k, v in package.items())
-            )
-            download_kwargs = {"processors": processors, "verbose": False}
-            try:
-                if package:
-                    download_kwargs["package"] = package
-                stanza.download(lang, **download_kwargs)
-            except Exception:
-                pass
-
-            pipeline_kwargs = {
-                "processors": processors,
-                "use_gpu": self._stanza_use_gpu(),
-                "verbose": False,
-            }
-            if package:
-                pipeline_kwargs["package"] = package
-            try:
-                pipeline = stanza.Pipeline(lang, **pipeline_kwargs)
-                pipelines.append((str(pkg_display), pipeline))
-                logger.info("Using Stanza biomedical NER package %s.", pkg_display)
-            except Exception as exc:
-                logger.warning(
-                    "Stanza package %s unavailable (%s); trying fallback.",
-                    pkg_display,
-                    exc,
-                )
-                continue
-        if not pipelines:
-            logger.error(
-                "Unable to initialise any Stanza biomedical NER package; extractions will be empty."
-            )
-        else:
-            pkg_labels = ", ".join(pkg for pkg, _ in pipelines)
-            logger.info(
-                "Finished loading %d Stanza NER pipeline(s): %s",
-                len(pipelines),
-                pkg_labels,
-            )
-        self._pipelines = pipelines
-        return self._pipelines
-
-    def _ensure_nli(self):
-        if self._nli_tokenizer is not None and self._nli_model is not None:
-            return
-        with self._nli_lock:
-            if self._nli_tokenizer is None or self._nli_model is None:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.config.nli_model_name, token=None, local_files_only=False
-                )
-                model = AutoModelForSequenceClassification.from_pretrained(
-                    self.config.nli_model_name, token=None, use_safetensors=True
-                )
-                model.eval()
-                self._nli_tokenizer = tokenizer
-                self._nli_model = model
-
-    def _nli_probs(self, premise: str, hypothesis: str) -> NliScores:
-        self._ensure_nli()
-        assert self._nli_tokenizer is not None and self._nli_model is not None
-        with torch.no_grad():
-            encoding = self._nli_tokenizer(
-                premise,
-                hypothesis,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-            logits = self._nli_model(**encoding).logits.softmax(-1)[0]
-        return NliScores(
-            entailment=float(logits[2].item()),
-            neutral=float(logits[1].item()),
-            contradiction=float(logits[0].item()),
+    def __init__(self, config: ExtractionConfig) -> None:
+        self.config = config
+        _ensure_file(self.config.kg_path, "PrimeKG edge list")
+        _ensure_file(
+            self.config.resolved_disease_features_path, "Disease modality table"
         )
-
-    def _node_type_from_umls(self, kb_id: Optional[str]) -> Optional[str]:
-        if not kb_id or not self._scispacy_linker:
-            return None
-        cached = self._umls_type_cache.get(kb_id)
-        if kb_id in self._umls_type_cache:
-            return cached
-        node_type: Optional[str] = None
-        concept = None
-        kb = getattr(self._scispacy_linker, "kb", None)
-        if kb is not None:
-            concept = getattr(kb, "cui_to_entity", {}).get(kb_id)
-            if concept is None and hasattr(kb, "get_concept"):
-                concept = kb.get_concept(kb_id)
-        concept_name = ""
-        if concept is not None:
-            concept_name = (
-                getattr(concept, "canonical_name", "")
-                or getattr(concept, "preferred_name", "")
-                or getattr(concept, "name", "")
+        if self.config.resolved_drug_features_path.exists():
+            logger.debug(
+                "Using drug features from %s", self.config.resolved_drug_features_path
             )
-            semantic_types = getattr(concept, "types", None) or getattr(
-                concept, "semantic_types", None
+        if self.config.resolved_protein_features_path.exists():
+            logger.debug(
+                "Using protein features from %s",
+                self.config.resolved_protein_features_path,
             )
-            if semantic_types:
-                for tui in semantic_types:
-                    mapped = _UMLS_SEMANTIC_TYPE_TO_NODE.get(str(tui).upper())
-                    if mapped:
-                        node_type = mapped
-                        break
-        if node_type == "Symptom" and concept_name:
-            lowered = concept_name.lower()
-            if any(
-                keyword in lowered
-                for keyword in (
-                    "disorder",
-                    "disorders",
-                    "disease",
-                    "diseases",
-                    "syndrome",
-                    "syndromes",
-                )
-            ):
-                node_type = "Diagnosis"
-        self._umls_type_cache[kb_id] = node_type
-        return node_type
+        if self.config.resolved_dna_features_path.exists():
+            logger.debug(
+                "Using DNA features from %s", self.config.resolved_dna_features_path
+            )
 
-    def categorize_entity(
-        self, label: str, kb_id: Optional[str] = None
-    ) -> Optional[str]:
-        lbl = label.upper()
-        direct_map = {
-            "PROBLEM": "Symptom",
-            "FINDING": "Symptom",
-            "SIGN": "Symptom",
-            "BEHAVIOR": "Symptom",
-            "SYMPTOM": "Symptom",
-            #
-            "DIAGNOSIS": "Diagnosis",
-            "DISEASE": "Diagnosis",
-            "SYNDROME": "Diagnosis",
-            #
-            "TEST": "Measure",
-            "MEASUREMENT": "Measure",
-            "MEASURE": "Measure",
-            "ASSESSMENT": "Measure",
-            "LAB": "Measure",
-            #
-            "TREATMENT": "Treatment",
-            "PROCEDURE": "Treatment",
-            "THERAPY": "Treatment",
-            "MEDICATION": "Treatment",
-            "DEVICE": "Treatment",
-            "CHEMICAL": "Treatment",
-            "DRUG": "Treatment",
-            "MED": "Treatment",
-            #
-            "ANATOMY": "Biomarker",
-            "ANATOMICAL": "Biomarker",
-            "CELL_LINE": "Biomarker",
-            "CELL_TYPE": "Biomarker",
-            "DNA": "Biomarker",
-            "PROEIN": "Biomarker",
-            "RNA": "Biomarker",
-            "GENE": "Biomarker",
-            "BIOMARKER": "Biomarker",
+        base_scoring = build_default_scoring_config(
+            threshold=self.config.psychiatric_score_threshold
+        )
+        scoring_config = PsychiatricScoringConfig(
+            mondo_ids=self.config.psychiatric_mondo_ids or base_scoring.mondo_ids,
+            group_labels=self.config.psychiatric_group_labels
+            or base_scoring.group_labels,
+            drug_category_keywords=self.config.psychiatric_drug_categories
+            or base_scoring.drug_category_keywords,
+            text_prototypes=self.config.psychiatric_text_prototypes
+            or base_scoring.text_prototypes,
+            weights=self.config.psychiatric_score_weights or base_scoring.weights,
+            threshold=self.config.psychiatric_score_threshold,
+        )
+        self.scorer = PsychiatricRelevanceScorer(config=scoring_config)
+        default_constraints = {
+            relation: (
+                {token.lower() for token in subject_tokens},
+                {token.lower() for token in object_tokens},
+            )
+            for relation, (
+                subject_tokens,
+                object_tokens,
+            ) in _DEFAULT_RELATION_CONSTRAINTS.items()
         }
-        if lbl in direct_map:
-            return direct_map[lbl]
-        umls_type = self._node_type_from_umls(kb_id)
-        if umls_type:
-            return umls_type
-        return None
+        if self.config.relation_role_constraints:
+            for relation, pair in self.config.relation_role_constraints.items():
+                subj_tokens = {token.lower() for token in pair[0]}
+                obj_tokens = {token.lower() for token in pair[1]}
+                default_constraints[relation.lower()] = (subj_tokens, obj_tokens)
+        self.relation_constraints = default_constraints
 
-    def _relation_allowed_for_types(
-        self, predicate: str, subj_type: str, obj_type: str
-    ) -> bool:
-        rules = self.config.relation_role_constraints.get(predicate)
-        if not rules:
-            return True
-        allowed_subject = rules.get("subject")
-        allowed_object = rules.get("object")
-        if allowed_subject and subj_type not in allowed_subject:
-            return False
-        if allowed_object and obj_type not in allowed_object:
-            return False
-        return True
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def build_subgraph(self) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """Return nodes and edges restricted to psychiatric domains."""
 
-    def _fallback_relation_for_types(
-        self, subj_type: str, obj_type: str
-    ) -> Optional[str]:
-        for subj_candidates, obj_candidates, predicate in _FALLBACK_RELATION_RULES:
-            if subj_type in subj_candidates and obj_type in obj_candidates:
-                return predicate
-        return None
+        disease_features = self._load_disease_features()
+        drug_features = self._load_drug_features()
+        protein_features = self._load_protein_features()
+        dna_features = self._load_dna_features()
 
-    def _pair_has_potential_relation(self, type_a: str, type_b: str) -> bool:
-        cache_key = (type_a, type_b)
-        cached = self._relation_type_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        possible = False
-        for predicate in self.config.relation_role_constraints:
-            if self._relation_allowed_for_types(
-                predicate, type_a, type_b
-            ) or self._relation_allowed_for_types(predicate, type_b, type_a):
-                possible = True
-                break
-
-        if not possible:
-            for subj_candidates, obj_candidates, _ in _FALLBACK_RELATION_RULES:
-                if (type_a in subj_candidates and type_b in obj_candidates) or (
-                    type_b in subj_candidates and type_a in obj_candidates
-                ):
-                    possible = True
-                    break
-
-        self._relation_type_cache[cache_key] = possible
-        # store symmetric result to avoid recomputation
-        self._relation_type_cache[(type_b, type_a)] = possible
-        return possible
-
-    def _ensure_spacy_pipeline(self) -> Optional[Any]:
-        if spacy is None:
-            self._scispacy_linker = None
-            self._umls_type_cache = {}
-            return None
-        if self.config.spacy_model in (None, ""):
-            self._scispacy_linker = None
-            self._umls_type_cache = {}
-            return None
-        if self._spacy_nlp is not None:
-            return self._spacy_nlp
-        try:
-            nlp = spacy.load(
-                self.config.spacy_model,
-                disable=["parser", "textcat"],
-            )
-        except Exception as exc:  # pragma: no cover
-            logger.warning(
-                "spaCy model %s unavailable (%s); disabling spaCy integration.",
-                self.config.spacy_model,
-                exc,
-            )
-            self._scispacy_linker = None
-            self._umls_type_cache = {}
-            self._spacy_nlp = None
-            return None
-
-        try:
-            if (
-                "scispacy_linker" not in nlp.pipe_names
-                and "entity_linker" not in nlp.pipe_names
-            ):
-                nlp.add_pipe(
-                    "scispacy_linker",
-                    config={
-                        "resolve_abbreviations": True,
-                        "linker_name": self.config.spacy_linker_name,
-                    },
-                )
-        except Exception as exc:  # pragma: no cover
-            logger.warning(
-                "Unable to add SciSpaCy linker (%s); continuing without ontology filter.",
-                exc,
-            )
-        self._spacy_linker_available = (
-            "scispacy_linker" in nlp.pipe_names or "entity_linker" in nlp.pipe_names
+        base_scores = self.scorer.score_diseases(
+            disease_features,
+            pl.DataFrame(),
+            drug_features,
         )
-        if self._spacy_linker_available:
-            try:
-                self._scispacy_linker = nlp.get_pipe("scispacy_linker")
-            except Exception:
-                try:
-                    self._scispacy_linker = nlp.get_pipe("entity_linker")
-                except Exception:
-                    self._scispacy_linker = None
-                    self._spacy_linker_available = False
-        else:
-            self._scispacy_linker = None
-        # Reset cached UMLS lookups whenever the spaCy pipeline is rebuilt.
-        self._umls_type_cache = {}
-        self._spacy_nlp = nlp
-        return self._spacy_nlp
-
-    def _ensure_prefilter_model(self) -> None:
-        if self._prefilter_model is not None or not self.config.prefilter_model_name:
-            return
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.config.prefilter_model_name,
-                token=None,
-                use_fast=True,
-            )
-            model = AutoModelForSequenceClassification.from_pretrained(
-                self.config.prefilter_model_name,
-                token=None,
-                use_safetensors=True,
-            )
-            model.eval()
-            self._prefilter_tokenizer = tokenizer
-            self._prefilter_model = model
-            entail_idx = None
-            for idx, label in model.config.id2label.items():
-                if label.lower() == "entailment":
-                    entail_idx = idx
-                    break
-            if entail_idx is None:
-                entail_idx = (
-                    2 if model.config.num_labels >= 3 else model.config.num_labels - 1
-                )
-            self._prefilter_entailment_index = entail_idx
-        except Exception as exc:  # pragma: no cover
-            logger.warning(
-                "Prefilter model %s unavailable (%s); disabling fast relation filter.",
-                self.config.prefilter_model_name,
-                exc,
-            )
-            self._prefilter_model = None
-            self._prefilter_tokenizer = None
-            self._prefilter_entailment_index = None
-            self.config.prefilter_model_name = None
-
-    def _passes_entity_heuristics(
-        self,
-        surface: str,
-        tokens: Sequence[str],
-        pos_tags: Sequence[str],
-    ) -> bool:
-        surface = surface.strip()
-        if not surface:
-            return False
-        if sum(ch.isalpha() for ch in surface) == 0:
-            return False
-        if tokens:
-            stripped_tokens = [tok.lower() for tok in tokens if tok]
-            if stripped_tokens and all(
-                token in self._stop_words for token in stripped_tokens
-            ):
-                return False
-            if len(stripped_tokens) == 1:
-                token = stripped_tokens[0]
-                if len(token) < 3 or token in self._stop_words:
-                    return False
-        informative = {"NOUN", "PROPN", "ADJ", "VERB"}
-        if pos_tags and not any(tag in informative for tag in pos_tags):
-            return False
-        return True
-
-    def _passes_relation_prefilter(self, context: str, subj: str, obj: str) -> bool:
-        context = context.strip()
-        if len(context) < self.config.prefilter_min_context_chars:
-            return False
-        lower_context = context.lower()
-        subj_lower = subj.lower()
-        obj_lower = obj.lower()
-        if subj_lower not in lower_context or obj_lower not in lower_context:
-            return False
-        if not self.config.prefilter_model_name:
-            return True
-        self._ensure_prefilter_model()
-        if not (
-            self._prefilter_model
-            and self._prefilter_tokenizer
-            and self._prefilter_entailment_index is not None
-        ):
-            return True
-        hypothesis = self.config.prefilter_hypothesis_template.format(
-            SUBJ=subj,
-            OBJ=obj,
+        candidate_frame = base_scores.filter(
+            pl.col("ontology_flag")
+            | pl.col("group_flag")
+            | (pl.col("text_score") > 0.25)
         )
-        try:
-            inputs = self._prefilter_tokenizer(
-                context,
-                hypothesis,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
+        psych_indices = candidate_frame.select("node_index").to_series().to_list()
+        if not psych_indices:
+            logger.warning("No psychiatric disease nodes passed hybrid scoring.")
+            return self._empty_nodes(), self._empty_edges()
+
+        edges_df = self._collect_relevant_edges(psych_indices)
+        if edges_df.is_empty():
+            logger.warning(
+                "No edges incident to psychiatric nodes were found in the KG."
             )
-            with torch.no_grad():
-                logits = self._prefilter_model(**inputs).logits[0]
-            probs = torch.softmax(logits, dim=-1)
-            score = probs[self._prefilter_entailment_index].item()
-            return score >= self.config.prefilter_min_score
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Prefilter scoring failed (%s); allowing pair.", exc)
-            return True
+            return self._empty_nodes(), self._empty_edges()
 
-    def _coref_mention_info(
-        self, doc: "stanza.Document", mention: Any
-    ) -> Optional[Dict[str, Any]]:
-        try:
-            sentence_idx = int(getattr(mention, "sentence", -1))
-            start_token = int(getattr(mention, "start_word", -1))
-            end_token = int(getattr(mention, "end_word", -1))
-        except Exception:
-            return None
-        if sentence_idx < 0 or start_token < 0 or end_token <= start_token:
-            return None
-        sentences = getattr(doc, "sentences", [])
-        if sentence_idx >= len(sentences):
-            return None
-        sentence = sentences[sentence_idx]
-        tokens = getattr(sentence, "tokens", [])
-        if end_token > len(tokens):
-            return None
-        start = tokens[start_token]
-        end = tokens[end_token - 1]
-        start_char = getattr(start, "start_char", None)
-        end_char = getattr(end, "end_char", None)
-        if start_char is None or end_char is None:
-            return None
-        surface = doc.text[start_char:end_char]
-        upos: List[str] = []
-        lemmas: List[str] = []
-        for token in tokens[start_token:end_token]:
-            for word in getattr(token, "words", []) or []:
-                if getattr(word, "upos", None):
-                    upos.append(word.upos)
-                if getattr(word, "lemma", None):
-                    lemmas.append(word.lemma)
-        return {
-            "sentence_idx": sentence_idx,
-            "start_char": int(start_char),
-            "end_char": int(end_char),
-            "surface": clean_entity_surface(surface),
-            "upos": upos,
-            "lemmas": lemmas,
-            "start_token": start_token,
-            "end_token": end_token,
-        }
+        refined_scores = self.scorer.score_diseases(
+            disease_features,
+            edges_df,
+            drug_features,
+        )
+        disease_features = disease_features.join(
+            refined_scores, on="node_index", how="left"
+        )
 
-    def _select_coref_antecedent(
-        self, mentions: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        if not mentions:
-            raise ValueError("Cannot select antecedent from empty mention list")
-        ranked: List[Tuple[int, int, Dict[str, Any]]] = []
-        for idx, info in enumerate(mentions):
-            pos = info.get("upos", [])
-            score = 0
-            if any(tag == "PROPN" for tag in pos):
-                score = 3
-            elif any(tag == "NOUN" for tag in pos):
-                score = 2
-            elif any(tag == "ADJ" for tag in pos):
-                score = 1
-            length = info.get("end_char", 0) - info.get("start_char", 0)
-            ranked.append((score, -length, idx))
-        ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
-        best_index = ranked[0][2]
-        return mentions[best_index]
+        nodes_df = self._build_nodes_table(
+            edges_df,
+            disease_features,
+            drug_features,
+            protein_features,
+            dna_features,
+        )
+        return nodes_df, edges_df
 
-    def _build_coref_reference_map(
-        self, doc: "stanza.Document"
-    ) -> Dict[Tuple[int, int], Dict[str, Any]]:
-        chains = getattr(doc, "coref", None)
-        if not chains:
-            return {}
-        references: Dict[Tuple[int, int], Dict[str, Any]] = {}
-        for chain in chains:
-            mention_infos: List[Dict[str, Any]] = []
-            for mention in getattr(chain, "mentions", []) or []:
-                info = self._coref_mention_info(doc, mention)
-                if info is None:
-                    continue
-                mention_infos.append(info)
-            if not mention_infos:
-                continue
-            mention_infos.sort(key=lambda m: (m["start_char"], m["end_char"]))
-            antecedent = self._select_coref_antecedent(mention_infos)
-            antecedent_key = (antecedent["start_char"], antecedent["end_char"])
-            for info in mention_infos:
-                key = (info["start_char"], info["end_char"])
-                if key == antecedent_key:
-                    continue
-                if key in references:
-                    continue
-                references[key] = {
-                    "text": antecedent["surface"],
-                    "start": antecedent["start_char"],
-                    "end": antecedent["end_char"],
-                    "surface": info["surface"],
-                }
-        return references
+    def to_networkx(
+        self, nodes_df: pl.DataFrame, edges_df: pl.DataFrame
+    ) -> nx.MultiDiGraph:
+        """Convert node/edge tables into a NetworkX MultiDiGraph."""
 
-    def _pick_sentence_context(
-        self, text: str, s1: str, s2: str, window: int = 2
-    ) -> str:
-        sentences = sent_tokenize(text)
-        indexes = [
-            i
-            for i, sentence in enumerate(sentences)
-            if (s1 in sentence and s2 in sentence)
+        graph = nx.MultiDiGraph()
+        if nodes_df.is_empty() or edges_df.is_empty():
+            return graph
+
+        metadata_cols = [
+            column
+            for column in (
+                "disease_metadata",
+                "drug_metadata",
+                "protein_metadata",
+                "dna_metadata",
+            )
+            if column in nodes_df.columns
         ]
-        if not indexes:
-            idx1 = next(
-                (i for i, sentence in enumerate(sentences) if s1 in sentence), None
-            )
-            idx2 = next(
-                (i for i, sentence in enumerate(sentences) if s2 in sentence), None
-            )
-            if idx1 is None or idx2 is None:
-                return text[:2000]
-            lo, hi = sorted([idx1, idx2])
-            lo = max(0, lo - window)
-            hi = min(len(sentences), hi + window + 1)
-            return " ".join(sentences[lo:hi])
-        lo = max(0, min(indexes) - window)
-        hi = min(len(sentences), max(indexes) + window + 1)
-        return " ".join(sentences[lo:hi])
 
-    def _score_relation_templates(
-        self,
-        context: str,
-        subj: str,
-        obj: str,
-        templates: Dict[str, str],
-        reverse_templates: Optional[Dict[str, str]] = None,
-    ) -> Optional[RelationInference]:
-        if not context.strip():
-            return None
-        scored: List[Tuple[str, float, NliScores, Optional[NliScores]]] = []
-        for rel, template in templates.items():
-            forward = self._nli_probs(context, template.format(SUBJ=subj, OBJ=obj))
-            reverse: Optional[NliScores] = None
-            if reverse_templates and rel in reverse_templates:
-                reverse = self._nli_probs(
-                    context, reverse_templates[rel].format(SUBJ=subj, OBJ=obj)
-                )
-            score = forward.signal
-            if reverse is not None:
-                penalty = max(0.0, reverse.signal)
-                score -= _REL_DIRECTION_PENALTY * penalty
-            scored.append((rel, score, forward, reverse))
-        if not scored:
-            return None
-        scored.sort(key=lambda item: item[1], reverse=True)
-        best_rel, best_score, best_forward, best_reverse = scored[0]
-        runner_score = scored[1][1] if len(scored) > 1 else -1.0
-        margin = best_score - runner_score
-        reverse_entail = best_reverse.entailment if best_reverse else 0.0
-        directional_conflict = (
-            bool(reverse_templates)
-            and best_rel in (reverse_templates or {})
-            and best_reverse is not None
-            and (reverse_entail - best_forward.entailment) >= _REL_REVERSE_GAP
+        for row in nodes_df.to_dicts():
+            node_id = str(row["node_index"])
+            merged_metadata: dict[str, str] = {}
+            for column in metadata_cols:
+                payload = row.get(column)
+                if payload:
+                    try:
+                        data = json.loads(payload)
+                        for key, value in data.items():
+                            if value not in (None, ""):
+                                merged_metadata[key] = value
+                    except json.JSONDecodeError:
+                        merged_metadata[column] = str(payload)
+            graph.add_node(
+                node_id,
+                name=row.get("name", ""),
+                node_type=row.get("node_type", ""),
+                source=row.get("source", ""),
+                node_index=row.get("node_index"),
+                node_identifier=row.get("node_id"),
+                is_psychiatric=bool(row.get("is_psychiatric", False)),
+                metadata=json.dumps(merged_metadata, ensure_ascii=False),
+            )
+
+        for row in edges_df.to_dicts():
+            src = str(row["source_index"])
+            dst = str(row["target_index"])
+            attributes = {
+                "relation": row.get("relation", ""),
+                "display_relation": row.get("display_relation", ""),
+                "source_type": row.get("source_type", ""),
+                "target_type": row.get("target_type", ""),
+                "source_name": row.get("source_name", ""),
+                "target_name": row.get("target_name", ""),
+            }
+            graph.add_edge(src, dst, **attributes)
+            if self.config.include_reverse_edges:
+                graph.add_edge(dst, src, **attributes)
+        return graph
+
+    # ------------------------------------------------------------------
+    # Loading helpers
+    # ------------------------------------------------------------------
+    def _load_disease_features(self) -> pl.DataFrame:
+        path = self.config.resolved_disease_features_path
+        df = pl.read_csv(path)
+        if "" in df.columns and "node_index" not in df.columns:
+            df = df.rename({"": "node_index"})
+        elif "" in df.columns:
+            df = df.drop("")
+        if "node_index" not in df.columns:
+            raise ValueError("Disease feature table must include a node_index column")
+        df = df.with_columns(pl.col("node_index").cast(pl.Int64))
+
+        textual_columns = [
+            "mondo_definition",
+            "umls_description",
+            "orphanet_definition",
+            "orphanet_clinical_description",
+            "mayo_symptoms",
+            "mayo_causes",
+            "mayo_risk_factors",
+            "mayo_complications",
+            "mayo_prevention",
+            "mayo_see_doc",
+        ]
+        available_text_cols = [col for col in textual_columns if col in df.columns]
+
+        agg_exprs: list[pl.Expr] = [
+            pl.col("mondo_id").drop_nulls().first().alias("mondo_id"),
+            pl.col("mondo_name").drop_nulls().first().alias("mondo_name"),
+            pl.col("group_name_bert").drop_nulls().first().alias("group_name_bert"),
+        ]
+        agg_exprs.extend(
+            [pl.col(col).drop_nulls().first().alias(col) for col in available_text_cols]
         )
-        if (
-            best_forward.entailment < _REL_ENTAILMENT_THRESHOLD
-            or best_score < _REL_SCORE_THRESHOLD
-            or margin < _REL_MARGIN_THRESHOLD
-            or directional_conflict
-        ):
-            return None
-        return RelationInference(
-            label=best_rel,
-            entailment=best_forward.entailment,
-            score=best_score,
-            margin=margin,
-            reverse_entailment=reverse_entail,
+
+        grouped = df.group_by("node_index").agg(agg_exprs)
+
+        truncated_cols = [
+            _truncate_text(pl.col(col), self.config.metadata_truncate, alias=col)
+            for col in available_text_cols
+        ]
+        grouped = grouped.with_columns(truncated_cols)
+
+        metadata_struct = pl.struct([pl.col(col) for col in available_text_cols])
+        grouped = grouped.with_columns(
+            metadata_struct.apply(
+                lambda s: json.dumps(
+                    {k: v for k, v in s.items() if v not in (None, "")},
+                    ensure_ascii=False,
+                )
+                if any(v not in (None, "") for v in s.values())
+                else None,
+                return_dtype=pl.Utf8,
+            ).alias("disease_metadata")
         )
+        grouped = grouped.drop(available_text_cols)
+        return grouped
 
-    def classify_relation_via_nli(
-        self, context: str, subj: str, obj: str
-    ) -> Tuple[Optional[RelationInference], Optional[RelationInference]]:
-        relation = self._score_relation_templates(
-            context,
-            subj,
-            obj,
-            _SUBSTANTIVE_REL_TEMPLATES,
-            _SUBSTANTIVE_REL_TEMPLATES_REV,
+    def _load_drug_features(self) -> pl.DataFrame:
+        path = self.config.resolved_drug_features_path
+        if not path.exists():
+            return pl.DataFrame({"node_index": pl.Series([], dtype=pl.Int64)})
+        df = pl.read_csv(path)
+        if "" in df.columns and "node_index" not in df.columns:
+            df = df.rename({"": "node_index"})
+        elif "" in df.columns:
+            df = df.drop("")
+        if "node_index" not in df.columns:
+            return pl.DataFrame({"node_index": pl.Series([], dtype=pl.Int64)})
+        df = df.with_columns(pl.col("node_index").cast(pl.Int64))
+        textual_columns = [
+            "description",
+            "indication",
+            "mechanism_of_action",
+            "protein_binding",
+            "pharmacodynamics",
+            "state",
+            "category",
+            "group",
+            "pathway",
+        ]
+        agg_exprs = [pl.col("drugbank_ids").drop_nulls().first().alias("drugbank_ids")]
+        agg_exprs.append(
+            pl.col("generic_name").drop_nulls().first().alias("generic_name")
         )
-        evidence = self._score_relation_templates(
-            context, subj, obj, _EVIDENCE_REL_TEMPLATES
+        agg_exprs.extend(
+            [pl.col(col).drop_nulls().first().alias(col) for col in textual_columns]
         )
-        return relation, evidence
+        agg_exprs.append(pl.col("smiles").drop_nulls().first().alias("smiles"))
 
-    def _ner_pipeline(self, text: str) -> List[Dict[str, Any]]:
-        if not text.strip():
-            return []
-
-        self._latest_link_scores = {}
-        spacy_entities: Dict[str, List[Dict[str, Any]]] = {}
-        spacy_allowed_keys: Optional[Set[str]] = None
-        spacy_nlp = self._ensure_spacy_pipeline()
-        if spacy_nlp is not None:
-            try:
-                spacy_doc = spacy_nlp(text)
-                for ent in spacy_doc.ents:
-                    start = ent.start_char
-                    end = ent.end_char
-                    label = getattr(ent, "label_", "")
-                    tokens = [token.text for token in ent]
-                    lemmas = [
-                        getattr(token, "lemma_", "") or token.text for token in ent
-                    ]
-                    pos_tags = [getattr(token, "pos_", "").upper() for token in ent]
-                    canonical = canonical_entity_key(ent.text)
-                    kb_id = None
-                    link_score = None
-                    if self._spacy_linker_available:
-                        kb_ents = getattr(ent._, "kb_ents", None)
-                        if kb_ents:
-                            kb_id, link_score = kb_ents[0]
-                    entry = {
-                        "start": start,
-                        "end": end,
-                        "entity_group": label,
-                        "word": ent.text,
-                        "source_package": f"spacy:{self.config.spacy_model}",
-                        "lemma": " ".join(lemmas).strip(),
-                        "upos": pos_tags,
-                        "xpos": [getattr(token, "tag_", "") for token in ent],
-                        "tokens": tokens,
-                        "coref_antecedent": None,
-                        "canonical_key": canonical,
-                        "ontology_score": link_score,
-                        "kb_id": kb_id,
-                    }
-                    key = canonical or f"{start}:{end}:{label}"
-                    spacy_entities.setdefault(key, []).append(entry)
-            except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "spaCy extraction failed (%s); disabling spaCy integration.",
-                    exc,
+        grouped = df.group_by("node_index").agg(agg_exprs)
+        truncated_cols = [
+            _truncate_text(pl.col(col), self.config.metadata_truncate, alias=col)
+            for col in textual_columns
+        ]
+        grouped = grouped.with_columns(truncated_cols)
+        metadata_struct = pl.struct([pl.col(col) for col in textual_columns])
+        grouped = grouped.with_columns(
+            metadata_struct.apply(
+                lambda s: json.dumps(
+                    {k: v for k, v in s.items() if v not in (None, "")},
+                    ensure_ascii=False,
                 )
-                self._spacy_nlp = None
-                spacy_entities = {}
-
-        if spacy_entities:
-            for key, entries in spacy_entities.items():
-                best = max(entries, key=lambda item: item.get("ontology_score") or 0.0)
-                canonical = best.get("canonical_key")
-                score = best.get("ontology_score")
-                if canonical and score is not None:
-                    self._latest_link_scores[canonical] = score
-
-        pipelines = self._ensure_stanza_pipelines()
-        results: List[Dict[str, Any]] = []
-        seen_spans: Set[Tuple[int, int, str, str]] = set()
-
-        if pipelines:
-            for pkg_display, pipeline in pipelines:
-                doc = pipeline(text)
-                coref_map = self._build_coref_reference_map(doc)
-                entities = getattr(doc, "ents", None)
-                if entities is None:
-                    entities = getattr(doc, "entities", [])
-                for ent in entities:
-                    start = getattr(ent, "start_char", None)
-                    end = getattr(ent, "end_char", None)
-                    label = getattr(ent, "type", "")
-                    words = getattr(ent, "words", [])
-                    lemmas: List[str] = []
-                    upos: List[str] = []
-                    xpos: List[str] = []
-                    tokens: List[str] = []
-                    for word in words:
-                        token = getattr(word, "text", "")
-                        if token:
-                            tokens.append(token)
-                        lemma = getattr(word, "lemma", "")
-                        if lemma:
-                            lemmas.append(lemma)
-                        elif token:
-                            lemmas.append(token)
-                        pos = getattr(word, "upos", "")
-                        if pos:
-                            upos.append(pos)
-                        xpos_tag = getattr(word, "xpos", "")
-                        if xpos_tag:
-                            xpos.append(xpos_tag)
-                    if start is not None and end is not None:
-                        key = (start, end, label, pkg_display)
-                        if key in seen_spans:
-                            continue
-                        seen_spans.add(key)
-                    canonical = canonical_entity_key(getattr(ent, "text", ""))
-                    if spacy_allowed_keys is not None:
-                        if not canonical or canonical not in spacy_allowed_keys:
-                            continue
-                    if start is not None and end is not None:
-                        coref_info = coref_map.get((start, end))
-                    else:
-                        coref_info = None
-                    result = {
-                        "start": start,
-                        "end": end,
-                        "entity_group": label,
-                        "word": getattr(ent, "text", ""),
-                        "source_package": pkg_display,
-                        "lemma": " ".join(lemmas).strip(),
-                        "upos": upos,
-                        "xpos": xpos,
-                        "tokens": tokens,
-                        "coref_antecedent": coref_info,
-                        "canonical_key": canonical,
-                        "ontology_score": self._latest_link_scores.get(canonical),
-                    }
-                    results.append(result)
-
-        if spacy_entities and not pipelines:
-            for entries in spacy_entities.values():
-                for entry in entries:
-                    key = (
-                        entry.get("start"),
-                        entry.get("end"),
-                        entry.get("entity_group"),
-                        entry.get("source_package"),
-                    )
-                    if key in seen_spans:
-                        continue
-                    seen_spans.add(key)
-                    results.append(entry)
-
-        return results
-
-    def extract(self, meta: Dict[str, Any], text: str) -> Optional[PaperExtraction]:
-        overall_start = time.perf_counter()
-        paper_label = (
-            meta.get("id") or meta.get("doi") or meta.get("title") or "<unknown>"
+                if any(v not in (None, "") for v in s.values())
+                else None,
+                return_dtype=pl.Utf8,
+            ).alias("drug_metadata")
         )
-        if not text.strip():
-            logger.info(
-                "Skipping paper %s: no text available after preprocessing.",
-                paper_label,
-            )
-            _log_step_duration(
-                "extract.total",
-                overall_start,
-                paper=paper_label,
-                details="result=no_text",
-            )
-            return None
-        try:
-            ner_start = time.perf_counter()
-            ner_results = self._ner_pipeline(text)
-            _log_step_duration(
-                "extract.ner_pipeline",
-                ner_start,
-                paper=paper_label,
-                details=f"ner_results={len(ner_results)}",
-            )
-        except Exception:
-            _log_step_duration(
-                "extract.ner_pipeline",
-                ner_start,
-                paper=paper_label,
-                details="error=true",
-            )
-            logger.exception("Skipping paper %s: NER pipeline failed.", paper_label)
-            _log_step_duration(
-                "extract.total",
-                overall_start,
-                paper=paper_label,
-                details="result=ner_error",
-            )
-            return None
+        grouped = grouped.drop(textual_columns)
+        return grouped
 
-        entity_start = time.perf_counter()
-        entities: Dict[str, NodeRecord] = {}
-        link_scores = dict(self._latest_link_scores)
-        for ent in ner_results:
-            coref_info = ent.get("coref_antecedent") or None
-            if (
-                "start" in ent
-                and "end" in ent
-                and ent["start"] is not None
-                and ent["end"] is not None
-            ):
-                raw_name = text[ent["start"] : ent["end"]]
-            else:
-                raw_name = ent.get("word", "")
-            raw_name = clean_entity_surface(raw_name)
-            if not raw_name:
-                continue
-            if raw_name.lower() in self._span_blocklist:
-                continue
-            tokens = ent.get("tokens") or []
-            pos_tags = [tag.upper() for tag in ent.get("upos") or [] if tag]
-            if not self._passes_entity_heuristics(raw_name, tokens, pos_tags):
-                continue
-            original_surface = raw_name
-            lemma_from_ent = (ent.get("lemma") or "").strip()
-            lemma_override: Optional[str] = None
-            if coref_info:
-                antecedent_text = clean_entity_surface(coref_info.get("text") or "")
-                if (
-                    antecedent_text
-                    and antecedent_text.lower() not in self._span_blocklist
-                    and self._passes_entity_heuristics(
-                        antecedent_text, tokens, pos_tags
-                    )
-                ):
-                    raw_name = antecedent_text
-                    lemma_override = canonical_entity_display(antecedent_text)
-
-            lemma_hint = lemma_override or lemma_from_ent
-            lemma_source = lemma_hint if lemma_hint else raw_name
-            canonical_key = canonical_entity_key(lemma_source)
-            if not canonical_key or canonical_key in self._span_blocklist:
-                continue
-            canonical_display = (
-                canonical_entity_display(lemma_hint or raw_name) or raw_name
-            )
-            ontology_score = ent.get("ontology_score")
-            if ontology_score is None:
-                ontology_score = link_scores.get(canonical_key)
-            label = ent.get("entity_group", "")
-            if label.upper() == "ENTITY":
-                if self.config.ontology_min_score > 0.0 and (
-                    ontology_score is None
-                    or ontology_score < self.config.ontology_min_score
-                ):
-                    continue
-            record = entities.get(canonical_key)
-            if record is None:
-                node_type = self.categorize_entity(label, ent.get("kb_id"))
-                if not node_type:
-                    continue
-                record = NodeRecord(
-                    canonical_name=canonical_display,
-                    lemma=canonical_key,
-                    node_type=node_type,
-                    synonyms=[],
-                    normalizations={},
-                )
-                entities[canonical_key] = record
-            lemma_values: List[str] = []
-            if lemma_hint:
-                lemma_values.append(lemma_hint)
-            if lemma_from_ent and lemma_from_ent not in lemma_values:
-                lemma_values.append(lemma_from_ent)
-            if lemma_values:
-                existing_lemmas = record.normalizations.get("lemmas", [])
-                record.normalizations["lemmas"] = dedupe_preserve_order(
-                    list(existing_lemmas) + lemma_values
-                )
-            if pos_tags:
-                existing_pos = record.normalizations.get("upos", [])
-                record.normalizations["upos"] = dedupe_preserve_order(
-                    list(existing_pos) + pos_tags
-                )
-            source_pkg = ent.get("source_package")
-            if source_pkg:
-                existing_sources = record.normalizations.get("ner_sources", [])
-                record.normalizations["ner_sources"] = dedupe_preserve_order(
-                    list(existing_sources) + [source_pkg]
-                )
-            if tokens:
-                existing_tokens = record.normalizations.get("tokens", [])
-                record.normalizations["tokens"] = dedupe_preserve_order(
-                    list(existing_tokens) + tokens
-                )
-            kb_id = ent.get("kb_id")
-            if kb_id:
-                umls_ids = record.normalizations.get("umls_ids", [])
-                record.normalizations["umls_ids"] = dedupe_preserve_order(
-                    list(umls_ids) + [kb_id]
-                )
-            name_candidates = [raw_name, canonical_display]
-            if (
-                coref_info
-                and original_surface
-                and original_surface.lower() != raw_name.lower()
-            ):
-                name_candidates.append(original_surface)
-            self._update_record_forms(record, name_candidates)
-        _log_step_duration(
-            "extract.entity_postprocess",
-            entity_start,
-            paper=paper_label,
-            details=f"unique_entities={len(entities)}",
+    def _load_protein_features(self) -> pl.DataFrame:
+        path = self.config.resolved_protein_features_path
+        if not path.exists():
+            return pl.DataFrame({"node_index": pl.Series([], dtype=pl.Int64)})
+        df = pl.read_csv(path)
+        if "" in df.columns and "node_index" not in df.columns:
+            df = df.rename({"": "node_index"})
+        elif "" in df.columns:
+            df = df.drop("")
+        if "node_index" not in df.columns:
+            return pl.DataFrame({"node_index": pl.Series([], dtype=pl.Int64)})
+        df = df.with_columns(pl.col("node_index").cast(pl.Int64))
+        df = df.with_columns(
+            pl.col("protein_seq").cast(pl.Utf8).str.len_chars().alias("protein_seq_len")
         )
-        if not entities:
-            logger.info("Skipping paper %s: no entities detected.", paper_label)
-            _log_step_duration(
-                "extract.total",
-                overall_start,
-                paper=paper_label,
-                details="result=no_entities",
-            )
-            return None
-
-        node_records = list(entities.values())
-        node_records.sort(key=lambda record: record.canonical_name.lower())
-        surface_lookup = {
-            record.canonical_name: self._surface_form(record, text)
-            for record in node_records
-        }
-
-        relation_start = time.perf_counter()
-        relations: List[RelationRecord] = []
-        relation_attempts = 0
-        candidate_pairs = 0
-        skipped_pairs = 0
-        prefilter_skipped = 0
-        for i in range(len(node_records)):
-            for j in range(i + 1, len(node_records)):
-                subj = node_records[i].canonical_name
-                obj = node_records[j].canonical_name
-                subj_type = node_records[i].node_type
-                obj_type = node_records[j].node_type
-                if not self._pair_has_potential_relation(subj_type, obj_type):
-                    skipped_pairs += 1
-                    logger.debug(
-                        "Skipping relation pair %s (%s) ↔ %s (%s): no compatible predicates",
-                        subj,
-                        subj_type,
-                        obj,
-                        obj_type,
-                    )
-                    continue
-                candidate_pairs += 1
-                context = self._pick_sentence_context(
-                    text, surface_lookup[subj], surface_lookup[obj]
-                )
-                if not self._passes_relation_prefilter(context, subj, obj):
-                    prefilter_skipped += 1
-                    continue
-                relation_attempts += 1
-                relation_inf, evidence_inf = self.classify_relation_via_nli(
-                    context, subj, obj
-                )
-                candidates: List[Dict[str, Any]] = [
-                    {
-                        "subj": subj,
-                        "obj": obj,
-                        "subj_type": subj_type,
-                        "obj_type": obj_type,
-                        "relation": relation_inf,
-                        "evidence": evidence_inf,
-                    }
-                ]
-
-                needs_alternate_orientation = (
-                    relation_inf is None
-                    or not self._relation_allowed_for_types(
-                        relation_inf.label, subj_type, obj_type
-                    )
-                )
-                if needs_alternate_orientation:
-                    swapped_relation, swapped_evidence = self.classify_relation_via_nli(
-                        context, obj, subj
-                    )
-                    candidates.append(
-                        {
-                            "subj": obj,
-                            "obj": subj,
-                            "subj_type": obj_type,
-                            "obj_type": subj_type,
-                            "relation": swapped_relation,
-                            "evidence": swapped_evidence,
-                        }
-                    )
-
-                chosen: Optional[Dict[str, Any]] = None
-                for candidate in candidates:
-                    candidate_rel = candidate["relation"]
-                    if candidate_rel and self._relation_allowed_for_types(
-                        candidate_rel.label,
-                        candidate["subj_type"],
-                        candidate["obj_type"],
-                    ):
-                        chosen = candidate
-                        break
-
-                if chosen is None:
-                    fallback_candidate: Optional[Dict[str, Any]] = next(
-                        (
-                            cand
-                            for cand in candidates
-                            if cand["evidence"] is not None
-                            and self._fallback_relation_for_types(
-                                cand["subj_type"], cand["obj_type"]
-                            )
-                        ),
-                        None,
-                    )
-                    if fallback_candidate is None:
-                        continue
-                    fallback_predicate = self._fallback_relation_for_types(
-                        fallback_candidate["subj_type"], fallback_candidate["obj_type"]
-                    )
-                    assert fallback_predicate is not None
-                    evidence_for_fallback = fallback_candidate["evidence"]
-                    assert evidence_for_fallback is not None
-                    fallback_relation = RelationInference(
-                        label=fallback_predicate,
-                        entailment=evidence_for_fallback.entailment,
-                        score=evidence_for_fallback.score,
-                        margin=evidence_for_fallback.margin,
-                        reverse_entailment=evidence_for_fallback.reverse_entailment,
-                    )
-                    chosen = dict(fallback_candidate)
-                    chosen["relation"] = fallback_relation
-
-                if chosen is None:
-                    continue
-
-                relation_chosen: RelationInference = chosen["relation"]
-                evidence_chosen: Optional[RelationInference] = chosen["evidence"]
-                subj = chosen["subj"]
-                obj = chosen["obj"]
-                subj_type = chosen["subj_type"]
-                obj_type = chosen["obj_type"]
-
-                predicate = relation_chosen.label
-                confidence = min(
-                    1.0, relation_chosen.entailment + 0.1 * relation_chosen.margin
-                )
-                directionality = (
-                    "directed"
-                    if predicate
-                    in {"treats", "predicts", "biomarker_for", "measure_of"}
-                    else "undirected"
-                )
-                claim_descriptor = self._build_claim_descriptor(predicate, subj, obj)
-                qualifiers: Dict[str, Any] = {
-                    "nli_raw_label": relation_chosen.label,
-                    "nli_entailment": round(relation_chosen.entailment, 4),
-                    "nli_margin": round(relation_chosen.margin, 4),
-                    "nli_reverse_entailment": round(
-                        relation_chosen.reverse_entailment, 4
-                    ),
-                    "nli_score": round(relation_chosen.score, 4),
-                }
-                if claim_descriptor:
-                    qualifiers["claim"] = claim_descriptor.model_dump(exclude_none=True)
-                if evidence_chosen is not None:
-                    evidence_descriptor = self._build_claim_descriptor(
-                        evidence_chosen.label, subj, obj
-                    )
-                    qualifiers.update(
-                        {
-                            "evidence_label": evidence_chosen.label,
-                            "evidence_entailment": round(evidence_chosen.entailment, 4),
-                            "evidence_margin": round(evidence_chosen.margin, 4),
-                            "evidence_score": round(evidence_chosen.score, 4),
-                            "evidence_reverse_entailment": round(
-                                evidence_chosen.reverse_entailment, 4
-                            ),
-                        }
-                    )
-                    if evidence_descriptor:
-                        qualifiers["evidence_claim"] = evidence_descriptor._model_dump(
-                            exclude_none=True
-                        )
-                relations.append(
-                    RelationRecord(
-                        subject=subj,
-                        predicate=predicate,
-                        object=obj,
-                        directionality=directionality,
-                        evidence_span=context[:300],
-                        confidence=confidence,
-                        claim=claim_descriptor,
-                        qualifiers=qualifiers,
-                    )
-                )
-        _log_step_duration(
-            "extract.relation_inference",
-            relation_start,
-            paper=paper_label,
-            details=(
-                f"attempts={relation_attempts}, relations={len(relations)}, "
-                f"skipped_types={skipped_pairs}, prefilter_skipped={prefilter_skipped}, "
-                f"candidates={candidate_pairs}"
+        agg_exprs = [
+            pl.col("protein_id").drop_nulls().first().alias("protein_id"),
+            pl.col("protein_name").drop_nulls().first().alias("protein_name"),
+            pl.col("fasta_id").drop_nulls().first().alias("fasta_id"),
+            pl.col("fasta_description").drop_nulls().first().alias("fasta_description"),
+            pl.col("ncbi_summary").drop_nulls().first().alias("ncbi_summary"),
+            pl.col("protein_seq_len").drop_nulls().first().alias("protein_seq_len"),
+        ]
+        grouped = df.group_by("node_index").agg(agg_exprs)
+        grouped = grouped.with_columns(
+            _truncate_text(
+                pl.col("fasta_description"),
+                self.config.metadata_truncate,
+                alias="fasta_description",
+            ),
+            _truncate_text(
+                pl.col("ncbi_summary"),
+                self.config.metadata_truncate,
+                alias="ncbi_summary",
             ),
         )
-        result = PaperExtraction(
-            paper_id=meta.get("id", ""),
-            doi=meta.get("doi"),
-            title=meta.get("title", ""),
-            year=meta.get("year"),
-            venue=meta.get("venue"),
-            nodes=node_records,
-            relations=relations,
+        metadata_struct = pl.struct(
+            [
+                pl.col("fasta_description"),
+                pl.col("ncbi_summary"),
+                pl.col("protein_seq_len"),
+            ]
         )
-        _log_step_duration(
-            "extract.total",
-            overall_start,
-            paper=paper_label,
-            details=(f"nodes={len(node_records)}, relations={len(relations)}"),
+        grouped = grouped.with_columns(
+            metadata_struct.apply(
+                lambda s: json.dumps(
+                    {k: v for k, v in s.items() if v not in (None, "")},
+                    ensure_ascii=False,
+                )
+                if any(v not in (None, "") for v in s.values())
+                else None,
+                return_dtype=pl.Utf8,
+            ).alias("protein_metadata")
         )
-        return result
+        grouped = grouped.drop(["fasta_description", "ncbi_summary", "protein_seq_len"])
+        return grouped
 
-    def _surface_form(self, record: NodeRecord, text: str) -> str:
-        forms = record.normalizations.get("surface_forms", [])
-        if isinstance(forms, list):
-            for form in forms:
-                if form and form in text:
-                    return form
-        return record.canonical_name
-
-    def _update_record_forms(
-        self, record: NodeRecord, candidates: Iterable[str]
-    ) -> None:
-        existing_forms = record.normalizations.get("surface_forms")
-        if isinstance(existing_forms, list):
-            forms = list(existing_forms)
+    def _load_dna_features(self) -> pl.DataFrame:
+        path = self.config.resolved_dna_features_path
+        if not path.exists():
+            return pl.DataFrame({"node_index": pl.Series([], dtype=pl.Int64)})
+        df = pl.read_csv(path)
+        if "" in df.columns and "node_index" not in df.columns:
+            df = df.rename({"": "node_index"})
+        elif "" in df.columns:
+            df = df.drop("")
+        if "node_index" not in df.columns:
+            return pl.DataFrame({"node_index": pl.Series([], dtype=pl.Int64)})
+        df = df.with_columns(pl.col("node_index").cast(pl.Int64))
+        if "dna_sequence" in df.columns:
+            df = df.with_columns(
+                pl.col("dna_sequence")
+                .cast(pl.Utf8)
+                .str.len_chars()
+                .alias("dna_seq_len")
+            )
         else:
-            forms = [record.canonical_name]
-        forms.extend(candidates)
-        forms.append(record.canonical_name)
-        normalized_forms = dedupe_preserve_order(forms)
-        record.normalizations["surface_forms"] = normalized_forms
-        record.synonyms = dedupe_preserve_order(
-            list(record.synonyms)
-            + [form for form in normalized_forms if form != record.canonical_name]
+            df = df.with_columns(pl.lit(None).alias("dna_seq_len"))
+        agg_exprs = []
+        value_cols: list[str] = []
+        if "gene_symbol" in df.columns:
+            agg_exprs.append(
+                pl.col("gene_symbol").drop_nulls().first().alias("gene_symbol")
+            )
+            value_cols.append("gene_symbol")
+        if "dna_seq_len" in df.columns:
+            agg_exprs.append(
+                pl.col("dna_seq_len").drop_nulls().first().alias("dna_seq_len")
+            )
+            value_cols.append("dna_seq_len")
+
+        grouped = (
+            df.groupby("node_index").agg(agg_exprs)
+            if agg_exprs
+            else df.groupby("node_index").agg([])
         )
 
-    def _build_claim_descriptor(
-        self, predicate: str, subject: str, obj: str
-    ) -> ClaimDescriptor:
-        """Construct a claim descriptor that explains what an evidence edge supports."""
+        if value_cols:
+            metadata_struct = pl.struct([pl.col(col) for col in value_cols])
+            grouped = grouped.with_columns(
+                metadata_struct.apply(
+                    lambda s: json.dumps(
+                        {k: v for k, v in s.items() if v not in (None, "")},
+                        ensure_ascii=False,
+                    )
+                    if any(v not in (None, "") for v in s.values())
+                    else None,
+                    return_dtype=pl.Utf8,
+                ).alias("dna_metadata")
+            )
+            grouped = grouped.drop(value_cols)
+        else:
+            grouped = grouped.with_columns(pl.lit(None).alias("dna_metadata"))
+        return grouped
 
-        predicate = predicate.lower()
-        if predicate == "treats":
-            return ClaimDescriptor(
-                type="causal",
-                statement=f"{subject} treats {obj}",
-                direction="positive",
-                evidence_type="nli_text_entailment",
+    def _collect_relevant_edges(self, psych_indices: Iterable[int]) -> pl.DataFrame:
+        psych_series = pl.Series(list(psych_indices), dtype=pl.Int64)
+        edges_lazy = pl.scan_csv(
+            self.config.kg_path,
+            infer_schema_length=0,
+            dtypes={
+                "x_id": pl.Utf8,
+                "y_id": pl.Utf8,
+                "x_name": pl.Utf8,
+                "y_name": pl.Utf8,
+                "x_type": pl.Utf8,
+                "y_type": pl.Utf8,
+                "x_source": pl.Utf8,
+                "y_source": pl.Utf8,
+                "relation": pl.Utf8,
+                "display_relation": pl.Utf8,
+            },
+        )
+        filter_expr = pl.col("x_index").cast(pl.Int64).is_in(psych_series) | pl.col(
+            "y_index"
+        ).cast(pl.Int64).is_in(psych_series)
+        if self.config.allowed_relations:
+            filter_expr = filter_expr & pl.col("relation").is_in(
+                sorted(self.config.allowed_relations)
             )
-        if predicate == "predicts":
-            return ClaimDescriptor(
-                type="association",
-                statement=f"{subject} predicts {obj}",
-                direction="positive",
-                evidence_type="nli_text_entailment",
+        collected = (
+            edges_lazy.filter(filter_expr)
+            .with_columns(
+                pl.col("x_index").cast(pl.Int64),
+                pl.col("y_index").cast(pl.Int64),
             )
-        if predicate == "biomarker_for":
-            return ClaimDescriptor(
-                type="mechanistic",
-                statement=f"{subject} is a biomarker for {obj}",
-                direction="positive",
-                evidence_type="nli_text_entailment",
+            .collect(streaming=True)
+        )
+        if collected.is_empty():
+            return self._empty_edges()
+        renamed = collected.rename(
+            {
+                "x_index": "source_index",
+                "x_id": "source_id",
+                "x_type": "source_type",
+                "x_name": "source_name",
+                "x_source": "source_dataset",
+                "y_index": "target_index",
+                "y_id": "target_id",
+                "y_type": "target_type",
+                "y_name": "target_name",
+                "y_source": "target_dataset",
+            }
+        )
+        mask = [
+            self._relation_allowed(
+                row.get("relation"),
+                row.get("source_type"),
+                row.get("target_type"),
             )
-        if predicate == "measure_of":
-            return ClaimDescriptor(
-                type="measurement",
-                statement=f"{subject} is a measure of {obj}",
-                direction="positive",
-                evidence_type="nli_text_entailment",
-            )
-        if predicate == "supports":
-            return ClaimDescriptor(
-                type="association",
-                statement=f"{subject} is positively associated with {obj}",
-                direction="positive",
-                evidence_type="nli_text_entailment",
-            )
-        if predicate == "contradicts":
-            return ClaimDescriptor(
-                type="association",
-                statement=f"{subject} is negatively associated with {obj}",
-                direction="negative",
-                evidence_type="nli_text_entailment",
-            )
-        if predicate == "replicates":
-            return ClaimDescriptor(
-                type="measurement",
-                statement=f"{subject} replicates findings reported for {obj}",
-                direction="positive",
-                evidence_type="nli_text_entailment",
-            )
-        if predicate == "null_reported":
-            return ClaimDescriptor(
-                type="association",
-                statement=f"{subject} reports null findings with respect to {obj}",
-                direction="null",
-                evidence_type="nli_text_entailment",
-            )
+            for row in renamed.iter_rows(named=True)
+        ]
+        if not mask or not any(mask):
+            return self._empty_edges()
+        renamed = renamed.with_columns(pl.Series("_allowed_mask", mask))
+        renamed = renamed.filter(pl.col("_allowed_mask")).drop("_allowed_mask")
+        return renamed
 
-        return ClaimDescriptor(
-            statement=f"{subject} relates to {obj}",
-            type="unknown",
-            direction="unknown",
-            evidence_type="nli_text_entailment",
+    def _build_nodes_table(
+        self,
+        edges_df: pl.DataFrame,
+        disease_features: pl.DataFrame,
+        drug_features: pl.DataFrame,
+        protein_features: pl.DataFrame,
+        dna_features: pl.DataFrame,
+    ) -> pl.DataFrame:
+        src_nodes = edges_df.select(
+            pl.col("source_index").alias("node_index"),
+            pl.col("source_id").alias("node_id"),
+            pl.col("source_name").alias("name"),
+            pl.col("source_type").alias("node_type"),
+            pl.col("source_dataset").alias("source"),
+        )
+        dst_nodes = edges_df.select(
+            pl.col("target_index").alias("node_index"),
+            pl.col("target_id").alias("node_id"),
+            pl.col("target_name").alias("name"),
+            pl.col("target_type").alias("node_type"),
+            pl.col("target_dataset").alias("source"),
+        )
+        nodes = pl.concat([src_nodes, dst_nodes]).unique(
+            subset=["node_index"], keep="first"
+        )
+
+        nodes = nodes.join(disease_features, on="node_index", how="left")
+        if not drug_features.is_empty():
+            nodes = nodes.join(drug_features, on="node_index", how="left")
+        if not protein_features.is_empty():
+            nodes = nodes.join(protein_features, on="node_index", how="left")
+        if not dna_features.is_empty():
+            nodes = nodes.join(dna_features, on="node_index", how="left")
+
+        default_columns = {
+            "is_psychiatric": pl.lit(False),
+            "psy_score": pl.lit(0.0),
+            "psy_evidence": pl.lit("[]"),
+            "ontology_flag": pl.lit(False),
+            "group_flag": pl.lit(False),
+            "drug_flag": pl.lit(False),
+            "text_score": pl.lit(0.0),
+        }
+        for column, expr in default_columns.items():
+            if column not in nodes.columns:
+                nodes = nodes.with_columns(expr.alias(column))
+            else:
+                if column == "psy_evidence":
+                    nodes = nodes.with_columns(pl.col(column).fill_null("[]"))
+                elif column in {"psy_score", "text_score"}:
+                    nodes = nodes.with_columns(pl.col(column).fill_null(0.0))
+                else:
+                    nodes = nodes.with_columns(pl.col(column).fill_null(False))
+
+        return nodes.sort("node_index")
+
+    def _relation_allowed(
+        self, relation: str | None, src_type: str | None, dst_type: str | None
+    ) -> bool:
+        if relation is None:
+            return True
+        constraint = self.relation_constraints.get(relation.lower())
+        if not constraint:
+            return True
+        subj_allowed, obj_allowed = constraint
+        return self._type_matches(src_type, subj_allowed) and self._type_matches(
+            dst_type, obj_allowed
+        )
+
+    @staticmethod
+    def _type_matches(node_type: str | None, allowed: set[str]) -> bool:
+        if not allowed:
+            return True
+        if not node_type:
+            return False
+        node_type = node_type.lower()
+        if node_type in allowed:
+            return True
+        tokens = {node_type}
+        tokens.update(part for part in re.split(r"[\s/_,;:-]+", node_type) if part)
+        return any(token in allowed for token in tokens)
+
+    # ------------------------------------------------------------------
+    # Empty-table helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _empty_nodes() -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                "node_index": pl.Series([], dtype=pl.Int64),
+                "node_id": pl.Series([], dtype=pl.Utf8),
+                "name": pl.Series([], dtype=pl.Utf8),
+                "node_type": pl.Series([], dtype=pl.Utf8),
+                "source": pl.Series([], dtype=pl.Utf8),
+                "is_psychiatric": pl.Series([], dtype=pl.Boolean),
+                "psy_score": pl.Series([], dtype=pl.Float64),
+                "psy_evidence": pl.Series([], dtype=pl.Utf8),
+                "ontology_flag": pl.Series([], dtype=pl.Boolean),
+                "group_flag": pl.Series([], dtype=pl.Boolean),
+                "drug_flag": pl.Series([], dtype=pl.Boolean),
+                "text_score": pl.Series([], dtype=pl.Float64),
+            }
+        )
+
+    @staticmethod
+    def _empty_edges() -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                "relation": pl.Series([], dtype=pl.Utf8),
+                "display_relation": pl.Series([], dtype=pl.Utf8),
+                "source_index": pl.Series([], dtype=pl.Int64),
+                "source_id": pl.Series([], dtype=pl.Utf8),
+                "source_type": pl.Series([], dtype=pl.Utf8),
+                "source_name": pl.Series([], dtype=pl.Utf8),
+                "source_dataset": pl.Series([], dtype=pl.Utf8),
+                "target_index": pl.Series([], dtype=pl.Int64),
+                "target_id": pl.Series([], dtype=pl.Utf8),
+                "target_type": pl.Series([], dtype=pl.Utf8),
+                "target_name": pl.Series([], dtype=pl.Utf8),
+                "target_dataset": pl.Series([], dtype=pl.Utf8),
+            }
         )
 
 
-__all__ = [
-    "EntityRelationExtractor",
-    "ExtractionConfig",
-]
+__all__ = ["ExtractionConfig", "EntityRelationExtractor"]

@@ -161,7 +161,9 @@ def train_scae_on_graph(
     entropy_eps: float = 1e-12,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
-        num_clusters = graph.data.node_types.numel()
+        # Default to one cluster per node *type* rather than per node to avoid
+        # allocating massive gate tensors on large graphs.
+        num_clusters = max(1, len(graph.node_type_index))
 
     shared_vocab = SharedAttributeVocab(
         initial_names=[], embedding_dim=attr_encoder_dims[0]
@@ -188,7 +190,6 @@ def train_scae_on_graph(
         hidden_dims=list(hidden_dims),
         type_embedding_dim=type_embedding_dim,
         negative_sampling_ratio=negative_sampling_ratio,
-        allow_self_loops=True,
         entropy_weight=entropy_weight,
         dirichlet_alpha=dirichlet_param,
         dirichlet_weight=dirichlet_weight,

@@ -8,3 +8,7 @@ line_length = 88
 # optional, but helps:
 combine_as_imports = true
 force_single_line = false
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+

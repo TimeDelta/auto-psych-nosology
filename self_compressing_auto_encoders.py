@@ -1157,7 +1157,18 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
                 return [float(x) for x in flat.tolist()]
             return flat.tolist()
         if isinstance(node_ids, (list, tuple)):
-            return list(node_ids)
+            normalised: List[Any] = []
+            for node_id in node_ids:
+                if isinstance(node_id, (list, tuple)):
+                    if len(node_id) == 1 and isinstance(
+                        node_id[0], (str, bytes, int, float)
+                    ):
+                        normalised.append(node_id[0])
+                    else:
+                        normalised.append(tuple(node_id))
+                else:
+                    normalised.append(node_id)
+            return normalised
         return None
 
     # Memory bank ties repeated node ids together to align embeddings across
