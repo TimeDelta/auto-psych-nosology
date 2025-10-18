@@ -906,6 +906,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         degree_decorrelation_weight: float = 1e-3,
         relation_reweight_power: float = 0.5,
         enable_relation_reweighting: bool = True,
+        active_gate_threshold: float = 0.5,
     ) -> None:
         """
         Args:
@@ -958,6 +959,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             degree_decorrelation_weight: Weight on the penalty forcing latents to decorrelate from log degree.
             relation_reweight_power: Power-law for relation frequency reweighting.
             enable_relation_reweighting: Enables inverse-frequency reweighting when True.
+            active_gate_threshold: Probability cutoff used when counting active gates for training diagnostics.
         """
         super().__init__()
         base_gate_temperature = 2.0 / 3.0
@@ -1051,6 +1053,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         self.revival_usage_threshold = float(max(revival_usage_threshold, 0.0))
         self.degree_decorrelation_weight = float(degree_decorrelation_weight)
         self.enable_relation_reweighting = enable_relation_reweighting
+        self.active_gate_threshold = float(active_gate_threshold)
 
         self.cluster_gate = ClusterGate(
             num_clusters,
@@ -1547,6 +1550,12 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
 
         self._update_memory_bank(node_ids_list, node_embeddings, real_mask)
 
+        gate_expectation = self.cluster_gate.expected_l0()
+        if gate_expectation.dim() == 0:
+            gate_expectation = gate_expectation.unsqueeze(0)
+        active_count = (gate_sample >= self.active_gate_threshold).sum().float()
+        expected_active = gate_expectation.sum()
+
         metrics: Dict[str, torch.Tensor] = {
             "total_loss": total_loss.detach(),
             "recon_loss": recon_loss.detach(),
@@ -1577,6 +1586,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             ),
             "degree_penalty": degree_penalty.detach(),
             "degree_correlation_sq": degree_corr.detach(),
+            "num_active_clusters": active_count.detach(),
+            "expected_active_clusters": expected_active.detach(),
         }
         if neg_conf_weight is not None:
             metrics["negative_confidence_weight"] = neg_conf_weight.detach()

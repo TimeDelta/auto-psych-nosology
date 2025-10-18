@@ -437,6 +437,7 @@ def train_scae_on_graph(
         embedding_norm_weight=embedding_norm_weight,
         kld_weight=kld_weight,
         entropy_eps=entropy_eps,
+        active_gate_threshold=gate_threshold,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -674,7 +675,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 if final_loss is not None and math.isfinite(final_loss):
                     mlflow_client.log_metric("final_loss", float(final_loss))
             mlflow_client.log_metric(
-                "num_active_clusters", len(partition.active_clusters)
+                "num_active_clusters",
+                len(partition.active_clusters),
+                step=len(history) + 1,
             )
             type_embedding = getattr(model.encoder, "node_type_embedding", None)
             if type_embedding is not None and hasattr(type_embedding, "embedding_dim"):
