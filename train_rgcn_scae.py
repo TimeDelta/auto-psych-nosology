@@ -142,6 +142,20 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
     )
 
 
+def _default_cluster_capacity(graph: MultiplexGraph) -> int:
+    """Heuristic for the latent cluster capacity used by the SCAE."""
+
+    num_nodes = max(int(graph.data.node_types.numel()), 1)
+    num_relations = max(len(graph.relation_index), 1)
+    # Start with a sublinear growth heuristic so capacity scales with graph size
+    # without exploding memory on dense graphs.
+    sqrt_capacity = max(8, int(round(math.sqrt(num_nodes))))
+    # Ensure we have at least a couple of prototypes per relation in multiplex
+    # graphs so decoders can differentiate relation patterns.
+    relation_floor = num_relations * 4
+    return min(num_nodes, max(sqrt_capacity, relation_floor))
+
+
 def _parse_mlflow_tags(raw_tags: Optional[Sequence[str]]) -> Dict[str, str]:
     if not raw_tags:
         return {}
@@ -211,9 +225,7 @@ def train_scae_on_graph(
     entropy_eps: float = 1e-12,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
-        # Default to one cluster per node *type* rather than per node to avoid
-        # allocating massive gate tensors on large graphs.
-        num_clusters = max(1, len(graph.node_type_index))
+        num_clusters = _default_cluster_capacity(graph)
 
     shared_vocab = SharedAttributeVocab(
         initial_names=[], embedding_dim=attr_encoder_dims[0]
@@ -412,9 +424,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     graph = load_multiplex_graph(args.graphml)
     effective_num_clusters = (
-        args.clusters
-        if args.clusters is not None
-        else max(1, len(graph.node_type_index))
+        args.clusters if args.clusters is not None else _default_cluster_capacity(graph)
     )
 
     tags = _parse_mlflow_tags(args.mlflow_tags)
