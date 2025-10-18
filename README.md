@@ -1,4 +1,4 @@
-# Automated Psychiatric Nosology via Partitioning of Multiplex Graph Generated from Mining Scientific Papers for Findings
+# Automated Psychiatric Nosology via Partitioning of Knowledge Graph
 ## Table of Contents
 - [Code Notes](#code-notes)
 - [Background / Literature Review](#background--literature-review)
