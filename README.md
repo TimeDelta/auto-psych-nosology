@@ -21,9 +21,12 @@
 - [References](#references)
 
 ## Code Notes
-- This project uses python 3.10
-- Must install [graph tool](https://graph-tool.skewed.de) in order to run the [create_hSBM_partitions.py](./create_hSBM_partitions.py) script.
-- In order to use this for something other than psychiatry, must change `"concepts.id:C61535369",` filter part in [openalex_client.py](./openalex_client.py)
+- Install project requirements via `pip3.10 install -r requirements.txt`.
+- MLflow is used for optional experiment tracking.
+    - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
+- The rGCN-SCAE trainer now picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
+- To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_hSBM_partitions.py](./create_hSBM_partitions.py).
+- Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
 
 ## Background / Literature Review
 Psychiatric nosology has long been dominated by categorical systems such as the DSM and the ICD.
@@ -110,23 +113,23 @@ By mining the scientific literature into a multiplex graph and partitioning it w
 Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction.
 Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
-### Graph Creation
-Multiplex Graph Design
-- Node Types: extractor currently emits `Symptom`, `Diagnosis`, `Biomarker`, `Treatment`, and `Measure`
-- Structural Relation Types (directed where appropriate): `treats`, `predicts`, `biomarker_for`, `measure_of`
-- Evidence Qualifiers: each structural edge stores the NLI evidence label (`supports`, `contradicts`, `replicates`, `null_reported`) plus scores, margins, and an embedded `ClaimDescriptor`
-- Orientation Logic: for every node pair, test both subject→object and object→subject hypotheses; if neither satisfies the role constraints, an evidence-backed fallback (e.g., Treatment→Diagnosis as `treats`) is applied so clinically plausible edges persist instead of isolating nodes
-- Export Schema: edge qualifiers are flattened as `qual_*` attributes (e.g., `qual_nli_score`, `qual_claim`, `qual_evidence_label`) so GraphML/HTML tooltips surface the underlying evidence without manual JSON parsing
+### Knowledge Graph
+The knowledge graph was created from a subset of the BioMedKG dataset [19], which can be downloaded with: `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data`.
+This data is then pared down to only the psychiatrically relevant nodes and edges by the [`create_graph.py`](./create_graph.py]) script.
+First, loading of the disease, drug, protein, and DNA modality tables happens and the hybrid `PsychiatricRelevanceScorer` is invoked, which fuses ontology membership, learned group labels, psychiatric drug neighborhoods, and cosine similarity to psychiatric prototype text snippets into a continuous relevance score.
+The high-confidence combinations still pass even if a single dimension underperforms, while low-scoring nodes are excluded.
 
-1. Specified queries ("bipolar disorder", "major depressive disorder", "schizoaffective disorder", "anxiety disorder", "PTSD", "OCD", "OCPD") are split into buckets with an extra fetch buffer evenly spread amongst each of the queries in case an error occurs during download or processing
-1. Fetch text from OpenAlex (falling back to PMC) for top M most cited and N most recent papers for each query, all of which are restricted to have been published in the past decade
-1. Pull out only results and discussion section
-1. Extraction process (via [Biomedical Stanza](https://stanfordnlp.github.io/stanza/available_biomed_models.html) and [Hugging Face](https://huggingface.co/pritamdeka/PubMedBERT-MNLI-MedNLI))
-    1. Tokenization
-    1. POS
-    1. NER for Nodes - NER exclusion terms
-    1. Lemmatization of found NER terms to ensure canonicalization of nodes
-    1. Entailment (only Hugging Face part) for relations
+Only disease vertices meeting these criteria become seed indices for the downstream graph walk.
+Any edge whose source or target index appears in the psychiatric seed set is retained, optionally intersected with a whitelist of relation labels.
+After collection, each edge is checked against the relation-role constraints prepared during initialization so that invalid edges are removed (i.e. "drug_disease" edges must actually bind drug-like nodes to disease-like nodes).
+For every surviving edge, the extractor reconstructs a unique node table, joining in the disease/drug/protein/DNA attributes, and exporting JSON blobs for downstream consumption.
+***TODO: INCLUDE TEXT METADATA, MODIFY NODE ATTRIBUTE INGESTION IN DEEP SET TO ACCOMODATE.***
+Psychiatric scoring outputs (psy_score, psy_evidence, boolean flags, and the final is_psychiatric decision) are carried through so that later models can weight nodes by clinical relevance.
+Nodes lacking these columns receive neutral defaults to keep the table schema consistent.
+
+The filtered node/edge frames are projected into a multiplex networkx.MultiDiGraph, preserving node metadata and relation labels; reverse edges are optionally added when symmetrical analysis is required.
+During weighted projection each undirected edge receives a prior determined by its relation label and is modulated by the mean psychiatric score of its incident nodes, suppressing ties to weakly psychiatric neighbors while never dropping them outright.
+Finally, the pipeline streams the psychiatric slice of PrimeKG into Parquet tables plus directed and weighted GraphML files, yielding artifacts whose every node and edge has survived both the semantic filters and the psychiatric relevance scoring requirements described above.
 
 ### Preventing Biased Alignment
 Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input graph and the target taxonomies, nodes corresponding to existing nosological systems are explicitly removed from the graph before partitioning.
@@ -137,13 +140,13 @@ Only after the final partitioning is complete will alignment metrics such as nor
 This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
 
 ### Partitioning
-Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [19], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
+Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [20], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
 This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits hSBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
 
 Second, a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)** tailored to the heterogeneous, typed graph.
 The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignment matrix.
-This latent space is partitioned by Louizos et al.’s hard-concrete (L0) gates [20].
+This latent space is partitioned by Louizos et al.’s hard-concrete (L0) gates [21].
 Cluster gates drive automatic selection of the surviving latent clusters.
 Relation-specific inter-cluster gates and matrices learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
 For each relation type, a distinct decoder is trained to reconstruct edges of that type from the shared latent embeddings.
@@ -165,7 +168,7 @@ Each layer is followed by either `GraphNorm` (the default choice, given its empi
 The stack yields node embeddings that remain well-conditioned across sampling regimes, and the module returns both the embeddings and auxiliary bookkeeping tensors (e.g., batch indices) that downstream Sinkhorn balancing and gate sampling procedures consume to form temperature-controlled cluster assignment matrices.
 
 #### Decoder Architecture
-To improve expressivity while maintaining the strict size- and permutation-invariance required for subgraph-level training, the rGCN-SCAE decoder was designed using a **Deep Sets–style relational energy function** [21], [22].
+To improve expressivity while maintaining the strict size- and permutation-invariance required for subgraph-level training, the rGCN-SCAE decoder was designed using a **Deep Sets–style relational energy function** [22], [23].
 Unlike bilinear or message-passing decoders, which respectively underfit or introduce graph-size dependence, this formulation learns an invariant nonlinear mapping between pairs of latent embeddings and their relation type.
 
 Mathematically, for any relation type r and node pair (i,j):
@@ -354,6 +357,7 @@ The two approaches are treated as triangulating evidence: concordant structure a
 1. L. Wang et al., “BIOS: An algorithmically generated biomedical knowledge graph,” arXiv preprint arXiv:2203.09975, 2022.
 1. W. Wei et al., “NetMoST: A network-based machine learning approach for subtyping schizophrenia using polygenic SNP allele biomarkers,” arXiv preprint arXiv:2305.07005, 2023.
 1. D. Drysdale et al., “Resting-state connectivity biomarkers define neurophysiological subtypes of depression,” Nat. Med., vol. 23, pp. 28–38, 2017.
+1. S. Gao, K. Yu, Y. Yang, S. Yu, C. Shi, X. Wang, N. Tang, and H. Zhu, “Large language model powered knowledge graph construction for mental health exploration,” Nature Communications, vol. 16, no. 1, Art. no. 7526, 2025, doi: 10.1038/s41467-025-62781-z.
 1. T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership stochastic blockmodels for multiple networks and experimental interventions,” in Handbook of Mixed Membership Models and Their Applications, E. Airoldi, D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman & Hall/CRC Press, 2014, pp. 463–488.
 1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
 1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
