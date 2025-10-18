@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from xml.etree.ElementTree import Element, ElementTree, SubElement
 
 import networkx as nx
@@ -21,6 +22,11 @@ from psychiatry_scoring import (
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]{2,}")
+_TEXT_TOKEN_LIMIT_PER_FIELD = 32
+_TEXT_TOKEN_LIMIT_TOTAL = 128
 
 
 _DEFAULT_PATTERNS: tuple[str, ...] = (
@@ -56,6 +62,67 @@ _DEFAULT_RELATION_CONSTRAINTS: dict[str, tuple[set[str], set[str]]] = {
     "drug_sideeffect": ({"drug"}, {"sideeffect", "symptom"}),
     "sideeffect_drug": ({"sideeffect", "symptom"}, {"drug"}),
 }
+
+
+def _tokenize_text(value: str) -> List[str]:
+    if not value:
+        return []
+    return _TOKEN_RE.findall(value.lower())
+
+
+def _unique_tokens(tokens: Iterable[str], limit: int) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for token in tokens:
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+        if len(ordered) >= limit:
+            break
+    return ordered
+
+
+def _extract_text_tokens(raw: str, per_field_limit: int) -> List[str]:
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = raw
+
+    if isinstance(payload, dict):
+        source_iter: Iterable[Any] = payload.values()
+    elif isinstance(payload, list):
+        source_iter = payload
+    else:
+        source_iter = [payload]
+
+    candidates: List[str] = []
+    for value in source_iter:
+        if isinstance(value, str):
+            candidates.extend(_tokenize_text(value))
+    return _unique_tokens(candidates, per_field_limit)
+
+
+def _parse_float(value: Optional[str]) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_bool(value: Optional[str]) -> Optional[bool]:
+    if value in (None, ""):
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes"}:
+        return True
+    if lowered in {"false", "0", "no"}:
+        return False
+    return None
 
 
 def _truncate_text(expr: pl.Expr, limit: int, *, alias: str) -> pl.Expr:

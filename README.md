@@ -122,8 +122,7 @@ The high-confidence combinations still pass even if a single dimension underperf
 Only disease vertices meeting these criteria become seed indices for the downstream graph walk.
 Any edge whose source or target index appears in the psychiatric seed set is retained, optionally intersected with a whitelist of relation labels.
 After collection, each edge is checked against the relation-role constraints prepared during initialization so that invalid edges are removed (i.e. "drug_disease" edges must actually bind drug-like nodes to disease-like nodes).
-For every surviving edge, the extractor reconstructs a unique node table, joining in the disease/drug/protein/DNA attributes, and exporting JSON blobs for downstream consumption.
-***TODO: INCLUDE TEXT METADATA, MODIFY NODE ATTRIBUTE INGESTION IN DEEP SET TO ACCOMODATE.***
+For every surviving edge, the extractor reconstructs a unique node table, joining in the disease/drug/protein/DNA/text attributes, and exporting JSON blobs for downstream consumption.
 Psychiatric scoring outputs (psy_score, psy_evidence, boolean flags, and the final is_psychiatric decision) are carried through so that later models can weight nodes by clinical relevance.
 Nodes lacking these columns receive neutral defaults to keep the table schema consistent.
 

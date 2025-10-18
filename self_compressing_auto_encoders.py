@@ -90,22 +90,32 @@ class SharedAttributeVocab(nn.Module):
         self.embedding = nn.Embedding(len(self.name_to_index), embedding_dim)
 
     def add_names(self, new_names: List[str]):
-        names_to_add = [name for name in new_names if name not in self.name_to_index]
+        names_to_add: List[str] = []
+        for name in new_names:
+            if not name:
+                continue
+            if name not in self.name_to_index:
+                names_to_add.append(name)
+
+        if not names_to_add:
+            return
 
         starting_index = len(self.name_to_index)
-        num_new_names = len(names_to_add)
-
         for offset, name in enumerate(names_to_add):
             new_idx = starting_index + offset
             self.name_to_index[name] = new_idx
             self.index_to_name[new_idx] = name
 
         # expand the embedding matrix with He‐style initialization for the new rows
-        old_weight = self.embedding.weight.data
+        device = self.embedding.weight.device
+        dtype = self.embedding.weight.dtype
+        old_weight = self.embedding.weight.data.to(device=device, dtype=dtype)
         fan_in = old_weight.size(1)
-        new_rows = torch.randn(len(names_to_add), fan_in) * math.sqrt(2 / fan_in)
+        new_rows = torch.randn(len(names_to_add), fan_in, device=device, dtype=dtype)
+        new_rows = new_rows * math.sqrt(2 / fan_in)
         new_weight = torch.cat([old_weight, new_rows], dim=0)
         self.embedding = nn.Embedding.from_pretrained(new_weight, freeze=False)
+        self.embedding.to(device)
 
 
 class NodeAttributeDeepSetEncoder(nn.Module):
@@ -141,40 +151,56 @@ class NodeAttributeDeepSetEncoder(nn.Module):
         self.out_dim = out_dim
 
     def get_value_tensor(self, value: Any):
+        device = self.shared_attr_vocab.embedding.weight.device
         if isinstance(value, (int, float)):
-            value = torch.tensor([value], dtype=torch.float)
-        elif isinstance(value, str):
-            index = self.shared_attr_vocab.name_to_index.get(
-                value, self.shared_attr_vocab.name_to_index["<UNK>"]
+            value_tensor = torch.tensor(
+                [float(value)], dtype=torch.float, device=device
             )
-            index = torch.tensor(index, dtype=torch.long)
-            value = self.shared_attr_vocab.embedding(index)
+        elif isinstance(value, torch.Tensor):
+            value_tensor = value.to(device=device)
+        elif isinstance(value, str):
+            token = value if value else "<UNK>"
+            if token not in self.shared_attr_vocab.name_to_index:
+                self.shared_attr_vocab.add_names([token])
+            index = torch.tensor(
+                self.shared_attr_vocab.name_to_index.get(
+                    token, self.shared_attr_vocab.name_to_index["<UNK>"]
+                ),
+                dtype=torch.long,
+                device=device,
+            )
+            value_tensor = self.shared_attr_vocab.embedding(index)
         else:
             raise TypeError(f"Unsupported attribute value type: {type(value)}")
-        value = value.view(-1)
-        if value.numel() < self.max_value_dim:
-            pad_amt = self.max_value_dim - value.numel()
-            return F.pad(value, (0, pad_amt), "constant", 0.0)
-        else:
-            return value[: self.max_value_dim]
+        value_tensor = value_tensor.view(-1)
+        if value_tensor.numel() < self.max_value_dim:
+            pad_amt = self.max_value_dim - value_tensor.numel()
+            return F.pad(value_tensor, (0, pad_amt), "constant", 0.0)
+        return value_tensor[: self.max_value_dim]
 
     def forward(self, attr_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         if not attr_dict or len(attr_dict) == 0:
-            return torch.zeros(self.aggregator[-1].out_features)
+            device = self.shared_attr_vocab.embedding.weight.device
+            return torch.zeros(self.aggregator[-1].out_features, device=device)
 
         phis = []
+        device = self.shared_attr_vocab.embedding.weight.device
         for attr, value in sorted(
-            attr_dict.items(), key=lambda i: i[0].name
-        ):  # consistent ordering
+            attr_dict.items(), key=lambda item: getattr(item[0], "name", str(item[0]))
+        ):
+            attr_name = getattr(attr, "name", str(attr))
+            if attr_name not in self.shared_attr_vocab.name_to_index:
+                self.shared_attr_vocab.add_names([attr_name])
             name_index = torch.tensor(
-                self.shared_attr_vocab.name_to_index[attr.name], dtype=torch.long
+                self.shared_attr_vocab.name_to_index[attr_name],
+                dtype=torch.long,
+                device=device,
             )
-            value = self.get_value_tensor(value)
+            value_tensor = self.get_value_tensor(value)
+            name_embedding = self.shared_attr_vocab.embedding(name_index)
             phis.append(
                 self.attr_encoder(
-                    torch.cat(
-                        [self.shared_attr_vocab.embedding(name_index), value], dim=0
-                    )
+                    torch.cat([name_embedding, value_tensor.to(device)], dim=0)
                 )
             )
         return self.aggregator(torch.stack(phis, dim=0).sum(dim=0))

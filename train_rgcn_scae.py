@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch_geometric.data import Data
@@ -23,6 +24,71 @@ from self_compressing_auto_encoders import (
 
 GRAPHML_NS = "{http://graphml.graphdrawing.org/xmlns}"
 
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]{2,}")
+_TEXT_TOKEN_LIMIT_PER_FIELD = 32
+_TEXT_TOKEN_LIMIT_TOTAL = 128
+
+
+def _tokenize_text(value: str) -> List[str]:
+    if not value:
+        return []
+    return _TOKEN_RE.findall(value.lower())
+
+
+def _unique_tokens(tokens: Iterable[str], limit: int) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for token in tokens:
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+        if len(ordered) >= limit:
+            break
+    return ordered
+
+
+def _extract_text_tokens(raw: str, per_field_limit: int) -> List[str]:
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = raw
+
+    if isinstance(payload, dict):
+        source_iter: Iterable[Any] = payload.values()
+    elif isinstance(payload, list):
+        source_iter = payload
+    else:
+        source_iter = [payload]
+
+    candidates: List[str] = []
+    for value in source_iter:
+        if isinstance(value, str):
+            candidates.extend(_tokenize_text(value))
+    return _unique_tokens(candidates, per_field_limit)
+
+
+def _parse_float(value: Optional[str]) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_bool(value: Optional[str]) -> Optional[bool]:
+    if value in (None, ""):
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes"}:
+        return True
+    if lowered in {"false", "0", "no"}:
+        return False
+    return None
+
 
 @dataclass
 class MultiplexGraph:
@@ -32,6 +98,7 @@ class MultiplexGraph:
     node_index: Mapping[str, int]
     node_type_index: Mapping[str, int]
     relation_index: Mapping[str, int]
+    node_attributes: List[Dict[str, Any]]
 
     @property
     def node_names(self) -> List[str]:
@@ -96,12 +163,88 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
     node_types: List[str] = []
     node_type_index: Dict[str, int] = {}
     node_type_ids: List[int] = []
+    node_attribute_dicts: List[Dict[str, Any]] = []
+
+    metadata_fields = (
+        "disease_metadata",
+        "drug_metadata",
+        "protein_metadata",
+        "dna_metadata",
+    )
+
     for node_id, attrs in nodes:
         node_type = attrs.get("node_type", "Unknown")
         if node_type not in node_type_index:
             node_type_index[node_type] = len(node_type_index)
             node_types.append(node_type)
         node_type_ids.append(node_type_index[node_type])
+
+        attr_dict: Dict[str, Any] = {}
+        token_budget = _TEXT_TOKEN_LIMIT_TOTAL
+
+        if node_type:
+            attr_dict[f"node_type::{node_type.lower()}"] = 1.0
+
+        source = attrs.get("source")
+        if source:
+            attr_dict[f"source::{source.lower()}"] = 1.0
+
+        name_value = attrs.get("name")
+        if name_value:
+            name_tokens = _unique_tokens(
+                _tokenize_text(name_value), min(8, token_budget)
+            )
+            for token in name_tokens:
+                attr_dict[f"name_token::{token}"] = 1.0
+            token_budget -= len(name_tokens)
+
+        psy_score = _parse_float(attrs.get("psy_score"))
+        if psy_score is not None:
+            attr_dict["psy_score"] = psy_score
+
+        text_score = _parse_float(attrs.get("text_score"))
+        if text_score is not None:
+            attr_dict["text_score"] = text_score
+
+        for flag_field in (
+            "is_psychiatric",
+            "ontology_flag",
+            "group_flag",
+            "drug_flag",
+        ):
+            flag_value = _parse_bool(attrs.get(flag_field))
+            if flag_value is not None:
+                attr_dict[flag_field] = 1.0 if flag_value else 0.0
+
+        evidence_raw = attrs.get("psy_evidence")
+        if evidence_raw:
+            try:
+                evidence_list = json.loads(evidence_raw)
+            except json.JSONDecodeError:
+                evidence_list = None
+            if isinstance(evidence_list, list):
+                for label in evidence_list:
+                    if token_budget <= 0:
+                        break
+                    if isinstance(label, str):
+                        token = label.strip().lower()
+                        if not token:
+                            continue
+                        attr_dict[f"evidence::{token}"] = 1.0
+                        token_budget -= 1
+
+        for field in metadata_fields:
+            if token_budget <= 0:
+                break
+            tokens = _extract_text_tokens(
+                attrs.get(field, ""),
+                min(_TEXT_TOKEN_LIMIT_PER_FIELD, token_budget),
+            )
+            for token in tokens:
+                attr_dict[f"{field}::{token}"] = 1.0
+            token_budget -= len(tokens)
+
+        node_attribute_dicts.append(attr_dict)
 
     relation_index: Dict[str, int] = {}
     edge_pairs: List[Tuple[int, int]] = []
@@ -133,12 +276,14 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
     data.node_names = [node_id for node_id, _ in nodes]
     data.node_type_names = list(node_type_index.keys())
     data.edge_type_names = list(relation_index.keys())
+    data.node_attributes = node_attribute_dicts
 
     return MultiplexGraph(
         data=data,
         node_index=node_index,
         node_type_index=node_type_index,
         relation_index=relation_index,
+        node_attributes=node_attribute_dicts,
     )
 
 
@@ -172,6 +317,39 @@ def _parse_mlflow_tags(raw_tags: Optional[Sequence[str]]) -> Dict[str, str]:
             continue
         tags[key] = value.strip()
     return tags
+
+
+def _iter_attribute_dicts(
+    node_attributes: Optional[List[Any]],
+) -> Iterable[Dict[str, Any]]:
+    if not node_attributes:
+        return []
+    if isinstance(node_attributes, list):
+        for item in node_attributes:
+            if isinstance(item, dict):
+                yield item
+            elif isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, dict):
+                        yield sub
+
+
+def _populate_shared_vocab(
+    shared_vocab: SharedAttributeVocab, node_attributes: Optional[List[Any]]
+) -> None:
+    attr_names: set[str] = set()
+    string_values: set[str] = set()
+
+    for attrs in _iter_attribute_dicts(node_attributes):
+        for name, value in attrs.items():
+            attr_names.add(str(name))
+            if isinstance(value, str) and value:
+                string_values.add(value)
+
+    if attr_names:
+        shared_vocab.add_names(sorted(attr_names))
+    if string_values:
+        shared_vocab.add_names(sorted(string_values))
 
 
 @contextmanager
@@ -230,6 +408,7 @@ def train_scae_on_graph(
     shared_vocab = SharedAttributeVocab(
         initial_names=[], embedding_dim=attr_encoder_dims[0]
     )
+    _populate_shared_vocab(shared_vocab, getattr(graph.data, "node_attributes", None))
     attr_encoder = NodeAttributeDeepSetEncoder(
         shared_attr_vocab=shared_vocab,
         encoder_hdim=attr_encoder_dims[0],
@@ -287,7 +466,7 @@ def train_scae_on_graph(
             node_types=node_types,
             edge_index=edge_index,
             batch=batch_vec,
-            node_attributes=None,
+            node_attributes=getattr(graph.data, "node_attributes", None),
             edge_type=edge_type,
             negative_sampling_ratio=0.0,
         )
