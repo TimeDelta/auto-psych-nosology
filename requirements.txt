@@ -7,6 +7,7 @@ nltk>=3.8
 orjson
 pandas
 pdfminer.six
+mlflow
 pre-commit
 pydantic
 python-dotenv

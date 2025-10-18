@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -138,6 +140,54 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
         node_type_index=node_type_index,
         relation_index=relation_index,
     )
+
+
+def _parse_mlflow_tags(raw_tags: Optional[Sequence[str]]) -> Dict[str, str]:
+    if not raw_tags:
+        return {}
+    tags: Dict[str, str] = {}
+    for candidate in raw_tags:
+        if candidate is None:
+            continue
+        if "=" in candidate:
+            key, value = candidate.split("=", 1)
+        else:
+            key, value = candidate, ""
+        key = key.strip()
+        if not key:
+            continue
+        tags[key] = value.strip()
+    return tags
+
+
+@contextmanager
+def _mlflow_run(
+    enabled: bool,
+    tracking_uri: Optional[str],
+    experiment_name: Optional[str],
+    run_name: Optional[str],
+    tags: Mapping[str, str],
+):
+    if not enabled:
+        yield None
+        return
+    try:
+        import mlflow
+    except ImportError as exc:
+        raise RuntimeError(
+            "MLflow tracking requested but the 'mlflow' package is not installed."
+        ) from exc
+
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+    if experiment_name:
+        mlflow.set_experiment(experiment_name)
+
+    run_kwargs = {"run_name": run_name} if run_name else {}
+    with mlflow.start_run(**run_kwargs):
+        if tags:
+            mlflow.set_tags(tags)
+        yield mlflow
 
 
 def train_scae_on_graph(
@@ -322,6 +372,37 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=1e-12,
         help="Numerical floor for entropy/Dirichlet calculations",
     )
+    parser.add_argument(
+        "--mlflow",
+        action="store_true",
+        help="Enable MLflow tracking for this run",
+    )
+    parser.add_argument(
+        "--mlflow-tracking-uri",
+        type=str,
+        default="http://127.0.0.1:5000",
+        help="Optional MLflow tracking URI; otherwise uses the default profile",
+    )
+    parser.add_argument(
+        "--mlflow-experiment",
+        type=str,
+        default=None,
+        help="Name of the MLflow experiment to log under",
+    )
+    parser.add_argument(
+        "--mlflow-run-name",
+        type=str,
+        default=None,
+        help="Optional MLflow run name",
+    )
+    parser.add_argument(
+        "--mlflow-tag",
+        type=str,
+        action="append",
+        dest="mlflow_tags",
+        default=None,
+        help="Additional MLflow tag(s) as KEY=VALUE. May be supplied multiple times.",
+    )
     return parser
 
 
@@ -330,26 +411,101 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     graph = load_multiplex_graph(args.graphml)
-    model, partition, history = train_scae_on_graph(
-        graph,
-        num_clusters=args.clusters,
-        hidden_dims=args.hidden,
-        epochs=args.epochs,
-        lr=args.lr,
-        negative_sampling_ratio=args.negative_sampling,
-        gate_threshold=args.gate_threshold,
-        min_cluster_size=args.min_cluster_size,
-        device=args.device,
-        verbose=not args.quiet,
-        entropy_weight=args.entropy_weight,
-        dirichlet_alpha=args.dirichlet_alpha,
-        dirichlet_weight=args.dirichlet_weight,
-        embedding_norm_weight=args.embedding_norm_weight,
-        kld_weight=args.kld_weight,
-        entropy_eps=args.entropy_eps,
+    effective_num_clusters = (
+        args.clusters
+        if args.clusters is not None
+        else max(1, len(graph.node_type_index))
     )
 
-    save_partition(partition, args.out, graph)
+    tags = _parse_mlflow_tags(args.mlflow_tags)
+    with _mlflow_run(
+        enabled=args.mlflow,
+        tracking_uri=args.mlflow_tracking_uri,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name,
+        tags=tags,
+    ) as mlflow_client:
+        if mlflow_client is not None:
+            hidden_dims_param = ",".join(map(str, args.hidden)) if args.hidden else ""
+            dirichlet_alpha_param = (
+                ",".join(map(str, args.dirichlet_alpha)) if args.dirichlet_alpha else ""
+            )
+            mlflow_client.log_params(
+                {
+                    "graph_path": str(args.graphml),
+                    "output_path": str(args.out),
+                    "epochs": args.epochs,
+                    "device": args.device or "auto",
+                    "learning_rate": args.lr,
+                    "negative_sampling_ratio": args.negative_sampling,
+                    "gate_threshold": args.gate_threshold,
+                    "min_cluster_size": args.min_cluster_size,
+                    "entropy_weight": args.entropy_weight,
+                    "dirichlet_weight": args.dirichlet_weight,
+                    "embedding_norm_weight": args.embedding_norm_weight,
+                    "kld_weight": args.kld_weight,
+                    "entropy_eps": args.entropy_eps,
+                    "hidden_dims": hidden_dims_param,
+                    "effective_num_clusters": effective_num_clusters,
+                    "dirichlet_alpha": dirichlet_alpha_param,
+                }
+            )
+            mlflow_client.log_params(
+                {
+                    "num_nodes": int(graph.data.node_types.numel()),
+                    "num_relations": len(graph.relation_index),
+                    "num_node_types": len(graph.node_type_index),
+                }
+            )
+
+        model, partition, history = train_scae_on_graph(
+            graph,
+            num_clusters=effective_num_clusters,
+            hidden_dims=args.hidden,
+            epochs=args.epochs,
+            lr=args.lr,
+            negative_sampling_ratio=args.negative_sampling,
+            gate_threshold=args.gate_threshold,
+            min_cluster_size=args.min_cluster_size,
+            device=args.device,
+            verbose=not args.quiet,
+            entropy_weight=args.entropy_weight,
+            dirichlet_alpha=args.dirichlet_alpha,
+            dirichlet_weight=args.dirichlet_weight,
+            embedding_norm_weight=args.embedding_norm_weight,
+            kld_weight=args.kld_weight,
+            entropy_eps=args.entropy_eps,
+        )
+
+        if mlflow_client is not None:
+            for epoch_idx, metrics in enumerate(history, start=1):
+                mlflow_client.log_metrics(metrics, step=epoch_idx)
+            if history:
+                final_loss = history[-1].get("loss")
+                if final_loss is not None and math.isfinite(final_loss):
+                    mlflow_client.log_metric("final_loss", float(final_loss))
+            mlflow_client.log_metric(
+                "num_active_clusters", len(partition.active_clusters)
+            )
+            type_embedding = getattr(model.encoder, "node_type_embedding", None)
+            if type_embedding is not None and hasattr(type_embedding, "embedding_dim"):
+                mlflow_client.log_param(
+                    "type_embedding_dim", int(type_embedding.embedding_dim)
+                )
+
+            attr_encoder = getattr(model.encoder, "attr_encoder", None)
+            if attr_encoder is not None and hasattr(attr_encoder, "out_dim"):
+                mlflow_client.log_param(
+                    "attr_encoder_out_dim", int(attr_encoder.out_dim)
+                )
+
+        save_partition(partition, args.out, graph)
+        if mlflow_client is not None:
+            mlflow_client.log_artifact(str(args.out))
+            mlflow_client.log_metric(
+                "partition_active_clusters", len(partition.active_clusters)
+            )
+
     print(
         f"Saved partition with {len(partition.active_clusters)} clusters to {args.out}"
     )

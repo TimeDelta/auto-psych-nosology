@@ -4,3 +4,7 @@
 *.html
 *.key
 *.ppt
+*.json
+data/
+mlruns/
+__pycache__/
