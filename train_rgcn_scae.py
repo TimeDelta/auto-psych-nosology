@@ -9,7 +9,18 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch_geometric.data import Data
@@ -401,6 +412,7 @@ def train_scae_on_graph(
     embedding_norm_weight: float = 1e-4,
     kld_weight: float = 1e-3,
     entropy_eps: float = 1e-12,
+    epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
         num_clusters = _default_cluster_capacity(graph)
@@ -448,6 +460,7 @@ def train_scae_on_graph(
         batch_size=1,
         negative_sampling_ratio=negative_sampling_ratio,
         verbose=verbose,
+        on_epoch_end=epoch_callback,
     )
 
     model.eval()
@@ -648,6 +661,23 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 }
             )
 
+        epoch_logger: Optional[Callable[[int, Dict[str, float]], None]] = None
+        if mlflow_client is not None:
+
+            def _epoch_logger(epoch_idx: int, metrics: Dict[str, float]) -> None:
+                safe_metrics: Dict[str, float] = {}
+                for key, value in metrics.items():
+                    try:
+                        numeric = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(numeric):
+                        safe_metrics[key] = numeric
+                if safe_metrics:
+                    mlflow_client.log_metrics(safe_metrics, step=epoch_idx)
+
+            epoch_logger = _epoch_logger
+
         model, partition, history = train_scae_on_graph(
             graph,
             num_clusters=effective_num_clusters,
@@ -665,11 +695,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             embedding_norm_weight=args.embedding_norm_weight,
             kld_weight=args.kld_weight,
             entropy_eps=args.entropy_eps,
+            epoch_callback=epoch_logger,
         )
 
         if mlflow_client is not None:
-            for epoch_idx, metrics in enumerate(history, start=1):
-                mlflow_client.log_metrics(metrics, step=epoch_idx)
             if history:
                 final_loss = history[-1].get("loss")
                 if final_loss is not None and math.isfinite(final_loss):

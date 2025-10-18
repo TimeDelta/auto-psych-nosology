@@ -2,7 +2,7 @@ import math
 import random
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from warnings import warn
 
 import torch
@@ -865,8 +865,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         type_embedding_dim: Optional[int] = None,
         dropout: float = 0.0,
         negative_sampling_ratio: float = 1.0,
-        l0_cluster_weight: float = 1e-6,
-        l0_inter_weight: float = 1e-6,
+        l0_cluster_weight: float = 1e-5,
+        l0_inter_weight: float = 1e-5,
         entropy_weight: float = 1e-3,
         dirichlet_alpha: Union[float, Sequence[float]] = 0.5,
         dirichlet_weight: float = 1e-3,
@@ -1925,6 +1925,7 @@ class OnlineTrainer:
         bucket_by_size: bool = True,
         node_budget: Optional[int] = None,
         shuffle: bool = True,
+        on_epoch_end: Optional[Callable[[int, Dict[str, float]], None]] = None,
     ) -> List[Dict[str, float]]:
         if epochs <= 0:
             raise ValueError("epochs must be a positive integer.")
@@ -2007,12 +2008,17 @@ class OnlineTrainer:
                 raise RuntimeError("Training loader produced zero batches.")
 
             averaged_metrics = {k: v / batch_count for k, v in metric_sums.items()}
-            averaged_metrics["loss"] = epoch_loss / batch_count
             self.history.append(averaged_metrics)
+            if on_epoch_end is not None:
+                try:
+                    on_epoch_end(epoch, averaged_metrics)
+                except Exception:
+                    # Ensure training continues even if logging hook fails.
+                    pass
 
             if verbose:
                 print(
-                    f"Epoch {epoch}/{epochs} loss={averaged_metrics['loss']:.4f} metrics={averaged_metrics}"
+                    f"Epoch {epoch}/{epochs} loss={averaged_metrics['total_loss']:.4f} metrics={averaged_metrics}"
                 )
 
         return self.history
