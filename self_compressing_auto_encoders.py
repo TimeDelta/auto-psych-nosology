@@ -1010,6 +1010,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         self.l0_inter_weight = float(l0_inter_weight)
         self.entropy_weight = float(entropy_weight)
         self.dirichlet_weight = float(dirichlet_weight)
+        self.dirichlet_alpha = dirichlet_alpha
         self.embedding_norm_weight = float(embedding_norm_weight)
         self.kld_weight = float(kld_weight)
         self.entropy_eps = float(entropy_eps)
@@ -1470,13 +1471,26 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         )
 
         cluster_usage = assignment_probs.mean(dim=0)
-        dirichlet_loss = (
-            -self.dirichlet_weight
-            * (
-                (self.dirichlet_alpha - 1.0)
-                * torch.log(cluster_usage.clamp_min(self.entropy_eps))
-            ).sum()
-        )
+        # Encourage cluster usage to match the Dirichlet prior via KL divergence
+        usage_probs = cluster_usage.clamp_min(self.entropy_eps)
+        usage_probs = usage_probs / usage_probs.sum().clamp_min(self.entropy_eps)
+        if isinstance(self.dirichlet_alpha, (float, int)):
+            alpha_values = assignments.new_full(
+                (usage_probs.size(0),), float(self.dirichlet_alpha)
+            )
+        else:
+            alpha_tensor = torch.as_tensor(
+                self.dirichlet_alpha, dtype=assignments.dtype, device=assignments.device
+            )
+            if alpha_tensor.numel() != usage_probs.size(0):
+                raise ValueError(
+                    "dirichlet_alpha must provide one value per cluster or a scalar."
+                )
+            alpha_values = alpha_tensor
+        prior_probs = alpha_values.clamp_min(self.entropy_eps)
+        prior_probs = prior_probs / prior_probs.sum().clamp_min(self.entropy_eps)
+        dirichlet_kl = (usage_probs * (usage_probs.log() - prior_probs.log())).sum()
+        dirichlet_loss = self.dirichlet_weight * dirichlet_kl.clamp_min(0.0)
         self._revive_dead_clusters(gate_sample, cluster_usage)
 
         if node_embeddings is None or node_embeddings.numel() == 0:
