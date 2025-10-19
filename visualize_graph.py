@@ -1,7 +1,8 @@
 import argparse
 import json
+import math
 import pathlib
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import networkx as nx
 
@@ -130,12 +131,82 @@ def stringify_complex_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def compute_layout(
+    graph: nx.Graph,
+    layout: str,
+    seed: int,
+    scale: float,
+    auto_threshold: int = 3000,
+    iterations: Optional[int] = None,
+) -> Optional[Dict[Any, Tuple[float, float]]]:
+    """Return a 2D layout for the graph or None if layout is disabled."""
+
+    layout_key = (layout or "none").lower()
+    if layout_key in {"none", "off"}:
+        return None
+
+    n_nodes = graph.number_of_nodes()
+    iteration_hint = iterations
+
+    if layout_key == "auto":
+        if n_nodes > auto_threshold and iteration_hint is None:
+            # For very large graphs, bound the number of iterations so the layout completes promptly.
+            iteration_hint = max(20, min(80, int(8000 / max(1.0, math.sqrt(n_nodes)))))
+            print(
+                f"[INFO] Auto layout: spring_layout with {iteration_hint} iterations for {n_nodes} nodes.",
+                flush=True,
+            )
+        layout_key = "spring"
+        if iteration_hint is None:
+            iteration_hint = 60
+
+    layout_key = layout_key.replace("-", "_")
+
+    try:
+        if layout_key in {"spring", "fr", "fruchterman_reingold"}:
+            spring_kwargs: Dict[str, Any] = {"seed": seed}
+            if iteration_hint is not None:
+                spring_kwargs["iterations"] = iteration_hint
+            base_pos = nx.spring_layout(graph, **spring_kwargs)
+        elif layout_key in {"kamada", "kamada_kawai"}:
+            base_pos = nx.kamada_kawai_layout(graph)
+        elif layout_key == "circular":
+            base_pos = nx.circular_layout(graph)
+        elif layout_key == "spectral":
+            base_pos = nx.spectral_layout(graph)
+        elif layout_key == "random":
+            base_pos = nx.random_layout(graph, seed=seed)
+        else:
+            raise ValueError(
+                "Unsupported layout '"
+                f"{layout}'"
+                ". Choose from auto, none, spring, fruchterman_reingold, kamada_kawai, circular, spectral, random."
+            )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        print(
+            f"[WARN] Layout computation failed for '{layout_key}' ({exc}). Falling back to browser physics.",
+            flush=True,
+        )
+        return None
+
+    def _scale(value: float) -> float:
+        return float(value) * scale
+
+    return {
+        node: (_scale(coords[0]), _scale(coords[1]))
+        for node, coords in base_pos.items()
+    }
+
+
 def export_visnetwork_html(
     graph: nx.Graph,
     output_html: str,
     node_type_attr: str = "node_type",
     node_label_attr: str = "canonical_name",
     edge_type_attr: str = "relation",
+    positions: Optional[Dict[Any, Tuple[float, float]]] = None,
+    physics_enabled: bool = True,
+    improved_layout: bool = True,
 ):
     # Build nodes/edges arrays for vis-network
     # Color maps (fixed palette cycling)
@@ -158,16 +229,25 @@ def export_visnetwork_html(
             f"{k}: {v}" for k, v in sorted(attrs_str.items()) if k != node_label_attr
         )
         title = "\n".join(title_lines)
-        nodes.append(
-            {
-                "id": str(n),
-                "label": str(label),
-                "title": title,
-                "color": {"background": color, "border": "#222"},
-                "shape": "dot",
-                "size": 16,
-            }
-        )
+        node_payload: Dict[str, Any] = {
+            "id": str(n),
+            "label": str(label),
+            "title": title,
+            "color": {"background": color, "border": "#222"},
+            "shape": "dot",
+            "size": 16,
+        }
+
+        if positions and n in positions:
+            x, y = positions[n]
+            node_payload.update({"x": x, "y": y})
+            if not physics_enabled:
+                node_payload["fixed"] = {"x": True, "y": True}
+
+        if not physics_enabled:
+            node_payload["physics"] = False
+
+        nodes.append(node_payload)
 
     edges = []
     if graph.is_multigraph():
@@ -204,6 +284,21 @@ def export_visnetwork_html(
                 }
             )
 
+    physics_config: Dict[str, Any] = {"enabled": physics_enabled}
+    if physics_enabled:
+        physics_config.update(
+            {
+                "stabilization": True,
+                "forceAtlas2Based": {
+                    "gravitationalConstant": -50,
+                    "centralGravity": 0.01,
+                    "springLength": 120,
+                    "springConstant": 0.08,
+                },
+                "solver": "forceAtlas2Based",
+            }
+        )
+
     html_doc = f"""<!doctype html>
 <html>
 <head>
@@ -221,17 +316,9 @@ def export_visnetwork_html(
   const data = {{ nodes, edges }};
   const options = {{
     nodes: {{ borderWidth: 1 }},
-    interaction: {{ hover: true }},
-    physics: {{
-      stabilization: true,
-      forceAtlas2Based: {{
-        gravitationalConstant: -50,
-        centralGravity: 0.01,
-        springLength: 120,
-        springConstant: 0.08
-      }},
-      solver: 'forceAtlas2Based'
-    }}
+    interaction: {{ hover: true, multiselect: true }},
+    layout: {{ improvedLayout: {str(improved_layout).lower()} }},
+    physics: {json.dumps(physics_config)}
   }};
   new vis.Network(container, data, options);
 </script>
@@ -333,6 +420,51 @@ if __name__ == "__main__":
         "--edge-type-attr", default="relation", help="Edge attribute to color by."
     )
     parser.add_argument(
+        "--layout",
+        default="auto",
+        choices=[
+            "auto",
+            "none",
+            "spring",
+            "fruchterman_reingold",
+            "kamada_kawai",
+            "circular",
+            "spectral",
+            "random",
+        ],
+        help="Layout algorithm used to precompute node positions (auto bounds spring iterations for large graphs).",
+    )
+    parser.add_argument(
+        "--layout-scale",
+        type=float,
+        default=500.0,
+        help="Scale factor applied to layout coordinates (higher spreads nodes further).",
+    )
+    parser.add_argument(
+        "--layout-seed",
+        type=int,
+        default=42,
+        help="Random seed used by layout algorithms that support it.",
+    )
+    parser.add_argument(
+        "--layout-iterations",
+        type=int,
+        default=None,
+        help="Number of iterations for spring/fruchterman_reingold layouts (auto chooses a size-aware default).",
+    )
+    parser.add_argument(
+        "--layout-auto-threshold",
+        type=int,
+        default=3000,
+        help="When --layout auto is set, graphs above this node count trigger reduced iteration counts instead of disabling the layout.",
+    )
+    parser.add_argument(
+        "--physics",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Control vis-network physics simulation (auto disables it when a layout is precomputed).",
+    )
+    parser.add_argument(
         "--csv-cols",
         nargs=2,
         metavar=("SOURCE", "TARGET"),
@@ -358,12 +490,35 @@ if __name__ == "__main__":
         for u, v, attrs in list(graph.edges(data=True)):
             graph.edges[u, v].update(stringify_complex_attrs(attrs))
 
+    layout_positions = compute_layout(
+        graph,
+        layout=args.layout,
+        seed=args.layout_seed,
+        scale=args.layout_scale,
+        auto_threshold=args.layout_auto_threshold,
+        iterations=args.layout_iterations,
+    )
+
+    if args.physics == "auto":
+        physics_enabled = layout_positions is None
+    elif args.physics == "on":
+        physics_enabled = True
+    else:
+        physics_enabled = False
+
+    if layout_positions is not None and args.physics == "auto":
+        # Physics fights with fixed layouts; auto-disable when using a precomputed layout.
+        physics_enabled = False
+
     export_visnetwork_html(
         graph,
         output_html=args.out,
         node_type_attr=args.node_type_attr,
         node_label_attr=args.node_label_attr,
         edge_type_attr=args.edge_type_attr,
+        positions=layout_positions,
+        physics_enabled=physics_enabled,
+        improved_layout=layout_positions is None,
     )
 
     if args.static_png:
