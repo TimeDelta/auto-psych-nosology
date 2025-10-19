@@ -1,5 +1,6 @@
 import math
 import random
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -1894,6 +1895,7 @@ class OnlineTrainer:
         model: SelfCompressingRGCNAutoEncoder,
         optimizer,
         device: Optional[str] = None,
+        log_timing: bool = False,
     ):
         resolved_device = (
             torch.device(device)
@@ -1909,15 +1911,31 @@ class OnlineTrainer:
         self._node_sizes: List[int] = []
         self.early_stop_epoch: Optional[int] = None
         self.early_stop_reason: Optional[str] = None
+        self.log_timing = log_timing
 
     def add_data(self, graphs: List[Data]) -> None:
-        for graph in graphs:
+        for idx, graph in enumerate(graphs):
+            graph_start = time.perf_counter()
             clone = graph.clone()
+            clone_duration = time.perf_counter() - graph_start
             self.dataset.append(clone)
             node_count = int(
                 getattr(clone, "num_nodes", None) or clone.node_types.size(0)
             )
             self._node_sizes.append(node_count)
+            if self.log_timing:
+                edge_count = (
+                    int(clone.edge_index.size(1))
+                    if hasattr(clone, "edge_index") and clone.edge_index is not None
+                    else 0
+                )
+                print(
+                    "[TIMING] add_data",
+                    f"index={idx}",
+                    f"clone={clone_duration:.3f}s",
+                    f"nodes={node_count}",
+                    f"edges={edge_count}",
+                )
 
     def clear_dataset(self) -> None:
         self.dataset.clear()

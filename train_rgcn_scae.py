@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
+import random
 import re
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,8 +25,11 @@ from typing import (
     Union,
 )
 
+import networkx as nx
+import numpy as np
 import torch
 from torch_geometric.data import Data
+from torch_geometric.utils import k_hop_subgraph
 
 from nosology_filters import should_drop_nosology_node
 from self_compressing_auto_encoders import (
@@ -407,6 +413,221 @@ def _populate_shared_vocab(
         shared_vocab.add_names(sorted(string_values))
 
 
+def _safe_zscore(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return values
+    mean = float(values.mean())
+    std = float(values.std())
+    if std < 1e-8:
+        return np.zeros_like(values)
+    return (values - mean) / std
+
+
+def _compute_adaptive_radii(
+    data: Data, alpha: float, min_radius: int, max_radius: int
+) -> np.ndarray:
+    num_nodes = int(data.node_types.size(0))
+    if num_nodes == 0:
+        return np.zeros(0, dtype=int)
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(num_nodes))
+    if data.edge_index.numel() > 0:
+        edges = data.edge_index.t().cpu().tolist()
+        graph.add_edges_from((int(u), int(v)) for u, v in edges)
+
+    degree = np.array([graph.degree(n) for n in range(num_nodes)], dtype=float)
+    if graph.number_of_edges() > 0:
+        clustering_map = nx.clustering(graph)
+    else:
+        clustering_map = {}
+    clustering = np.array([float(clustering_map.get(n, 0.0)) for n in range(num_nodes)])
+    try:
+        core_map = nx.core_number(graph)
+    except nx.NetworkXError:
+        core_map = {n: 0 for n in graph.nodes()}
+    core = np.array([float(core_map.get(n, 0.0)) for n in range(num_nodes)])
+
+    z_clustering = _safe_zscore(clustering)
+    z_core = _safe_zscore(core)
+    z_degree = _safe_zscore(degree)
+    composite = z_clustering + z_core - z_degree
+    radii = 1.0 + alpha * composite
+    radii = np.clip(np.round(radii), min_radius, max_radius)
+    return radii.astype(int)
+
+
+def _build_adaptive_subgraph_dataset(
+    graph: MultiplexGraph,
+    num_samples: int,
+    alpha: float,
+    min_radius: int,
+    max_radius: int,
+    rng_seed: Optional[int],
+    verbose: bool,
+    min_nodes: int,
+    min_edges: int,
+) -> List[Data]:
+    data = graph.data
+    num_nodes = int(data.node_types.size(0))
+    if num_nodes == 0 or num_samples <= 0:
+        return [data]
+
+    total_start = time.perf_counter()
+
+    metrics_start = time.perf_counter()
+    radii = _compute_adaptive_radii(data, alpha, min_radius, max_radius)
+    if radii.size == 0:
+        return [data]
+    metrics_duration = time.perf_counter() - metrics_start
+
+    rng = random.Random(rng_seed)
+    population = list(range(num_nodes))
+
+    node_attrs = getattr(data, "node_attributes", None)
+    node_names = getattr(data, "node_names", None)
+    node_ids = getattr(data, "node_ids", None)
+    edge_type = getattr(data, "edge_type", None)
+
+    dataset: List[Data] = []
+    sampling_start = time.perf_counter()
+    dropped_no_edges = 0
+    dropped_too_small = 0
+    sample_attempts = 0
+    max_attempts = max(num_samples * 5, num_samples + 10)
+
+    while len(dataset) < num_samples and sample_attempts < max_attempts:
+        seed = rng.choice(population)
+        sample_start = time.perf_counter()
+        sample_attempts += 1
+        radius = int(max(min_radius, min(max_radius, radii[seed])))
+
+        def build_subgraph(current_radius: int) -> Tuple[Data, int, int, int]:
+            subset, edge_index_sub, mapping, edge_mask = k_hop_subgraph(
+                seed,
+                current_radius,
+                data.edge_index,
+                relabel_nodes=True,
+                num_nodes=num_nodes,
+            )
+            subset = subset.to(torch.long)
+            sub = Data(
+                node_types=data.node_types[subset].clone(),
+                edge_index=edge_index_sub.contiguous(),
+            )
+            if edge_type is not None and edge_type.numel() > 0:
+                sub.edge_type = edge_type[edge_mask].clone()
+            else:
+                sub.edge_type = torch.empty((0,), dtype=torch.long)
+            if node_attrs:
+                sub.node_attributes = [
+                    copy.deepcopy(node_attrs[int(node_idx)])
+                    for node_idx in subset.tolist()
+                ]
+            if node_names:
+                sub.node_names = [
+                    node_names[int(node_idx)] for node_idx in subset.tolist()
+                ]
+            if node_ids:
+                sub.node_ids = [node_ids[int(node_idx)] for node_idx in subset.tolist()]
+            sub.seed_index = torch.tensor([int(mapping)], dtype=torch.long)
+            sub.seed_original_index = torch.tensor([int(seed)], dtype=torch.long)
+            return (
+                sub,
+                current_radius,
+                int(sub.node_types.size(0)),
+                int(sub.edge_index.size(1)),
+            )
+
+        sub_data, radius_used, node_count, edge_count = build_subgraph(radius)
+        while edge_count == 0 and radius_used < max_radius:
+            new_radius = min(max_radius, radius_used + 1)
+            sub_data, radius_used, node_count, edge_count = build_subgraph(new_radius)
+
+        if edge_count == 0:
+            dropped_no_edges += 1
+            if verbose:
+                sample_duration = time.perf_counter() - sample_start
+                print(
+                    "[TIMING] subgraph-skipped",
+                    f"attempt={sample_attempts}",
+                    f"seed={seed}",
+                    f"radius={radius_used}",
+                    f"nodes={node_count}",
+                    "reason=no_edges",
+                    f"duration={sample_duration:.3f}s",
+                )
+            continue
+
+        if node_count < min_nodes or edge_count < min_edges:
+            if radius_used < max_radius:
+                sub_data, radius_used, node_count, edge_count = build_subgraph(
+                    max_radius
+                )
+
+        if node_count < min_nodes or edge_count < min_edges:
+            dropped_too_small += 1
+            if verbose:
+                sample_duration = time.perf_counter() - sample_start
+                print(
+                    "[TIMING] subgraph-skipped",
+                    f"attempt={sample_attempts}",
+                    f"seed={seed}",
+                    f"radius={radius_used}",
+                    f"nodes={node_count}",
+                    f"edges={edge_count}",
+                    "reason=too_small",
+                    f"duration={sample_duration:.3f}s",
+                )
+            continue
+
+        dataset.append(sub_data)
+
+        if verbose:
+            sample_duration = time.perf_counter() - sample_start
+            print(
+                "[TIMING] subgraph",
+                f"index={len(dataset)-1}",
+                f"attempt={sample_attempts}",
+                f"seed={seed}",
+                f"radius={radius_used}",
+                f"nodes={node_count}",
+                f"edges={edge_count}",
+                f"duration={sample_duration:.3f}s",
+            )
+
+    fill_count = 0
+    if len(dataset) < num_samples:
+        if dataset:
+            base_samples = [sample.clone() for sample in dataset]
+        else:
+            base_samples = [graph.data.clone()]
+            dataset.extend(base_samples)
+        while len(dataset) < num_samples:
+            source = base_samples[
+                (len(dataset) - len(base_samples)) % len(base_samples)
+            ]
+            dataset.append(source.clone())
+            fill_count += 1
+
+    sampling_duration = time.perf_counter() - sampling_start
+    total_duration = time.perf_counter() - total_start
+    if verbose:
+        print(
+            "[TIMING] dataset",
+            f"samples={len(dataset)}",
+            f"dropped_no_edges={dropped_no_edges}",
+            f"dropped_too_small={dropped_too_small}",
+            f"attempts={sample_attempts}",
+            f"fills={fill_count}",
+            f"metrics={metrics_duration:.3f}s",
+            f"sampling={sampling_duration:.3f}s",
+            f"total={total_duration:.3f}s",
+        )
+
+    return dataset[:num_samples]
+
+
 @contextmanager
 def _mlflow_run(
     enabled: bool,
@@ -460,6 +681,13 @@ def train_scae_on_graph(
     embedding_norm_weight: float = 1e-4,
     kld_weight: float = 1e-3,
     entropy_eps: float = 1e-12,
+    ego_samples: int = 0,
+    ego_alpha: float = 0.75,
+    ego_min_radius: int = 1,
+    ego_max_radius: int = 3,
+    ego_seed: Optional[int] = None,
+    ego_min_nodes: int = 4,
+    ego_min_edges: int = 2,
     epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
@@ -468,13 +696,29 @@ def train_scae_on_graph(
     shared_vocab = SharedAttributeVocab(
         initial_names=[], embedding_dim=attr_encoder_dims[0]
     )
+    vocab_start = time.perf_counter()
     _populate_shared_vocab(shared_vocab, getattr(graph.data, "node_attributes", None))
+    vocab_duration = time.perf_counter() - vocab_start
+    if verbose:
+        print(
+            "[TIMING] shared vocab populated",
+            f"entries={len(shared_vocab.name_to_index)}",
+            f"duration={vocab_duration:.3f}s",
+        )
+
+    encoder_start = time.perf_counter()
     attr_encoder = NodeAttributeDeepSetEncoder(
         shared_attr_vocab=shared_vocab,
         encoder_hdim=attr_encoder_dims[0],
         aggregator_hdim=attr_encoder_dims[1],
         out_dim=attr_encoder_dims[2],
     )
+    encoder_duration = time.perf_counter() - encoder_start
+    if verbose:
+        print(
+            "[TIMING] attr encoder initialized",
+            f"duration={encoder_duration:.3f}s",
+        )
 
     if dirichlet_alpha is None:
         dirichlet_param: Union[float, Sequence[float]] = 0.5
@@ -501,8 +745,47 @@ def train_scae_on_graph(
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    trainer = OnlineTrainer(model, optimizer, device=device)
-    trainer.add_data([graph.data])
+    if ego_samples > 0:
+        dataset = _build_adaptive_subgraph_dataset(
+            graph,
+            num_samples=ego_samples,
+            alpha=ego_alpha,
+            min_radius=ego_min_radius,
+            max_radius=ego_max_radius,
+            rng_seed=ego_seed,
+            verbose=verbose,
+            min_nodes=ego_min_nodes,
+            min_edges=ego_min_edges,
+        )
+    else:
+        dataset = [graph.data]
+
+    if not dataset:
+        dataset = [graph.data]
+
+    if verbose:
+        node_counts = np.array(
+            [int(sample.node_types.size(0)) for sample in dataset], dtype=float
+        )
+        edge_counts = np.array(
+            [int(sample.edge_index.size(1)) for sample in dataset], dtype=float
+        )
+        print(
+            "[INFO] Training dataset",
+            f"samples={len(dataset)}",
+            f"nodes_mean={node_counts.mean():.1f}",
+            f"nodes_std={node_counts.std():.1f}",
+            f"edges_mean={edge_counts.mean():.1f}",
+            f"edges_std={edge_counts.std():.1f}",
+        )
+
+    trainer = OnlineTrainer(model, optimizer, device=device, log_timing=verbose)
+    add_start = time.perf_counter()
+    trainer.add_data(dataset)
+    add_duration = time.perf_counter() - add_start
+    if verbose:
+        print(f"[TIMING] trainer.add_data took {add_duration:.3f}s")
+
     history = trainer.train(
         epochs=epochs,
         batch_size=1,
@@ -664,6 +947,48 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Numerical floor for entropy/Dirichlet calculations",
     )
     parser.add_argument(
+        "--ego-samples",
+        type=int,
+        default=256,
+        help="Number of adaptive ego-net subgraphs to sample for training (0 to disable)",
+    )
+    parser.add_argument(
+        "--ego-alpha",
+        type=float,
+        default=0.75,
+        help="Scaling coefficient for the connectivity-based hop radius",
+    )
+    parser.add_argument(
+        "--ego-min-radius",
+        type=int,
+        default=1,
+        help="Minimum hop radius for sampled ego-nets",
+    )
+    parser.add_argument(
+        "--ego-max-radius",
+        type=int,
+        default=3,
+        help="Maximum hop radius for sampled ego-nets",
+    )
+    parser.add_argument(
+        "--ego-min-nodes",
+        type=int,
+        default=10,
+        help="Minimum number of nodes required for an ego-net sample",
+    )
+    parser.add_argument(
+        "--ego-min-edges",
+        type=int,
+        default=9,
+        help="Minimum number of edges required for an ego-net sample",
+    )
+    parser.add_argument(
+        "--ego-seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for ego-net sampling",
+    )
+    parser.add_argument(
         "--mlflow",
         action="store_true",
         help="Enable MLflow tracking for this run",
@@ -710,6 +1035,14 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         and args.cluster_stability_window > args.epochs
     ):
         parser.error("--cluster-stability-window cannot exceed --epochs")
+    if args.ego_min_radius < 1:
+        parser.error("--ego-min-radius must be at least 1")
+    if args.ego_max_radius < args.ego_min_radius:
+        parser.error("--ego-max-radius must be >= --ego-min-radius")
+    if args.ego_min_nodes < 1:
+        parser.error("--ego-min-nodes must be positive")
+    if args.ego_min_edges < 0:
+        parser.error("--ego-min-edges must be non-negative")
 
     graph = load_multiplex_graph(args.graphml)
     num_nodes_after = int(graph.data.node_types.numel())
@@ -753,6 +1086,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "embedding_norm_weight": args.embedding_norm_weight,
                     "kld_weight": args.kld_weight,
                     "entropy_eps": args.entropy_eps,
+                    "ego_samples": args.ego_samples,
+                    "ego_alpha": args.ego_alpha,
+                    "ego_min_radius": args.ego_min_radius,
+                    "ego_max_radius": args.ego_max_radius,
+                    "ego_min_nodes": args.ego_min_nodes,
+                    "ego_min_edges": args.ego_min_edges,
                     "hidden_dims": hidden_dims_param,
                     "effective_num_clusters": effective_num_clusters,
                     "dirichlet_alpha": dirichlet_alpha_param,
@@ -804,6 +1143,13 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             embedding_norm_weight=args.embedding_norm_weight,
             kld_weight=args.kld_weight,
             entropy_eps=args.entropy_eps,
+            ego_samples=args.ego_samples,
+            ego_alpha=args.ego_alpha,
+            ego_min_radius=args.ego_min_radius,
+            ego_max_radius=args.ego_max_radius,
+            ego_seed=args.ego_seed,
+            ego_min_nodes=args.ego_min_nodes,
+            ego_min_edges=args.ego_min_edges,
             epoch_callback=epoch_logger,
         )
 
