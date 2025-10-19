@@ -28,6 +28,9 @@ except ImportError as exc:
 LOGGER = logging.getLogger(__name__)
 
 
+from nosology_filters import should_drop_nosology_node
+
+
 def _load_graph(graph_path: Path) -> nx.Graph:
     """Load a graph from GraphML and coerce it to a simple undirected graph."""
     if not graph_path.exists():
@@ -48,6 +51,19 @@ def _load_graph(graph_path: Path) -> nx.Graph:
     if graph.is_directed():
         LOGGER.info("Symmetrising directed graph via edge union.")
         graph = graph.to_undirected(reciprocal=False)
+    to_remove = [
+        node for node, data in graph.nodes(data=True) if should_drop_nosology_node(data)
+    ]
+    if to_remove:
+        LOGGER.info("Filtered %d nosology-aligned nodes", len(to_remove))
+        graph.remove_nodes_from(to_remove)
+    if graph.number_of_nodes() == 0:
+        raise ValueError("No nodes remain after filtering; cannot run hSBM.")
+    LOGGER.info(
+        "Graph after nosology filter: %d nodes, %d edges",
+        graph.number_of_nodes(),
+        graph.number_of_edges(),
+    )
     return graph
 
 

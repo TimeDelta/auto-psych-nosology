@@ -46,6 +46,15 @@ def try_parse_number(x: str) -> Any:
         return s
 
 
+def _ensure_canonical_labels(
+    graph: nx.Graph, label_attr: str = "canonical_name"
+) -> nx.Graph:
+    for node, attrs in graph.nodes(data=True):
+        label = attrs.get(label_attr) or attrs.get("name") or str(node)
+        attrs[label_attr] = label
+    return graph
+
+
 def load_graph(
     path: str, csv_cols: Tuple[str, str] = None, directed: bool = False
 ) -> nx.Graph:
@@ -55,13 +64,17 @@ def load_graph(
 
     ext = p.suffix.lower()
     if ext in {".graphml"}:
-        return nx.read_graphml(p)
+        graph = nx.read_graphml(p)
+        return _ensure_canonical_labels(graph)
     if ext in {".gexf"}:
-        return nx.read_gexf(p)
+        graph = nx.read_gexf(p)
+        return _ensure_canonical_labels(graph)
     if ext in {".gpickle", ".pickle", ".pkl"}:
-        return nx.read_gpickle(p)
+        graph = nx.read_gpickle(p)
+        return _ensure_canonical_labels(graph)
     if ext in {".json"}:
-        return _read_json_node_link(p)
+        graph = _read_json_node_link(p)
+        return _ensure_canonical_labels(graph)
     if ext in {".csv", ".tsv"}:
         if csv_cols is None:
             raise ValueError("For CSV/TSV, provide --csv-cols <SOURCE> <TARGET>")

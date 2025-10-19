@@ -25,6 +25,7 @@ from typing import (
 import torch
 from torch_geometric.data import Data
 
+from nosology_filters import should_drop_nosology_node
 from self_compressing_auto_encoders import (
     NodeAttributeDeepSetEncoder,
     OnlineTrainer,
@@ -101,6 +102,38 @@ def _parse_bool(value: Optional[str]) -> Optional[bool]:
     return None
 
 
+_NOSOLOGY_NODE_TYPES = {"disease", "disorder", "diagnosis"}
+_NOSOLOGY_NAME_KEYWORDS = {
+    "disorder",
+    "disease",
+    "syndrome",
+    "diagnosis",
+    "illness",
+}
+
+
+def _should_drop_nosology_node(attrs: Mapping[str, Any]) -> bool:
+    node_type = (attrs.get("node_type") or "").strip().lower()
+    if node_type in _NOSOLOGY_NODE_TYPES:
+        return True
+    # Flags indicating the node comes from an external taxonomy
+    for flag_attr in ("ontology_flag", "group_flag", "is_psychiatric"):
+        flag_val = attrs.get(flag_attr)
+        if isinstance(flag_val, bool):
+            if flag_val:
+                return True
+        else:
+            parsed = _parse_bool(flag_val)
+            if parsed:
+                return True
+
+    name = (attrs.get("name") or "").lower()
+    if name and any(keyword in name for keyword in _NOSOLOGY_NAME_KEYWORDS):
+        return True
+
+    return False
+
+
 @dataclass
 class MultiplexGraph:
     """In-memory representation of a multiplex knowledge graph."""
@@ -110,13 +143,12 @@ class MultiplexGraph:
     node_type_index: Mapping[str, int]
     relation_index: Mapping[str, int]
     node_attributes: List[Dict[str, Any]]
+    node_labels: List[str]
+    node_ids: List[str]
 
     @property
     def node_names(self) -> List[str]:
-        reverse = [None] * len(self.node_index)
-        for name, idx in self.node_index.items():
-            reverse[idx] = name
-        return reverse
+        return self.node_labels
 
 
 def _parse_graphml(
@@ -167,14 +199,12 @@ def _parse_graphml(
 def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
     nodes, edges = _parse_graphml(graphml_path)
 
-    node_index: Dict[str, int] = {
-        node_id: idx for idx, (node_id, _attrs) in enumerate(nodes)
-    }
-
     node_types: List[str] = []
     node_type_index: Dict[str, int] = {}
     node_type_ids: List[int] = []
     node_attribute_dicts: List[Dict[str, Any]] = []
+    node_labels: List[str] = []
+    node_ids_ordered: List[str] = []
 
     metadata_fields = (
         "disease_metadata",
@@ -184,6 +214,8 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
     )
 
     for node_id, attrs in nodes:
+        if should_drop_nosology_node(attrs):
+            continue
         node_type = attrs.get("node_type", "Unknown")
         if node_type not in node_type_index:
             node_type_index[node_type] = len(node_type_index)
@@ -256,10 +288,19 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
             token_budget -= len(tokens)
 
         node_attribute_dicts.append(attr_dict)
+        node_labels.append(name_value if name_value else node_id)
+        node_ids_ordered.append(node_id)
+
+    if not node_ids_ordered:
+        raise ValueError("No nodes remain after filtering nosology-aligned entries.")
 
     relation_index: Dict[str, int] = {}
     edge_pairs: List[Tuple[int, int]] = []
     edge_type_ids: List[int] = []
+    node_index: Dict[str, int] = {
+        node_id: idx for idx, node_id in enumerate(node_ids_ordered)
+    }
+
     for src, dst, attrs in edges:
         if src not in node_index or dst not in node_index:
             continue
@@ -284,7 +325,8 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
         if edge_type_ids
         else torch.empty((0,), dtype=torch.long),
     )
-    data.node_names = [node_id for node_id, _ in nodes]
+    data.node_names = list(node_labels)
+    data.node_ids = list(node_ids_ordered)
     data.node_type_names = list(node_type_index.keys())
     data.edge_type_names = list(relation_index.keys())
     data.node_attributes = node_attribute_dicts
@@ -295,6 +337,8 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
         node_type_index=node_type_index,
         relation_index=relation_index,
         node_attributes=node_attribute_dicts,
+        node_labels=node_labels,
+        node_ids=node_ids_ordered,
     )
 
 
@@ -616,6 +660,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     graph = load_multiplex_graph(args.graphml)
+    num_nodes_after = int(graph.data.node_types.numel())
+    num_edges_after = int(graph.data.edge_index.size(1))
+    print(
+        f"Graph after nosology filter: {num_nodes_after} nodes, {num_edges_after} edges"
+    )
     effective_num_clusters = (
         args.clusters if args.clusters is not None else _default_cluster_capacity(graph)
     )
