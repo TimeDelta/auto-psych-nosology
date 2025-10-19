@@ -688,6 +688,7 @@ def train_scae_on_graph(
     type_embedding_dim: int = 64,
     attr_encoder_dims: Tuple[int, int, int] = (32, 64, 32),
     epochs: int = 200,
+    batch_size: int = 1,
     min_epochs: int = 0,
     cluster_stability_window: int = 0,
     cluster_stability_tolerance: float = 0.0,
@@ -713,6 +714,7 @@ def train_scae_on_graph(
     ego_min_edges: int = 2,
     ego_max_nodes: Optional[int] = None,
     ego_max_edges: Optional[int] = None,
+    node_budget: Optional[int] = 60000,
     epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
@@ -815,9 +817,11 @@ def train_scae_on_graph(
 
     history = trainer.train(
         epochs=epochs,
-        batch_size=1,
+        batch_size=max(1, int(batch_size)),
         negative_sampling_ratio=negative_sampling_ratio,
         verbose=verbose,
+        bucket_by_size=node_budget is None,
+        node_budget=node_budget,
         on_epoch_end=epoch_callback,
         stability_metric="num_active_clusters"
         if cluster_stability_window > 0
@@ -913,6 +917,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--clusters", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, nargs="*", default=(128, 128))
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=25,
+        help="Graphs per batch when node budget sampling is disabled",
+    )
+    parser.add_argument(
+        "--node-budget",
+        type=int,
+        default=60000,
+        help="Total node budget per batch (set to 0 to disable node-budget batching)",
+    )
     parser.add_argument("--gate-threshold", type=float, default=0.5)
     parser.add_argument("--min-cluster-size", type=int, default=1)
     parser.add_argument("--negative-sampling", type=float, default=1.0)
@@ -1074,6 +1090,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         and args.cluster_stability_window > args.epochs
     ):
         parser.error("--cluster-stability-window cannot exceed --epochs")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    if args.node_budget is not None and args.node_budget < 0:
+        parser.error("--node-budget must be non-negative")
+    if args.node_budget == 0:
+        args.node_budget = None
     if args.ego_min_radius < 1:
         parser.error("--ego-min-radius must be at least 1")
     if args.ego_max_radius < args.ego_min_radius:
@@ -1118,6 +1140,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "min_epochs": args.min_epochs,
                     "device": args.device or "auto",
                     "learning_rate": args.lr,
+                    "batch_size": args.batch_size,
+                    "node_budget": args.node_budget
+                    if args.node_budget is not None
+                    else "",
                     "negative_sampling_ratio": args.negative_sampling,
                     "gate_threshold": args.gate_threshold,
                     "min_cluster_size": args.min_cluster_size,
@@ -1186,6 +1212,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             embedding_norm_weight=args.embedding_norm_weight,
             kld_weight=args.kld_weight,
             entropy_eps=args.entropy_eps,
+            batch_size=args.batch_size,
             ego_samples=args.ego_samples,
             ego_alpha=args.ego_alpha,
             ego_min_radius=args.ego_min_radius,
@@ -1195,6 +1222,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             ego_min_edges=args.ego_min_edges,
             ego_max_nodes=args.ego_max_nodes,
             ego_max_edges=args.ego_max_edges,
+            node_budget=args.node_budget,
             epoch_callback=epoch_logger,
         )
 
