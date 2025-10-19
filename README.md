@@ -25,10 +25,10 @@
 - Run `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data` to download the main data for the knowledge graph.
 - Run
 ```
-mkdir -p data/hpo && cd data/hpo
-curl -L -o hp.obo https://purl.obolibrary.org/obo/hp.obo
-curl -L -o phenotype.hpoa https://purl.obolibrary.org/obo/hp/hpoa/phenotype.hpoa
-curl -L -o genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt
+mkdir -p data/hpo
+curl -L -o data/hpo/hp.obo https://purl.obolibrary.org/obo/hp.obo
+curl -L -o data/hpo/phenotype.hpoa https://purl.obolibrary.org/obo/hp/hpoa/phenotype.hpoa
+curl -L -o data/hpo/genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt
 python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
 ```
 to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
