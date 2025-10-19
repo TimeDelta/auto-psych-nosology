@@ -34,6 +34,20 @@ python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_p
 to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
 - MLflow is used for optional experiment tracking.
     - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
+    - Metric explanations:
+        - **total_loss** = weighted sum of reconstruction, sparsity, entropy, Dirichlet, embedding-norm, KL, consistency, gate-entropy, and degree penalties reported below.
+        - **recon_loss** averages the BCE losses for positive and sampled negative edges per graph.
+        - **sparsity_loss**, **cluster_l0**, **inter_l0** track the hard-concrete L0 penalties that drive cluster/edge sparsity.
+        - **entropy_loss** encourages per-graph assignment entropy to stay above `--assignment-entropy-floor`.
+        - **dirichlet_loss** is the KL term that keeps mean cluster usage close to the Dirichlet prior.
+        - **embedding_norm_loss** and **kld_loss** regularise latent vectors on a per-graph basis.
+        - **degree_penalty** (with **degree_correlation_sq**) measures the decorrelation between latent norms and node degree.
+        - **consistency_loss** / **consistency_overlap** are the memory-bank temporal consistency terms (0 when disabled).
+        - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
+        - **num_active_clusters** vs **expected_active_clusters** report hard vs. expected gate counts per batch.
+        - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
+        - **num_negatives** counts sampled negative edges that survived the per-graph cap.
+        - **timing_sample_neg** and **timing_neg_logits** capture the wall-clock time (in seconds) spent sampling negatives and scoring them.
 - The rGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
 - Training stops early when the stability metric you request stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `num_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
 - To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_hSBM_partitions.py](./create_hSBM_partitions.py).
