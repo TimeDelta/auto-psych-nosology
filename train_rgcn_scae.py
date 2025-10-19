@@ -992,8 +992,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ego-samples",
         type=int,
-        default=256,
-        help="Number of adaptive ego-net subgraphs to sample for training (0 to disable)",
+        default=0,
+        help="Number of adaptive ego-net subgraphs to sample for training (0 uses full graph)",
+    )
+    parser.add_argument(
+        "--stability",
+        action="store_true",
+        help="Enable ego-net subsampling defaults suited for stability sweeps",
     )
     parser.add_argument(
         "--ego-alpha",
@@ -1108,6 +1113,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--ego-max-nodes must be positive when provided")
     if args.ego_max_edges is not None and args.ego_max_edges < 1:
         parser.error("--ego-max-edges must be positive when provided")
+
+    if args.stability and args.ego_samples == 0:
+        args.ego_samples = 256
 
     graph = load_multiplex_graph(args.graphml)
     num_nodes_after = int(graph.data.node_types.numel())
