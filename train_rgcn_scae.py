@@ -705,6 +705,7 @@ def train_scae_on_graph(
     embedding_norm_weight: float = 1e-4,
     kld_weight: float = 1e-3,
     entropy_eps: float = 1e-12,
+    max_negatives: Optional[int] = None,
     ego_samples: int = 0,
     ego_alpha: float = 0.75,
     ego_min_radius: int = 1,
@@ -768,6 +769,7 @@ def train_scae_on_graph(
         embedding_norm_weight=embedding_norm_weight,
         kld_weight=kld_weight,
         entropy_eps=entropy_eps,
+        max_negatives_per_graph=max_negatives,
         active_gate_threshold=gate_threshold,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -932,6 +934,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--gate-threshold", type=float, default=0.5)
     parser.add_argument("--min-cluster-size", type=int, default=1)
     parser.add_argument("--negative-sampling", type=float, default=1.0)
+    parser.add_argument(
+        "--max-negatives",
+        type=int,
+        default=20000,
+        help="Maximum negatives per graph (0 lets ratio decide)",
+    )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
@@ -1101,6 +1109,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--node-budget must be non-negative")
     if args.node_budget == 0:
         args.node_budget = None
+    if args.max_negatives is not None and args.max_negatives < 0:
+        parser.error("--max-negatives must be non-negative")
+    if args.max_negatives == 0:
+        args.max_negatives = None
     if args.ego_min_radius < 1:
         parser.error("--ego-min-radius must be at least 1")
     if args.ego_max_radius < args.ego_min_radius:
@@ -1153,6 +1165,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     if args.node_budget is not None
                     else "",
                     "negative_sampling_ratio": args.negative_sampling,
+                    "max_negatives": args.max_negatives
+                    if args.max_negatives is not None
+                    else "",
                     "gate_threshold": args.gate_threshold,
                     "min_cluster_size": args.min_cluster_size,
                     "entropy_weight": args.entropy_weight,
@@ -1220,6 +1235,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             embedding_norm_weight=args.embedding_norm_weight,
             kld_weight=args.kld_weight,
             entropy_eps=args.entropy_eps,
+            max_negatives=args.max_negatives,
             batch_size=args.batch_size,
             ego_samples=args.ego_samples,
             ego_alpha=args.ego_alpha,

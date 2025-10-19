@@ -563,6 +563,7 @@ class ClusteredGraphReconstructor(nn.Module):
         gate_pre_activation_clip: float = 2.0,
         enable_relation_reweighting: bool = True,
         relation_reweight_power: float = 0.5,
+        max_negatives_per_graph: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.num_relations = max(1, num_relations)
@@ -571,6 +572,11 @@ class ClusteredGraphReconstructor(nn.Module):
         self.restrict_negatives_to_types = restrict_negatives_to_types
         self.enable_relation_reweighting = enable_relation_reweighting
         self.relation_reweight_power = relation_reweight_power
+        self.max_negatives_per_graph = (
+            int(max_negatives_per_graph)
+            if max_negatives_per_graph is not None and max_negatives_per_graph > 0
+            else None
+        )
         self.inter_cluster_logits = nn.Parameter(
             torch.zeros(self.num_relations, num_clusters, num_clusters)
         )
@@ -638,6 +644,12 @@ class ClusteredGraphReconstructor(nn.Module):
             if node_ids_tensor.numel() <= 1:
                 continue
 
+            remaining_budget = (
+                self.max_negatives_per_graph
+                if self.max_negatives_per_graph is not None
+                else None
+            )
+
             edges_mask = (batch_cpu[edge_index_cpu[0]] == graph_id) & (
                 batch_cpu[edge_index_cpu[1]] == graph_id
             )
@@ -666,6 +678,12 @@ class ClusteredGraphReconstructor(nn.Module):
             target = int(math.ceil(num_pos * ratio))
             if target <= 0:
                 continue
+            if remaining_budget is not None:
+                if remaining_budget <= 0:
+                    break
+                target = min(target, remaining_budget)
+                if target <= 0:
+                    break
 
             if self.restrict_negatives_to_types and node_types_cpu is not None:
                 type_to_nodes: Dict[int, torch.Tensor] = {}
@@ -684,6 +702,12 @@ class ClusteredGraphReconstructor(nn.Module):
                     if type_pos_edges.numel() == 0:
                         continue
                     type_target = max(1, int(math.ceil(type_pos_edges.size(1) * ratio)))
+                    if remaining_budget is not None:
+                        if remaining_budget <= 0:
+                            break
+                        type_target = min(type_target, remaining_budget)
+                        if type_target <= 0:
+                            break
                     neg_local = negative_sampling(
                         type_pos_edges,
                         num_nodes=locals_tensor.numel(),
@@ -712,11 +736,20 @@ class ClusteredGraphReconstructor(nn.Module):
                     neg_batch_chunks.append(
                         torch.full((neg_local.size(1),), graph_id, dtype=torch.long)
                     )
+                    if remaining_budget is not None:
+                        remaining_budget -= int(neg_local.size(1))
+                        if remaining_budget <= 0:
+                            break
             else:
+                num_samples = target
+                if remaining_budget is not None:
+                    num_samples = min(num_samples, remaining_budget)
+                    if num_samples <= 0:
+                        continue
                 neg_local = negative_sampling(
                     pos_local,
                     num_nodes=local_count,
-                    num_neg_samples=target,
+                    num_neg_samples=num_samples,
                     method="sparse",
                 )
                 if neg_local.numel() == 0:
@@ -738,6 +771,10 @@ class ClusteredGraphReconstructor(nn.Module):
                 neg_batch_chunks.append(
                     torch.full((neg_local.size(1),), graph_id, dtype=torch.long)
                 )
+                if remaining_budget is not None:
+                    remaining_budget -= int(neg_local.size(1))
+                    if remaining_budget <= 0:
+                        break
 
         if not neg_edge_chunks:
             return (
@@ -925,6 +962,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         embedding_norm_weight: float = 1e-4,
         kld_weight: float = 1e-3,
         entropy_eps: float = 1e-12,
+        max_negatives_per_graph: Optional[int] = None,
         positional_dim: int = 0,
         assignment_temperature: float = 0.1,
         sinkhorn_iterations: int = 3,
@@ -1055,6 +1093,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             gate_pre_activation_clip=gate_pre_activation_clip,
             enable_relation_reweighting=enable_relation_reweighting,
             relation_reweight_power=relation_reweight_power,
+            max_negatives_per_graph=max_negatives_per_graph,
         )
         self._base_l0_cluster_weight = float(l0_cluster_weight)
         self._base_l0_inter_weight = float(l0_inter_weight)
