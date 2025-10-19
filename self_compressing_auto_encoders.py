@@ -1907,6 +1907,8 @@ class OnlineTrainer:
         self.history: List[Dict[str, float]] = []
         # Track node counts per graph so we can bucket by size or enforce budgets.
         self._node_sizes: List[int] = []
+        self.early_stop_epoch: Optional[int] = None
+        self.early_stop_reason: Optional[str] = None
 
     def add_data(self, graphs: List[Data]) -> None:
         for graph in graphs:
@@ -1931,6 +1933,11 @@ class OnlineTrainer:
         node_budget: Optional[int] = None,
         shuffle: bool = True,
         on_epoch_end: Optional[Callable[[int, Dict[str, float]], None]] = None,
+        stability_metric: Optional[str] = None,
+        stability_window: int = 0,
+        stability_tolerance: float = 0.0,
+        stability_relative_tolerance: Optional[float] = None,
+        min_epochs: int = 0,
     ) -> List[Dict[str, float]]:
         if epochs <= 0:
             raise ValueError("epochs must be a positive integer.")
@@ -2025,6 +2032,39 @@ class OnlineTrainer:
                 print(
                     f"Epoch {epoch}/{epochs} loss={averaged_metrics['total_loss']:.4f} metrics={averaged_metrics}"
                 )
+
+            if (
+                stability_metric
+                and stability_window > 0
+                and epoch >= max(min_epochs, stability_window)
+            ):
+                recent = self.history[-stability_window:]
+                if len(recent) == stability_window:
+                    values: List[float] = []
+                    valid = True
+                    for record in recent:
+                        metric_value = record.get(stability_metric)
+                        if metric_value is None:
+                            valid = False
+                            break
+                        values.append(float(metric_value))
+                    if valid:
+                        span = max(values) - min(values)
+                        within_abs = span <= stability_tolerance
+                        within_rel = True
+                        if stability_relative_tolerance is not None:
+                            mean_abs = max(abs(sum(values) / len(values)), 1e-8)
+                            within_rel = (
+                                span / mean_abs
+                            ) <= stability_relative_tolerance
+                        if within_abs and within_rel:
+                            self.early_stop_epoch = epoch
+                            self.early_stop_reason = f"{stability_metric} stable for last {stability_window} epochs"
+                            if verbose:
+                                print(
+                                    f"[EARLY STOP] {self.early_stop_reason} (span={span:.4f})"
+                                )
+                            break
 
         return self.history
 

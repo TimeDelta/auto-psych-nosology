@@ -444,6 +444,10 @@ def train_scae_on_graph(
     type_embedding_dim: int = 64,
     attr_encoder_dims: Tuple[int, int, int] = (32, 64, 32),
     epochs: int = 200,
+    min_epochs: int = 0,
+    cluster_stability_window: int = 0,
+    cluster_stability_tolerance: float = 0.0,
+    cluster_stability_relative_tolerance: Optional[float] = None,
     lr: float = 1e-3,
     negative_sampling_ratio: float = 1.0,
     gate_threshold: float = 0.5,
@@ -505,7 +509,21 @@ def train_scae_on_graph(
         negative_sampling_ratio=negative_sampling_ratio,
         verbose=verbose,
         on_epoch_end=epoch_callback,
+        stability_metric="num_active_clusters"
+        if cluster_stability_window > 0
+        else None,
+        stability_window=cluster_stability_window,
+        stability_tolerance=cluster_stability_tolerance,
+        stability_relative_tolerance=cluster_stability_relative_tolerance,
+        min_epochs=min_epochs,
     )
+
+    if trainer.early_stop_epoch is not None:
+        message = f"Early stop at epoch {trainer.early_stop_epoch}: {trainer.early_stop_reason}"
+        if verbose:
+            print(f"[INFO] {message}")
+        if history:
+            history[-1]["early_stop_epoch"] = float(trainer.early_stop_epoch)
 
     model.eval()
     with torch.no_grad():
@@ -576,6 +594,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Where to store the resulting partition JSON",
     )
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=50,
+        help="Minimum number of epochs before the stability criterion can stop training (must be <= --epochs).",
+    )
     parser.add_argument("--clusters", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, nargs="*", default=(128, 128))
@@ -589,6 +613,24 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=1e-3,
         help="Weight applied to the entropy regularizer",
+    )
+    parser.add_argument(
+        "--cluster-stability-window",
+        type=int,
+        default=15,
+        help="Number of trailing epochs used to test num_active_clusters stability for early stopping (0 disables).",
+    )
+    parser.add_argument(
+        "--cluster-stability-tol",
+        type=float,
+        default=0.0,
+        help="Absolute tolerance for num_active_clusters variation across the stability window.",
+    )
+    parser.add_argument(
+        "--cluster-stability-rel-tol",
+        type=float,
+        default=0.0,
+        help="Relative tolerance (fraction of the mean) allowed for num_active_clusters across the window.",
     )
     parser.add_argument(
         "--dirichlet-alpha",
@@ -659,6 +701,16 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser = _build_argparser()
     args = parser.parse_args(argv)
 
+    if args.min_epochs > args.epochs:
+        parser.error("--min-epochs must be less than or equal to --epochs")
+    if args.cluster_stability_window < 0:
+        parser.error("--cluster-stability-window must be non-negative")
+    if (
+        args.cluster_stability_window > 0
+        and args.cluster_stability_window > args.epochs
+    ):
+        parser.error("--cluster-stability-window cannot exceed --epochs")
+
     graph = load_multiplex_graph(args.graphml)
     num_nodes_after = int(graph.data.node_types.numel())
     num_edges_after = int(graph.data.edge_index.size(1))
@@ -687,12 +739,16 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "graph_path": str(args.graphml),
                     "output_path": str(args.out),
                     "epochs": args.epochs,
+                    "min_epochs": args.min_epochs,
                     "device": args.device or "auto",
                     "learning_rate": args.lr,
                     "negative_sampling_ratio": args.negative_sampling,
                     "gate_threshold": args.gate_threshold,
                     "min_cluster_size": args.min_cluster_size,
                     "entropy_weight": args.entropy_weight,
+                    "cluster_stability_window": args.cluster_stability_window,
+                    "cluster_stability_tol": args.cluster_stability_tol,
+                    "cluster_stability_rel_tol": args.cluster_stability_rel_tol,
                     "dirichlet_weight": args.dirichlet_weight,
                     "embedding_norm_weight": args.embedding_norm_weight,
                     "kld_weight": args.kld_weight,
@@ -732,6 +788,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             num_clusters=effective_num_clusters,
             hidden_dims=args.hidden,
             epochs=args.epochs,
+            min_epochs=args.min_epochs,
+            cluster_stability_window=args.cluster_stability_window,
+            cluster_stability_tolerance=args.cluster_stability_tol,
+            cluster_stability_relative_tolerance=args.cluster_stability_rel_tol,
             lr=args.lr,
             negative_sampling_ratio=args.negative_sampling,
             gate_threshold=args.gate_threshold,
@@ -752,6 +812,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 final_loss = history[-1].get("loss")
                 if final_loss is not None and math.isfinite(final_loss):
                     mlflow_client.log_metric("final_loss", float(final_loss))
+                if "early_stop_epoch" in history[-1]:
+                    mlflow_client.log_metric(
+                        "early_stop_epoch", history[-1]["early_stop_epoch"]
+                    )
+            mlflow_client.log_metric("epochs_completed", len(history))
             mlflow_client.log_metric(
                 "num_active_clusters",
                 len(partition.active_clusters),
