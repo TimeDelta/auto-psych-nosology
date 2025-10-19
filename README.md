@@ -34,7 +34,8 @@ python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_p
 to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
 - MLflow is used for optional experiment tracking.
     - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
-- The rGCN-SCAE trainer now picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
+- The rGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
+- Training stops early when the stability metric you request stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `num_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
 - To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_hSBM_partitions.py](./create_hSBM_partitions.py).
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
 
