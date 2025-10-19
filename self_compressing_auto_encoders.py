@@ -13,7 +13,7 @@ from torch.utils.data import Sampler
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GraphNorm, MessagePassing, RGCNConv, global_mean_pool
-from torch_geometric.utils import degree, softmax
+from torch_geometric.utils import degree, negative_sampling, softmax
 
 from utility import generate_random_string
 
@@ -389,6 +389,7 @@ class RGCNClusterEncoder(nn.Module):
         edge_index: torch.LongTensor,
         batch: Optional[torch.LongTensor] = None,
         node_attributes: Optional[List[List[Dict[str, Any]]]] = None,
+        precomputed_attr: Optional[torch.Tensor] = None,
         edge_type: Optional[torch.LongTensor] = None,
         positional_encodings: Optional[torch.Tensor] = None,
         edge_weight: Optional[torch.Tensor] = None,
@@ -479,7 +480,9 @@ class RGCNClusterEncoder(nn.Module):
         else:
             src_scale = dst_scale = torch.ones(num_nodes, device=device)
 
-        if node_attributes and len(node_attributes) > 0:
+        if precomputed_attr is not None:
+            attr_embedding = precomputed_attr.to(device)
+        elif node_attributes and len(node_attributes) > 0:
             # Allow already-collated per-node dicts or per-graph lists from PyG.
             if isinstance(node_attributes[0], dict):
                 attr_embedding = torch.stack(
@@ -611,14 +614,7 @@ class ClusteredGraphReconstructor(nn.Module):
         node_types: Optional[torch.LongTensor],
         ratio: float,
     ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor]:
-        if ratio <= 0.0:
-            return (
-                torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
-                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
-                torch.zeros((0,), dtype=torch.long, device=edge_index.device),
-            )
-
-        if num_nodes == 0:
+        if ratio <= 0.0 or num_nodes == 0:
             return (
                 torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
                 torch.zeros((0,), dtype=torch.long, device=edge_index.device),
@@ -632,80 +628,127 @@ class ClusteredGraphReconstructor(nn.Module):
         edge_index_cpu = edge_index.detach().cpu()
         batch_cpu = batch.detach().cpu()
         node_types_cpu = node_types.detach().cpu() if node_types is not None else None
-        neg_edges: List[Tuple[int, int]] = []
-        neg_types: List[int] = []
-        neg_batch: List[int] = []
+
+        neg_edge_chunks: List[torch.Tensor] = []
+        neg_type_chunks: List[torch.Tensor] = []
+        neg_batch_chunks: List[torch.Tensor] = []
 
         for graph_id in range(num_graphs):
-            node_ids = (batch_cpu == graph_id).nonzero(as_tuple=False).view(-1).tolist()
-            if len(node_ids) <= 1:
+            node_ids_tensor = (batch_cpu == graph_id).nonzero(as_tuple=False).view(-1)
+            if node_ids_tensor.numel() <= 1:
                 continue
-            pos_mask = (batch_cpu[edge_index_cpu[0]] == graph_id) & (
+
+            edges_mask = (batch_cpu[edge_index_cpu[0]] == graph_id) & (
                 batch_cpu[edge_index_cpu[1]] == graph_id
             )
-            edges = edge_index_cpu[:, pos_mask]
-            pos_edges = {tuple(edge) for edge in edges.t().tolist()}
-            max_possible = len(node_ids) ** 2
-            available = max(0, max_possible - len(pos_edges))
-            if available == 0:
-                continue
-            num_pos = max(1, edges.size(1))
-            target = min(available, int(math.ceil(num_pos * ratio)))
-            attempts = 0
-            seen: set[Tuple[int, int]] = set()
-            if self.restrict_negatives_to_types and node_types_cpu is not None:
-                # Sample negatives within type buckets so edge difficulty stays
-                # comparable even when graphs have uneven type distributions.
-                type_to_nodes: Dict[int, List[int]] = {}
-                for node_id in node_ids:
-                    node_type_id = int(node_types_cpu[node_id])
-                    type_to_nodes.setdefault(node_type_id, []).append(node_id)
-            while len(seen) < target and attempts < max(100, target * 10):
-                if (
-                    self.restrict_negatives_to_types
-                    and node_types_cpu is not None
-                    and len(node_ids) > 1
-                ):
-                    valid_types = [
-                        t for t, members in type_to_nodes.items() if len(members) > 0
-                    ]
-                    if not valid_types:
-                        break
-                    type_id = random.choice(valid_types)
-                    candidates = type_to_nodes[type_id]
-                    u = random.choice(candidates)
-                    v = random.choice(candidates)
-                else:
-                    u = random.choice(node_ids)
-                    v = random.choice(node_ids)
-                attempts += 1
-                pair = (u, v)
-                if pair in pos_edges or pair in seen:
-                    continue
-                seen.add(pair)
-            for u, v in seen:
-                neg_edges.append((u, v))
-                neg_types.append(random.randrange(self.num_relations))
-                neg_batch.append(graph_id)
+            pos_edges = edge_index_cpu[:, edges_mask]
+            num_pos = max(1, pos_edges.size(1))
 
-        if not neg_edges:
+            local_map = {
+                int(node_id): idx
+                for idx, node_id in enumerate(node_ids_tensor.tolist())
+            }
+            local_count = len(local_map)
+            if local_count <= 1:
+                continue
+
+            if pos_edges.numel() > 0:
+                src_local = torch.tensor(
+                    [local_map[int(u)] for u in pos_edges[0].tolist()], dtype=torch.long
+                )
+                dst_local = torch.tensor(
+                    [local_map[int(v)] for v in pos_edges[1].tolist()], dtype=torch.long
+                )
+                pos_local = torch.stack([src_local, dst_local], dim=0)
+            else:
+                pos_local = torch.empty((2, 0), dtype=torch.long)
+
+            target = int(math.ceil(num_pos * ratio))
+            if target <= 0:
+                continue
+
+            if self.restrict_negatives_to_types and node_types_cpu is not None:
+                type_to_nodes: Dict[int, torch.Tensor] = {}
+                for idx, node_id in enumerate(node_ids_tensor.tolist()):
+                    node_type_id = int(node_types_cpu[node_id])
+                    type_to_nodes.setdefault(node_type_id, []).append(idx)
+
+                for type_id, locals in type_to_nodes.items():
+                    if not locals:
+                        continue
+                    locals_tensor = torch.tensor(locals, dtype=torch.long)
+                    type_pos_mask = (node_types_cpu[pos_edges[0]] == type_id) & (
+                        node_types_cpu[pos_edges[1]] == type_id
+                    )
+                    type_pos_edges = pos_local[:, type_pos_mask]
+                    if type_pos_edges.numel() == 0:
+                        continue
+                    type_target = max(1, int(math.ceil(type_pos_edges.size(1) * ratio)))
+                    neg_local = negative_sampling(
+                        type_pos_edges,
+                        num_nodes=locals_tensor.numel(),
+                        num_neg_samples=type_target,
+                        method="sparse",
+                    )
+                    if neg_local.numel() == 0:
+                        continue
+                    neg_edge_chunks.append(
+                        torch.stack(
+                            [
+                                node_ids_tensor[locals_tensor[neg_local[0]]],
+                                node_ids_tensor[locals_tensor[neg_local[1]]],
+                            ],
+                            dim=0,
+                        )
+                    )
+                    neg_type_chunks.append(
+                        torch.randint(
+                            0,
+                            self.num_relations,
+                            (neg_local.size(1),),
+                            dtype=torch.long,
+                        )
+                    )
+                    neg_batch_chunks.append(
+                        torch.full((neg_local.size(1),), graph_id, dtype=torch.long)
+                    )
+            else:
+                neg_local = negative_sampling(
+                    pos_local,
+                    num_nodes=local_count,
+                    num_neg_samples=target,
+                    method="sparse",
+                )
+                if neg_local.numel() == 0:
+                    continue
+                neg_edge_chunks.append(
+                    torch.stack(
+                        [
+                            node_ids_tensor[neg_local[0]],
+                            node_ids_tensor[neg_local[1]],
+                        ],
+                        dim=0,
+                    )
+                )
+                neg_type_chunks.append(
+                    torch.randint(
+                        0, self.num_relations, (neg_local.size(1),), dtype=torch.long
+                    )
+                )
+                neg_batch_chunks.append(
+                    torch.full((neg_local.size(1),), graph_id, dtype=torch.long)
+                )
+
+        if not neg_edge_chunks:
             return (
                 torch.zeros((2, 0), dtype=torch.long, device=edge_index.device),
                 torch.zeros((0,), dtype=torch.long, device=edge_index.device),
                 torch.zeros((0,), dtype=torch.long, device=edge_index.device),
             )
 
-        neg_edge_tensor = (
-            torch.tensor(neg_edges, dtype=torch.long, device=edge_index.device)
-            .t()
-            .contiguous()
-        )
-        neg_type_tensor = torch.tensor(
-            neg_types, dtype=torch.long, device=edge_index.device
-        )
-        neg_batch_tensor = torch.tensor(
-            neg_batch, dtype=torch.long, device=edge_index.device
-        )
+        neg_edge_tensor = torch.cat(neg_edge_chunks, dim=1).to(edge_index.device)
+        neg_type_tensor = torch.cat(neg_type_chunks, dim=0).to(edge_index.device)
+        neg_batch_tensor = torch.cat(neg_batch_chunks, dim=0).to(edge_index.device)
         return neg_edge_tensor, neg_type_tensor, neg_batch_tensor
 
     def forward(
@@ -728,6 +771,8 @@ class ClusteredGraphReconstructor(nn.Module):
             batch, assignments.size(0), device=assignments.device
         )
         num_graphs = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 1
+
+        timing: Dict[str, float] = {}
 
         if edge_type is None:
             edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=device)
@@ -754,14 +799,18 @@ class ClusteredGraphReconstructor(nn.Module):
                 rel_scale = rel_counts.pow(-self.relation_reweight_power)
                 pos_losses = pos_losses * rel_scale[edge_type]
 
+        neg_sample_start = time.perf_counter()
         neg_edges, neg_types, neg_batch = self._sample_negative_edges(
             edge_index, batch_vec, assignments.size(0), node_types, ratio
         )
+        timing["sample_neg"] = time.perf_counter() - neg_sample_start
         if neg_edges.size(1) == 0:
             neg_logits = torch.empty(0, device=device)
             neg_losses = torch.empty(0, device=device)
         else:
+            neg_logits_start = time.perf_counter()
             neg_logits = self._edge_logits(assignments, neg_edges, neg_types, weights)
+            timing["neg_logits"] = time.perf_counter() - neg_logits_start
             neg_losses = F.binary_cross_entropy_with_logits(
                 neg_logits, torch.zeros_like(neg_logits), reduction="none"
             )
@@ -829,6 +878,8 @@ class ClusteredGraphReconstructor(nn.Module):
             "inter_l0": self.inter_cluster_gate.expected_l0(),
             "inter_gate_sample": gate_sample.detach(),
         }
+        for name, value in timing.items():
+            info[f"timing_{name}"] = torch.tensor(value, device=device)
         if negative_confidence_weight is not None:
             if not torch.is_tensor(negative_confidence_weight):
                 negative_confidence_weight = torch.tensor(
@@ -1384,6 +1435,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         edge_index: torch.LongTensor,
         batch: Optional[torch.LongTensor] = None,
         node_attributes: Optional[List[List[Dict[str, Any]]]] = None,
+        node_attr_embedding: Optional[torch.Tensor] = None,
         edge_type: Optional[torch.LongTensor] = None,
         negative_sampling_ratio: Optional[float] = None,
         positional_encodings: Optional[torch.Tensor] = None,
@@ -1395,6 +1447,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             edge_index=edge_index,
             batch=batch,
             node_attributes=node_attributes,
+            precomputed_attr=node_attr_embedding,
             edge_type=edge_type,
             positional_encodings=positional_encodings,
             edge_weight=edge_weight,
@@ -1597,7 +1650,14 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         }
         if neg_conf_weight is not None:
             metrics["negative_confidence_weight"] = neg_conf_weight.detach()
-        metrics.update({k: v for k, v in dec_info.items() if "loss" in k})
+        for key, value in dec_info.items():
+            if (
+                "loss" in key
+                or key.startswith("timing_")
+                or key
+                in {"num_negatives", "graph_losses", "graph_pos_loss", "graph_neg_loss"}
+            ):
+                metrics[key] = value
         metrics["graph_edge_loss"] = dec_info.get("graph_losses")
         if self.training:
             self._global_step += 1
@@ -1913,10 +1973,44 @@ class OnlineTrainer:
         self.early_stop_reason: Optional[str] = None
         self.log_timing = log_timing
 
+    def _cache_node_attributes(self, graph: Data) -> None:
+        node_attrs = getattr(graph, "node_attributes", None)
+        if not node_attrs:
+            return
+
+        encoder = getattr(self.model, "encoder", None)
+        attr_encoder = getattr(encoder, "attr_encoder", None) if encoder else None
+        if attr_encoder is None:
+            return
+
+        # Accept both flattened per-node lists and per-graph nested lists.
+        if node_attrs and isinstance(node_attrs[0], list):
+            flat_attrs: List[Dict[str, Any]] = [
+                attrs
+                for sublist in node_attrs
+                for attrs in sublist
+                if isinstance(attrs, dict)
+            ]
+        else:
+            flat_attrs = [attrs for attrs in node_attrs if isinstance(attrs, dict)]
+
+        if not flat_attrs:
+            return
+
+        embeddings: List[torch.Tensor] = []
+        with torch.no_grad():
+            for attrs in flat_attrs:
+                embedding = attr_encoder(attrs)
+                embeddings.append(embedding.detach().cpu())
+
+        if embeddings:
+            graph.node_attr_embedding = torch.stack(embeddings, dim=0)
+
     def add_data(self, graphs: List[Data]) -> None:
         for idx, graph in enumerate(graphs):
             graph_start = time.perf_counter()
             clone = graph.clone()
+            self._cache_node_attributes(clone)
             clone_duration = time.perf_counter() - graph_start
             self.dataset.append(clone)
             node_count = int(
@@ -1984,6 +2078,7 @@ class OnlineTrainer:
             metric_sums: Dict[str, float] = {}
 
             for batch in loader:
+                batch_wall_start = time.perf_counter()
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
                 positional = None
@@ -2013,6 +2108,7 @@ class OnlineTrainer:
                     edge_index=batch.edge_index,
                     batch=batch.batch,
                     node_attributes=getattr(batch, "node_attributes", None),
+                    node_attr_embedding=getattr(batch, "node_attr_embedding", None),
                     edge_type=getattr(batch, "edge_type", None),
                     negative_sampling_ratio=negative_sampling_ratio,
                     positional_encodings=positional,
@@ -2021,6 +2117,32 @@ class OnlineTrainer:
                 )
                 loss.backward()
                 self.optimizer.step()
+
+                batch_duration = time.perf_counter() - batch_wall_start
+                if self.log_timing:
+                    sample_neg = metrics.get("timing_sample_neg")
+                    if isinstance(sample_neg, torch.Tensor):
+                        sample_neg = float(sample_neg.detach().cpu().item())
+                    elif isinstance(sample_neg, (int, float)):
+                        sample_neg = float(sample_neg)
+                    neg_logits = metrics.get("timing_neg_logits")
+                    if isinstance(neg_logits, torch.Tensor):
+                        neg_logits = float(neg_logits.detach().cpu().item())
+                    elif isinstance(neg_logits, (int, float)):
+                        neg_logits = float(neg_logits)
+                    timing_parts = [f"duration={batch_duration:.3f}s"]
+                    if sample_neg is not None:
+                        timing_parts.append(f"sample_neg={sample_neg:.3f}s")
+                    if neg_logits is not None:
+                        timing_parts.append(f"neg_logits={neg_logits:.3f}s")
+                    print(
+                        "[TIMING] train-batch",
+                        f"epoch={epoch}",
+                        f"batch={batch_count}",
+                        f"nodes={int(batch.node_types.size(0))}",
+                        f"edges={int(batch.edge_index.size(1))}",
+                        *timing_parts,
+                    )
 
                 epoch_loss += float(loss.detach().cpu().item())
                 batch_count += 1

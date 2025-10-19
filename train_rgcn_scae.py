@@ -467,6 +467,8 @@ def _build_adaptive_subgraph_dataset(
     verbose: bool,
     min_nodes: int,
     min_edges: int,
+    max_nodes: Optional[int] = None,
+    max_edges: Optional[int] = None,
 ) -> List[Data]:
     data = graph.data
     num_nodes = int(data.node_types.size(0))
@@ -544,6 +546,17 @@ def _build_adaptive_subgraph_dataset(
             new_radius = min(max_radius, radius_used + 1)
             sub_data, radius_used, node_count, edge_count = build_subgraph(new_radius)
 
+        if (max_nodes is not None or max_edges is not None) and edge_count > 0:
+            adjusted_radius = radius_used
+            while (
+                (max_nodes is not None and node_count > max_nodes)
+                or (max_edges is not None and edge_count > max_edges)
+            ) and adjusted_radius > min_radius:
+                adjusted_radius -= 1
+                sub_data, radius_used, node_count, edge_count = build_subgraph(
+                    adjusted_radius
+                )
+
         if edge_count == 0:
             dropped_no_edges += 1
             if verbose:
@@ -559,13 +572,23 @@ def _build_adaptive_subgraph_dataset(
                 )
             continue
 
-        if node_count < min_nodes or edge_count < min_edges:
+        if (
+            node_count < min_nodes
+            or edge_count < min_edges
+            or (max_nodes is not None and node_count > max_nodes)
+            or (max_edges is not None and edge_count > max_edges)
+        ):
             if radius_used < max_radius:
                 sub_data, radius_used, node_count, edge_count = build_subgraph(
                     max_radius
                 )
 
-        if node_count < min_nodes or edge_count < min_edges:
+        if (
+            node_count < min_nodes
+            or edge_count < min_edges
+            or (max_nodes is not None and node_count > max_nodes)
+            or (max_edges is not None and edge_count > max_edges)
+        ):
             dropped_too_small += 1
             if verbose:
                 sample_duration = time.perf_counter() - sample_start
@@ -688,6 +711,8 @@ def train_scae_on_graph(
     ego_seed: Optional[int] = None,
     ego_min_nodes: int = 4,
     ego_min_edges: int = 2,
+    ego_max_nodes: Optional[int] = None,
+    ego_max_edges: Optional[int] = None,
     epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
@@ -756,6 +781,8 @@ def train_scae_on_graph(
             verbose=verbose,
             min_nodes=ego_min_nodes,
             min_edges=ego_min_edges,
+            max_nodes=ego_max_nodes,
+            max_edges=ego_max_edges,
         )
     else:
         dataset = [graph.data]
@@ -983,6 +1010,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Minimum number of edges required for an ego-net sample",
     )
     parser.add_argument(
+        "--ego-max-nodes",
+        type=int,
+        default=None,
+        help="Optional cap on nodes per ego-net sample (None leaves adaptive radius)",
+    )
+    parser.add_argument(
+        "--ego-max-edges",
+        type=int,
+        default=None,
+        help="Optional cap on edges per ego-net sample (None leaves adaptive radius)",
+    )
+    parser.add_argument(
         "--ego-seed",
         type=int,
         default=None,
@@ -1043,6 +1082,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--ego-min-nodes must be positive")
     if args.ego_min_edges < 0:
         parser.error("--ego-min-edges must be non-negative")
+    if args.ego_max_nodes is not None and args.ego_max_nodes < 1:
+        parser.error("--ego-max-nodes must be positive when provided")
+    if args.ego_max_edges is not None and args.ego_max_edges < 1:
+        parser.error("--ego-max-edges must be positive when provided")
 
     graph = load_multiplex_graph(args.graphml)
     num_nodes_after = int(graph.data.node_types.numel())
@@ -1150,6 +1193,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             ego_seed=args.ego_seed,
             ego_min_nodes=args.ego_min_nodes,
             ego_min_edges=args.ego_min_edges,
+            ego_max_nodes=args.ego_max_nodes,
+            ego_max_edges=args.ego_max_edges,
             epoch_callback=epoch_logger,
         )
 
