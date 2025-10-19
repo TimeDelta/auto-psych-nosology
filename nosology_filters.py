@@ -36,7 +36,7 @@ def should_drop_nosology_node(attrs: Mapping[str, Any]) -> bool:
     node_type = str(attrs.get("node_type", "")).strip().lower()
     if node_type in NOSOLOGY_NODE_TYPES:
         return True
-    for flag in ("ontology_flag", "group_flag", "is_psychiatric"):
+    for flag in ("ontology_flag", "group_flag"):
         if _parse_bool(attrs.get(flag)):
             return True
     name = str(attrs.get("name", "")).lower()
