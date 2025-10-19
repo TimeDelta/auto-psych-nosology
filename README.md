@@ -23,13 +23,15 @@
 ## Code Notes
 - Install project requirements via `pip3.10 install -r requirements.txt`.
 - Run `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data` to download the main data for the knowledge graph.
-- Run ```bash
+- Run
+```
 mkdir -p data/hpo && cd data/hpo
 curl -L -o hp.obo https://purl.obolibrary.org/obo/hp.obo
 curl -L -o phenotype.hpoa https://purl.obolibrary.org/obo/hp/hpoa/phenotype.hpoa
 curl -L -o genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt
 python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
-``` to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
+```
+to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
 - MLflow is used for optional experiment tracking.
     - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
 - The rGCN-SCAE trainer now picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
