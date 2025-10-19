@@ -1,13 +1,14 @@
 backoff
 black
+mlflow
 networkx
+obonet
 orjson
 pandas
-mlflow
+polars
 pre-commit
 pydantic
 python-dotenv
 sentence-transformers
 torch
 tqdm
-polars
