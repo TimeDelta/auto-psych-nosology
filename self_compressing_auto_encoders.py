@@ -292,7 +292,7 @@ class ClusterGate(nn.Module):
 
 
 class InterClusterGate(nn.Module):
-    """Hard-concrete gates across relation-specific inter-cluster matrices."""
+    """Hard-concrete gates across inter-cluster matrices with optional sharing."""
 
     def __init__(
         self,
@@ -301,20 +301,34 @@ class InterClusterGate(nn.Module):
         temperature: float = 2.0 / 3.0,
         stretch_epsilon: float = 0.1,
         pre_activation_clip: float = 2.0,
+        share_across_relations: bool = False,
     ) -> None:
         super().__init__()
+        self.num_relations = num_relations
+        self.share_across_relations = share_across_relations
+        gate_shape = (
+            (num_clusters, num_clusters)
+            if share_across_relations
+            else (num_relations, num_clusters, num_clusters)
+        )
         self._gate = HardConcreteGate(
-            (num_relations, num_clusters, num_clusters),
+            gate_shape,
             temperature=temperature,
             stretch_epsilon=stretch_epsilon,
             pre_activation_clip=pre_activation_clip,
         )
 
+    def _expand(self, value: torch.Tensor) -> torch.Tensor:
+        if self.share_across_relations and value.dim() == 2:
+            return value.unsqueeze(0).expand(self.num_relations, -1, -1)
+        return value
+
     def forward(self, training: Optional[bool] = None) -> torch.Tensor:
-        return self._gate(training=training)
+        sample = self._gate(training=training)
+        return self._expand(sample)
 
     def expected_l0(self) -> torch.Tensor:
-        return self._gate.expected_l0()
+        return self._expand(self._gate.expected_l0())
 
 
 class RGCNClusterEncoder(nn.Module):
@@ -565,6 +579,8 @@ class ClusteredGraphReconstructor(nn.Module):
         enable_relation_reweighting: bool = True,
         relation_reweight_power: float = 0.5,
         max_negatives_per_graph: Optional[int] = None,
+        relation_rank: Optional[int] = None,
+        share_inter_gate: bool = True,
     ) -> None:
         super().__init__()
         self.num_relations = max(1, num_relations)
@@ -578,22 +594,30 @@ class ClusteredGraphReconstructor(nn.Module):
             if max_negatives_per_graph is not None and max_negatives_per_graph > 0
             else None
         )
-        self.inter_cluster_logits = nn.Parameter(
-            torch.zeros(self.num_relations, num_clusters, num_clusters)
+        target_rank = (
+            relation_rank if relation_rank is not None else min(32, num_clusters)
         )
-        nn.init.xavier_uniform_(self.inter_cluster_logits)
+        self.relation_rank = max(1, min(num_clusters, target_rank))
+        self.relation_factors = nn.Parameter(
+            torch.empty(self.num_relations, num_clusters, self.relation_rank)
+        )
+        self.cluster_basis = nn.Parameter(torch.empty(self.relation_rank, num_clusters))
+        nn.init.xavier_uniform_(self.relation_factors)
+        nn.init.xavier_uniform_(self.cluster_basis)
         self.inter_cluster_gate = InterClusterGate(
             self.num_relations,
             num_clusters,
             temperature=gate_temperature,
             stretch_epsilon=gate_stretch_epsilon,
             pre_activation_clip=gate_pre_activation_clip,
+            share_across_relations=share_inter_gate,
         )
         self.absent_bias = nn.Parameter(torch.zeros(self.num_relations))
 
     def _inter_weights(self, training: bool) -> Tuple[torch.Tensor, torch.Tensor]:
         gate_sample = self.inter_cluster_gate(training=training)
-        weights = torch.sigmoid(self.inter_cluster_logits) * gate_sample
+        weights_dense = torch.matmul(self.relation_factors, self.cluster_basis)
+        weights = torch.sigmoid(weights_dense) * gate_sample
         return weights, gate_sample
 
     def _edge_logits(
@@ -998,6 +1022,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         relation_reweight_power: float = 0.5,
         enable_relation_reweighting: bool = True,
         active_gate_threshold: float = 0.5,
+        relation_rank: Optional[int] = None,
+        share_inter_gate: bool = True,
     ) -> None:
         """
         Args:
@@ -1051,6 +1077,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             relation_reweight_power: Power-law for relation frequency reweighting.
             enable_relation_reweighting: Enables inverse-frequency reweighting when True.
             active_gate_threshold: Probability cutoff used when counting active gates for training diagnostics.
+            relation_rank: Rank of the low-rank relation weight factorisation (defaults to min(32, num_clusters)).
+            share_inter_gate: If True, a single hard-concrete gate is shared across all relations.
         """
         super().__init__()
         base_gate_temperature = 2.0 / 3.0
@@ -1095,6 +1123,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             enable_relation_reweighting=enable_relation_reweighting,
             relation_reweight_power=relation_reweight_power,
             max_negatives_per_graph=max_negatives_per_graph,
+            relation_rank=relation_rank,
+            share_inter_gate=share_inter_gate,
         )
         self._base_l0_cluster_weight = float(l0_cluster_weight)
         self._base_l0_inter_weight = float(l0_inter_weight)

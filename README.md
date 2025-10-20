@@ -172,8 +172,10 @@ Second, a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (
 The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignment matrix.
 This latent space is partitioned by Louizos et al.’s hard-concrete (L0) gates [21].
 Cluster gates drive automatic selection of the surviving latent clusters.
-Relation-specific inter-cluster gates and matrices learn which cluster-to-cluster connections matter for each edge type, allowing the model to treat, for example, “symptom ↔ diagnosis” edges differently from “treatment ↔ biomarker” edges.
-For each relation type, a distinct decoder is trained to reconstruct edges of that type from the shared latent embeddings.
+Relation-specific inter-cluster affinities are produced via a low-rank factorization: every relation learns coefficients over a shared cluster basis, bringing the parameter count down to $\mathcal{O}(R \cdot C \cdot rank_rel)$ instead of $\mathcal{O}(R \cdot C^2)$ (with $rank_rel \ll C$).
+A single hard-concrete gate is shared across relations for cluster-to-cluster edges, pruning redundant pathways while the low-rank factors retain relation-specific weights inside each cluster.
+This lets the model treat, for example, some "symptom ↔ diagnosis" edges differently from "treatment ↔ biomarker" edges without paying the quadratic memory cost.
+For each relation type, the resulting slice of the factorized tensor is fed to a dedicated decoder head that reconstructs edges using the shared latent embeddings.
 This design allows relation-specific geometries to be learned while maintaining a common latent space.
 A single decoder conditioned on relation embeddings would instead force all relation types to share one generative function, often leading to interference and loss of type specificity.
 Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
@@ -218,10 +220,10 @@ where:
 - $\sigma(\cdot)$ is the sigmoid function mapping logits to edge probabilities.
 
 This construction ensures identical edge likelihoods regardless of node ordering and independence from batch size or subgraph composition.
-Implementation-wise, the decoder consists of two shared MLPs with hidden width 128–256 and ReLU activations.
-A relation embedding table provides $e_r$ for each edge type.
+The decoder creates relation-specific cluster affinities from a low-rank factorization: shared cluster bases (rank $k$) are combined with per-relation coefficients before being gated by a single hard-concrete mask shared across all relations.
+The factored weights then flow through the Deep Sets projection described above, so parameter count and activation size scale with $\mathcal{O}(C \cdot k)$ rather than $\mathcal{O}(C^2)$ while the shared gate enforces consistent sparsity patterns.
 Because the entire function operates on latent vectors rather than adjacency statistics, the reconstruction loss remains strictly size-invariant.
-This Deep Sets–based architecture preserves efficiency and stability for contrastive training while providing sufficient capacity to model relation-specific nonlinearities and higher-order dependencies.
+This factorized Deep Sets architecture preserves efficiency and stability for contrastive training while providing sufficient capacity to model relation-specific nonlinearities and higher-order dependencies.
 
 #### Preventing Trivial / Degenerate Solutions
 Five primary forms of degenerate or trivial solutions are guarded against in this model: uniform embeddings, local collapse, global collapse, decoder memorization, and latent drift.
