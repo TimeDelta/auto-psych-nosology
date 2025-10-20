@@ -722,6 +722,9 @@ def train_scae_on_graph(
     grad_accum_steps: int = 1,
     max_grad_norm: Optional[float] = None,
     empty_cache_each_epoch: bool = False,
+    gradient_checkpointing: bool = False,
+    pos_edge_chunk_size: Optional[int] = 16384,
+    neg_edge_chunk_size: Optional[int] = 4096,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
         num_clusters = _default_cluster_capacity(graph)
@@ -776,6 +779,9 @@ def train_scae_on_graph(
         entropy_eps=entropy_eps,
         max_negatives_per_graph=max_negatives,
         active_gate_threshold=gate_threshold,
+        use_gradient_checkpointing=gradient_checkpointing,
+        pos_edge_chunk_size=pos_edge_chunk_size,
+        neg_edge_chunk_size=neg_edge_chunk_size,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -950,6 +956,23 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--mixed_precision",
         action="store_true",
         help="Enable torch.cuda.amp mixed precision (CUDA only) in order to fit larger graphs.",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Wrap rGCN encoder layers with torch.utils.checkpoint to shrink activation memory (extra compute).",
+    )
+    parser.add_argument(
+        "--pos-edge-chunk",
+        type=int,
+        default=16384,
+        help="Maximum positive edges decoded per chunk (<=0 disables chunking).",
+    )
+    parser.add_argument(
+        "--neg-edge-chunk",
+        type=int,
+        default=4096,
+        help="Maximum negative edges decoded per chunk (<=0 disables chunking).",
     )
     parser.add_argument(
         "--grad-accum",
@@ -1171,9 +1194,16 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--ego-max-nodes must be positive when provided")
     if args.ego_max_edges is not None and args.ego_max_edges < 1:
         parser.error("--ego-max-edges must be positive when provided")
+    if args.pos_edge_chunk is not None and args.pos_edge_chunk < 0:
+        parser.error("--pos-edge-chunk must be non-negative")
+    if args.neg_edge_chunk is not None and args.neg_edge_chunk < 0:
+        parser.error("--neg-edge-chunk must be non-negative")
 
     if args.stability and args.ego_samples == 0:
         args.ego_samples = 256
+
+    pos_edge_chunk = args.pos_edge_chunk if args.pos_edge_chunk > 0 else None
+    neg_edge_chunk = args.neg_edge_chunk if args.neg_edge_chunk > 0 else None
 
     graph = load_multiplex_graph(args.graphml)
     num_nodes_after = int(graph.data.node_types.numel())
@@ -1224,6 +1254,13 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     else "",
                     "cache_node_attributes": not args.no_attr_cache,
                     "cuda_empty_cache": args.cuda_empty_cache,
+                    "gradient_checkpointing": args.gradient_checkpointing,
+                    "pos_edge_chunk": pos_edge_chunk
+                    if pos_edge_chunk is not None
+                    else "",
+                    "neg_edge_chunk": neg_edge_chunk
+                    if neg_edge_chunk is not None
+                    else "",
                     "cluster_stability_window": args.cluster_stability_window,
                     "cluster_stability_tol": args.cluster_stability_tol,
                     "cluster_stability_rel_tol": args.cluster_stability_rel_tol,
@@ -1306,6 +1343,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             grad_accum_steps=args.grad_accum,
             max_grad_norm=args.max_grad_norm,
             empty_cache_each_epoch=args.cuda_empty_cache,
+            gradient_checkpointing=args.gradient_checkpointing,
+            pos_edge_chunk_size=pos_edge_chunk,
+            neg_edge_chunk_size=neg_edge_chunk,
         )
 
         if mlflow_client is not None:

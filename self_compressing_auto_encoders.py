@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import Sampler
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -350,6 +351,7 @@ class RGCNClusterEncoder(nn.Module):
         use_degree_norm: bool = True,
         enable_relation_reweighting: bool = True,
         relation_reweight_power: float = 0.5,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         hidden_dims = hidden_dims or [128, 128]
@@ -363,6 +365,7 @@ class RGCNClusterEncoder(nn.Module):
         self.use_degree_norm = use_degree_norm
         self.enable_relation_reweighting = enable_relation_reweighting
         self.relation_reweight_power = relation_reweight_power
+        self.use_checkpointing = bool(use_gradient_checkpointing)
         embed_dim = type_embedding_dim or attr_encoder.out_dim
         # Keep type embeddings compact so node identity features don't balloon.
         self.node_type_embedding = nn.Embedding(num_node_types, embed_dim)
@@ -544,18 +547,35 @@ class RGCNClusterEncoder(nn.Module):
         x = torch.cat(features, dim=-1)
         src_scale_vec = src_scale.unsqueeze(-1)
         dst_scale_vec = dst_scale.unsqueeze(-1)
-        for layer_idx, conv in enumerate(self.convs):
-            x = x * src_scale_vec
-            x = conv(x, edge_index, etype)
-            x = x * dst_scale_vec
-            norm = self.norms[layer_idx]
-            if isinstance(norm, GraphNorm):
-                x = norm(x, batch_vec)
+
+        def _apply_layer(
+            inputs: torch.Tensor,
+            conv_module: MessagePassing,
+            norm_module: nn.Module,
+        ) -> torch.Tensor:
+            out = inputs * src_scale_vec
+            out = conv_module(out, edge_index, etype)
+            out = out * dst_scale_vec
+            if isinstance(norm_module, GraphNorm):
+                out = norm_module(out, batch_vec)
             else:
-                x = norm(x)
-            x = F.relu(x)
+                out = norm_module(out)
+            out = F.relu(out)
             if self.dropout > 0.0:
-                x = F.dropout(x, p=self.dropout, training=self.training)
+                out = F.dropout(out, p=self.dropout, training=self.training)
+            return out
+
+        for layer_idx, conv in enumerate(self.convs):
+            norm = self.norms[layer_idx]
+            if self.use_checkpointing and torch.is_grad_enabled():
+                x = checkpoint(
+                    lambda tensor, conv=conv, norm=norm: _apply_layer(
+                        tensor, conv, norm
+                    ),
+                    x,
+                )
+            else:
+                x = _apply_layer(x, conv, norm)
 
         info = {
             "node_embeddings": x,
@@ -581,6 +601,8 @@ class ClusteredGraphReconstructor(nn.Module):
         max_negatives_per_graph: Optional[int] = None,
         relation_rank: Optional[int] = None,
         share_inter_gate: bool = True,
+        pos_edge_chunk_size: Optional[int] = 16384,
+        neg_edge_chunk_size: Optional[int] = 4096,
     ) -> None:
         super().__init__()
         self.num_relations = max(1, num_relations)
@@ -613,6 +635,16 @@ class ClusteredGraphReconstructor(nn.Module):
             share_across_relations=share_inter_gate,
         )
         self.absent_bias = nn.Parameter(torch.zeros(self.num_relations))
+        self.pos_edge_chunk_size = (
+            int(pos_edge_chunk_size)
+            if pos_edge_chunk_size is not None and pos_edge_chunk_size > 0
+            else None
+        )
+        self.neg_edge_chunk_size = (
+            int(neg_edge_chunk_size)
+            if neg_edge_chunk_size is not None and neg_edge_chunk_size > 0
+            else None
+        )
 
     def _inter_weights(self, training: bool) -> Tuple[torch.Tensor, torch.Tensor]:
         gate_sample = self.inter_cluster_gate(training=training)
@@ -822,7 +854,7 @@ class ClusteredGraphReconstructor(nn.Module):
         negative_sampling_ratio: Optional[float] = None,
         node_types: Optional[torch.LongTensor] = None,
         negative_confidence_weight: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Dict[str, Union[torch.Tensor, float]]]:
         device = assignments.device
         ratio = (
             self.negative_sampling_ratio
@@ -839,17 +871,13 @@ class ClusteredGraphReconstructor(nn.Module):
         if edge_type is None:
             edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=device)
         weights, gate_sample = self._inter_weights(training=self.training)
-
-        if edge_index.size(1) == 0:
-            pos_logits = torch.empty(0, device=device)
-            pos_losses = torch.empty(0, device=device)
-            pos_batch = torch.empty(0, dtype=torch.long, device=device)
-        else:
-            pos_logits = self._edge_logits(assignments, edge_index, edge_type, weights)
-            pos_losses = F.binary_cross_entropy_with_logits(
-                pos_logits, torch.ones_like(pos_logits), reduction="none"
-            )
-            pos_batch = batch_vec[edge_index[0]]
+        pos_sum = torch.zeros(num_graphs, device=device)
+        pos_counts = torch.zeros(num_graphs, device=device)
+        pos_logit_sum = 0.0
+        pos_logit_sq_sum = 0.0
+        total_pos_edges = 0
+        if edge_index.size(1) > 0:
+            rel_scale_pos: Optional[torch.Tensor] = None
             if self.enable_relation_reweighting and edge_type.numel() > 0:
                 rel_counts = (
                     torch.bincount(
@@ -858,24 +886,44 @@ class ClusteredGraphReconstructor(nn.Module):
                     .to(device=device, dtype=torch.float)
                     .clamp_min(1.0)
                 )
-                rel_scale = rel_counts.pow(-self.relation_reweight_power)
-                pos_losses = pos_losses * rel_scale[edge_type]
+                rel_scale_pos = rel_counts.pow(-self.relation_reweight_power)
+            chunk_size = (
+                self.pos_edge_chunk_size
+                if self.pos_edge_chunk_size is not None
+                else edge_index.size(1)
+            )
+            for start in range(0, edge_index.size(1), chunk_size):
+                end = min(start + chunk_size, edge_index.size(1))
+                edge_chunk = edge_index[:, start:end]
+                type_chunk = edge_type[start:end]
+                batch_chunk = batch_vec[edge_chunk[0]]
+                logits = self._edge_logits(assignments, edge_chunk, type_chunk, weights)
+                losses = F.binary_cross_entropy_with_logits(
+                    logits, torch.ones_like(logits), reduction="none"
+                )
+                if rel_scale_pos is not None:
+                    losses = losses * rel_scale_pos[type_chunk]
+                pos_sum.index_add_(0, batch_chunk, losses)
+                pos_counts.index_add_(
+                    0, batch_chunk, torch.ones_like(losses, device=device)
+                )
+                logits_cpu = logits.detach().to(device="cpu", dtype=torch.float32)
+                pos_logit_sum += float(logits_cpu.sum().item())
+                pos_logit_sq_sum += float((logits_cpu * logits_cpu).sum().item())
+                total_pos_edges += int(logits_cpu.numel())
 
         neg_sample_start = time.perf_counter()
         neg_edges, neg_types, neg_batch = self._sample_negative_edges(
             edge_index, batch_vec, assignments.size(0), node_types, ratio
         )
         timing["sample_neg"] = time.perf_counter() - neg_sample_start
-        if neg_edges.size(1) == 0:
-            neg_logits = torch.empty(0, device=device)
-            neg_losses = torch.empty(0, device=device)
-        else:
-            neg_logits_start = time.perf_counter()
-            neg_logits = self._edge_logits(assignments, neg_edges, neg_types, weights)
-            timing["neg_logits"] = time.perf_counter() - neg_logits_start
-            neg_losses = F.binary_cross_entropy_with_logits(
-                neg_logits, torch.zeros_like(neg_logits), reduction="none"
-            )
+        neg_sum = torch.zeros(num_graphs, device=device)
+        neg_counts = torch.zeros(num_graphs, device=device)
+        neg_logit_sum = 0.0
+        neg_logit_sq_sum = 0.0
+        total_neg_edges = 0
+        if neg_edges.size(1) > 0:
+            rel_scale_neg: Optional[torch.Tensor] = None
             if self.enable_relation_reweighting and neg_types.numel() > 0:
                 rel_counts = (
                     torch.bincount(
@@ -884,37 +932,37 @@ class ClusteredGraphReconstructor(nn.Module):
                     .to(device=device, dtype=torch.float)
                     .clamp_min(1.0)
                 )
-                rel_scale = rel_counts.pow(-self.relation_reweight_power)
-                neg_losses = neg_losses * rel_scale[neg_types]
-            if negative_confidence_weight is not None:
-                neg_losses = neg_losses * negative_confidence_weight
-
-        # Average positive edge loss per graph so sparse and dense subgraphs
-        # contribute equally regardless of |E|.
-        pos_sum = (
-            _scatter_add_1d(pos_losses, pos_batch, num_graphs)
-            if pos_losses.numel() > 0
-            else torch.zeros(num_graphs, device=device)
-        )
-        pos_counts = (
-            _scatter_add_1d(torch.ones_like(pos_losses), pos_batch, num_graphs)
-            if pos_losses.numel() > 0
-            else torch.zeros(num_graphs, device=device)
-        )
-        pos_avg = torch.zeros(num_graphs, device=device)
-        mask = pos_counts > 0
-        pos_avg[mask] = pos_sum[mask] / pos_counts[mask]
-
-        if neg_losses.numel() > 0:
-            # Normalize negatives against requested ratio to keep contrastive
-            # pressure constant across size buckets.
-            neg_sum = _scatter_add_1d(neg_losses, neg_batch, num_graphs)
-            neg_counts = _scatter_add_1d(
-                torch.ones_like(neg_losses), neg_batch, num_graphs
+                rel_scale_neg = rel_counts.pow(-self.relation_reweight_power)
+            chunk_size = (
+                self.neg_edge_chunk_size
+                if self.neg_edge_chunk_size is not None
+                else neg_edges.size(1)
             )
-        else:
-            neg_sum = torch.zeros(num_graphs, device=device)
-            neg_counts = torch.zeros(num_graphs, device=device)
+            neg_logits_time = 0.0
+            for start in range(0, neg_edges.size(1), chunk_size):
+                end = min(start + chunk_size, neg_edges.size(1))
+                edge_chunk = neg_edges[:, start:end]
+                type_chunk = neg_types[start:end]
+                batch_chunk = neg_batch[start:end]
+                chunk_timer = time.perf_counter()
+                logits = self._edge_logits(assignments, edge_chunk, type_chunk, weights)
+                neg_logits_time += time.perf_counter() - chunk_timer
+                losses = F.binary_cross_entropy_with_logits(
+                    logits, torch.zeros_like(logits), reduction="none"
+                )
+                if rel_scale_neg is not None:
+                    losses = losses * rel_scale_neg[type_chunk]
+                if negative_confidence_weight is not None:
+                    losses = losses * negative_confidence_weight
+                neg_sum.index_add_(0, batch_chunk, losses)
+                neg_counts.index_add_(
+                    0, batch_chunk, torch.ones_like(losses, device=device)
+                )
+                logits_cpu = logits.detach().to(device="cpu", dtype=torch.float32)
+                neg_logit_sum += float(logits_cpu.sum().item())
+                neg_logit_sq_sum += float((logits_cpu * logits_cpu).sum().item())
+                total_neg_edges += int(logits_cpu.numel())
+            timing["neg_logits"] = neg_logits_time
 
         neg_expected = ratio * pos_counts
         neg_term = torch.zeros(num_graphs, device=device)
@@ -923,11 +971,34 @@ class ClusteredGraphReconstructor(nn.Module):
             1e-8
         )
 
+        pos_avg = torch.zeros(num_graphs, device=device)
+        mask = pos_counts > 0
+        pos_avg[mask] = pos_sum[mask] / pos_counts[mask]
+
         graph_losses = pos_avg + neg_term
         recon_loss = (
             graph_losses.mean()
             if graph_losses.numel() > 0
             else assignments.new_tensor(0.0)
+        )
+
+        pos_logit_mean = pos_logit_sum / total_pos_edges if total_pos_edges > 0 else 0.0
+        pos_logit_var = (
+            pos_logit_sq_sum / total_pos_edges - pos_logit_mean**2
+            if total_pos_edges > 0
+            else 0.0
+        )
+        pos_logit_std = (
+            math.sqrt(max(pos_logit_var, 0.0)) if total_pos_edges > 0 else 0.0
+        )
+        neg_logit_mean = neg_logit_sum / total_neg_edges if total_neg_edges > 0 else 0.0
+        neg_logit_var = (
+            neg_logit_sq_sum / total_neg_edges - neg_logit_mean**2
+            if total_neg_edges > 0
+            else 0.0
+        )
+        neg_logit_std = (
+            math.sqrt(max(neg_logit_var, 0.0)) if total_neg_edges > 0 else 0.0
         )
 
         info: Dict[str, torch.Tensor] = {
@@ -948,10 +1019,12 @@ class ClusteredGraphReconstructor(nn.Module):
                     negative_confidence_weight, device=device
                 )
             info["negative_confidence_weight"] = negative_confidence_weight.detach()
-        if pos_logits.numel() > 0:
-            info["pos_logits"] = pos_logits.detach()
-        if neg_logits.numel() > 0:
-            info["neg_logits"] = neg_logits.detach()
+        info["pos_logit_mean"] = float(pos_logit_mean)
+        info["pos_logit_std"] = float(pos_logit_std)
+        info["neg_logit_mean"] = float(neg_logit_mean)
+        info["neg_logit_std"] = float(neg_logit_std)
+        info["total_positive_edges"] = float(total_pos_edges)
+        info["total_negative_edges"] = float(total_neg_edges)
         return recon_loss, info
 
 
@@ -1024,6 +1097,9 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         active_gate_threshold: float = 0.5,
         relation_rank: Optional[int] = None,
         share_inter_gate: bool = True,
+        use_gradient_checkpointing: bool = False,
+        pos_edge_chunk_size: Optional[int] = 16384,
+        neg_edge_chunk_size: Optional[int] = 4096,
     ) -> None:
         """
         Args:
@@ -1079,6 +1155,9 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             active_gate_threshold: Probability cutoff used when counting active gates for training diagnostics.
             relation_rank: Rank of the low-rank relation weight factorisation (defaults to min(32, num_clusters)).
             share_inter_gate: If True, a single hard-concrete gate is shared across all relations.
+            use_gradient_checkpointing: Enables torch.utils.checkpoint over encoder layers to trade compute for memory.
+            pos_edge_chunk_size: Maximum number of positive edges decoded per chunk (<=0 disables chunking).
+            neg_edge_chunk_size: Maximum number of negative edges decoded per chunk (<=0 disables chunking).
         """
         super().__init__()
         base_gate_temperature = 2.0 / 3.0
@@ -1111,6 +1190,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             use_degree_norm=True,
             enable_relation_reweighting=enable_relation_reweighting,
             relation_reweight_power=relation_reweight_power,
+            use_gradient_checkpointing=use_gradient_checkpointing,
         )
         self.decoder = ClusteredGraphReconstructor(
             num_relations=num_relations + (1 if use_virtual_node else 0),
@@ -1125,6 +1205,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             max_negatives_per_graph=max_negatives_per_graph,
             relation_rank=relation_rank,
             share_inter_gate=share_inter_gate,
+            pos_edge_chunk_size=pos_edge_chunk_size,
+            neg_edge_chunk_size=neg_edge_chunk_size,
         )
         self._base_l0_cluster_weight = float(l0_cluster_weight)
         self._base_l0_inter_weight = float(l0_inter_weight)
@@ -1725,7 +1807,18 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
                 "loss" in key
                 or key.startswith("timing_")
                 or key
-                in {"num_negatives", "graph_losses", "graph_pos_loss", "graph_neg_loss"}
+                in {
+                    "num_negatives",
+                    "graph_losses",
+                    "graph_pos_loss",
+                    "graph_neg_loss",
+                    "pos_logit_mean",
+                    "pos_logit_std",
+                    "neg_logit_mean",
+                    "neg_logit_std",
+                    "total_positive_edges",
+                    "total_negative_edges",
+                }
             ):
                 metrics[key] = value
         metrics["graph_edge_loss"] = dec_info.get("graph_losses")
