@@ -687,7 +687,7 @@ def train_scae_on_graph(
     hidden_dims: Sequence[int] = (128, 128),
     type_embedding_dim: int = 64,
     attr_encoder_dims: Tuple[int, int, int] = (32, 64, 32),
-    epochs: int = 200,
+    max_epochs: int = 200,
     batch_size: int = 1,
     min_epochs: int = 0,
     cluster_stability_window: int = 0,
@@ -717,6 +717,11 @@ def train_scae_on_graph(
     ego_max_edges: Optional[int] = None,
     node_budget: Optional[int] = 60000,
     epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
+    cache_node_attributes: bool = True,
+    mixed_precision: bool = False,
+    grad_accum_steps: int = 1,
+    max_grad_norm: Optional[float] = None,
+    empty_cache_each_epoch: bool = False,
 ) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
     if num_clusters is None:
         num_clusters = _default_cluster_capacity(graph)
@@ -810,7 +815,17 @@ def train_scae_on_graph(
             f"edges_std={edge_counts.std():.1f}",
         )
 
-    trainer = OnlineTrainer(model, optimizer, device=device, log_timing=verbose)
+    trainer = OnlineTrainer(
+        model,
+        optimizer,
+        device=device,
+        log_timing=verbose,
+        cache_node_attributes=cache_node_attributes,
+        mixed_precision=mixed_precision,
+        grad_accum_steps=grad_accum_steps,
+        max_grad_norm=max_grad_norm,
+        empty_cache_each_epoch=empty_cache_each_epoch,
+    )
     add_start = time.perf_counter()
     trainer.add_data(dataset)
     add_duration = time.perf_counter() - add_start
@@ -818,7 +833,7 @@ def train_scae_on_graph(
         print(f"[TIMING] trainer.add_data took {add_duration:.3f}s")
 
     history = trainer.train(
-        epochs=epochs,
+        max_epochs=max_epochs,
         batch_size=max(1, int(batch_size)),
         negative_sampling_ratio=negative_sampling_ratio,
         verbose=verbose,
@@ -909,12 +924,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=Path("partition.json"),
         help="Where to store the resulting partition JSON",
     )
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--max-epochs", type=int, default=200)
     parser.add_argument(
         "--min-epochs",
         type=int,
         default=50,
-        help="Minimum number of epochs before the stability criterion can stop training (must be <= --epochs).",
+        help="Minimum number of epochs before the stability criterion can stop training (must be <= --max-epochs).",
     )
     parser.add_argument("--clusters", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -930,6 +945,33 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=60000,
         help="Total node budget per batch (set to 0 to disable node-budget batching)",
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        action="store_true",
+        help="Enable torch.cuda.amp mixed precision (CUDA only) in order to fit larger graphs.",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="Accumulate this many mini-batches before each optimizer step. This lowers peak activation/gradient memory per forward/backward pass. Make sure to also use --max-grad-norm as a stability guard.",
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help="Clip gradients to this norm before every optimizer step (disabled by default).",
+    )
+    parser.add_argument(
+        "--no-attr-cache",
+        action="store_true",
+        help="Skip caching node attribute embeddings to save host memory.",
+    )
+    parser.add_argument(
+        "--cuda-empty-cache",
+        action="store_true",
+        help="Call torch.cuda.empty_cache() after each epoch (CUDA only).",
     )
     parser.add_argument("--gate-threshold", type=float, default=0.5)
     parser.add_argument("--min-cluster-size", type=int, default=1)
@@ -1094,17 +1136,21 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser = _build_argparser()
     args = parser.parse_args(argv)
 
-    if args.min_epochs > args.epochs:
-        parser.error("--min-epochs must be less than or equal to --epochs")
+    if args.min_epochs > args.max_epochs:
+        parser.error("--min-epochs must be less than or equal to --max-epochs")
     if args.cluster_stability_window < 0:
         parser.error("--cluster-stability-window must be non-negative")
     if (
         args.cluster_stability_window > 0
-        and args.cluster_stability_window > args.epochs
+        and args.cluster_stability_window > args.max_epochs
     ):
-        parser.error("--cluster-stability-window cannot exceed --epochs")
+        parser.error("--cluster-stability-window cannot exceed --max-epochs")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.grad_accum < 1:
+        parser.error("--grad-accum must be at least 1")
+    if args.max_grad_norm is not None and args.max_grad_norm <= 0:
+        parser.error("--max-grad-norm must be positive")
     if args.node_budget is not None and args.node_budget < 0:
         parser.error("--node-budget must be non-negative")
     if args.node_budget == 0:
@@ -1156,7 +1202,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 {
                     "graph_path": str(args.graphml),
                     "output_path": str(args.out),
-                    "epochs": args.epochs,
+                    "max_epochs": args.max_epochs,
                     "min_epochs": args.min_epochs,
                     "device": args.device or "auto",
                     "learning_rate": args.lr,
@@ -1171,6 +1217,13 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "gate_threshold": args.gate_threshold,
                     "min_cluster_size": args.min_cluster_size,
                     "entropy_weight": args.entropy_weight,
+                    "mixed_precision": args.mixed_precision,
+                    "grad_accum_steps": args.grad_accum,
+                    "max_grad_norm": args.max_grad_norm
+                    if args.max_grad_norm is not None
+                    else "",
+                    "cache_node_attributes": not args.no_attr_cache,
+                    "cuda_empty_cache": args.cuda_empty_cache,
                     "cluster_stability_window": args.cluster_stability_window,
                     "cluster_stability_tol": args.cluster_stability_tol,
                     "cluster_stability_rel_tol": args.cluster_stability_rel_tol,
@@ -1218,7 +1271,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             graph,
             num_clusters=effective_num_clusters,
             hidden_dims=args.hidden,
-            epochs=args.epochs,
+            max_epochs=args.max_epochs,
             min_epochs=args.min_epochs,
             cluster_stability_window=args.cluster_stability_window,
             cluster_stability_tolerance=args.cluster_stability_tol,
@@ -1248,6 +1301,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             ego_max_edges=args.ego_max_edges,
             node_budget=args.node_budget,
             epoch_callback=epoch_logger,
+            cache_node_attributes=not args.no_attr_cache,
+            mixed_precision=args.mixed_precision,
+            grad_accum_steps=args.grad_accum,
+            max_grad_norm=args.max_grad_norm,
+            empty_cache_each_epoch=args.cuda_empty_cache,
         )
 
         if mlflow_client is not None:

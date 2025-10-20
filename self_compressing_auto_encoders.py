@@ -9,6 +9,7 @@ from warnings import warn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Sampler
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -1995,6 +1996,11 @@ class OnlineTrainer:
         optimizer,
         device: Optional[str] = None,
         log_timing: bool = False,
+        cache_node_attributes: bool = True,
+        mixed_precision: bool = False,
+        grad_accum_steps: int = 1,
+        max_grad_norm: Optional[float] = None,
+        empty_cache_each_epoch: bool = False,
     ):
         resolved_device = (
             torch.device(device)
@@ -2011,8 +2017,20 @@ class OnlineTrainer:
         self.early_stop_epoch: Optional[int] = None
         self.early_stop_reason: Optional[str] = None
         self.log_timing = log_timing
+        self.cache_node_attributes = cache_node_attributes
+        self.mixed_precision = bool(mixed_precision and torch.cuda.is_available())
+        self.grad_accum_steps = max(1, int(grad_accum_steps))
+        self.max_grad_norm = max_grad_norm
+        self.empty_cache_each_epoch = bool(
+            empty_cache_each_epoch and torch.cuda.is_available()
+        )
+        self.scaler: Optional[GradScaler] = (
+            GradScaler(enabled=True) if self.mixed_precision else None
+        )
 
     def _cache_node_attributes(self, graph: Data) -> None:
+        if not self.cache_node_attributes:
+            return
         node_attrs = getattr(graph, "node_attributes", None)
         if not node_attrs:
             return
@@ -2076,7 +2094,7 @@ class OnlineTrainer:
 
     def train(
         self,
-        epochs: int = 1,
+        max_epochs: int = 100,
         batch_size: int = 16,
         negative_sampling_ratio: Optional[float] = None,
         verbose: bool = True,
@@ -2090,36 +2108,51 @@ class OnlineTrainer:
         stability_relative_tolerance: Optional[float] = None,
         min_epochs: int = 0,
     ) -> List[Dict[str, float]]:
-        if epochs <= 0:
-            raise ValueError("epochs must be a positive integer.")
+        if max_epochs <= 0:
+            raise ValueError("max epochs must be a positive integer.")
         if not self.dataset:
             raise ValueError("No graphs available to train on. Call add_data first.")
+
+        pin_memory = self.device.type == "cuda"
+        loader_kwargs = {"pin_memory": pin_memory}
 
         if node_budget is not None:
             # Node-budget sampler keeps total nodes per batch bounded to limit VRAM.
             batch_sampler = NodeBudgetBatchSampler(
                 self._node_sizes, node_budget, shuffle=shuffle
             )
-            loader = DataLoader(self.dataset, batch_sampler=batch_sampler)
+            loader = DataLoader(
+                self.dataset, batch_sampler=batch_sampler, **loader_kwargs
+            )
         elif bucket_by_size:
             # Bucket graphs of similar size together to reduce gradient variance.
             batch_sampler = SizeBucketBatchSampler(
                 self._node_sizes, batch_size, shuffle=shuffle
             )
-            loader = DataLoader(self.dataset, batch_sampler=batch_sampler)
+            loader = DataLoader(
+                self.dataset, batch_sampler=batch_sampler, **loader_kwargs
+            )
         else:
-            loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
+            loader = DataLoader(
+                self.dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                **loader_kwargs,
+            )
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(1, max_epochs + 1):
             self.model.train()
             batch_count = 0
             epoch_loss = 0.0
             metric_sums: Dict[str, float] = {}
+            accum_steps = 0
+
+            if self.optimizer is not None:
+                self.optimizer.zero_grad(set_to_none=True)
 
             for batch in loader:
                 batch_wall_start = time.perf_counter()
                 batch = batch.to(self.device)
-                self.optimizer.zero_grad()
                 positional = None
                 for candidate in (
                     "positional_encodings",
@@ -2142,20 +2175,43 @@ class OnlineTrainer:
                     if hasattr(batch, candidate):
                         node_ids = getattr(batch, candidate)
                         break
-                loss, _assignments, metrics = self.model(
-                    node_types=batch.node_types,
-                    edge_index=batch.edge_index,
-                    batch=batch.batch,
-                    node_attributes=getattr(batch, "node_attributes", None),
-                    node_attr_embedding=getattr(batch, "node_attr_embedding", None),
-                    edge_type=getattr(batch, "edge_type", None),
-                    negative_sampling_ratio=negative_sampling_ratio,
-                    positional_encodings=positional,
-                    edge_weight=getattr(batch, "edge_weight", None),
-                    node_ids=node_ids,
-                )
-                loss.backward()
-                self.optimizer.step()
+                with autocast(enabled=self.mixed_precision):
+                    loss, _assignments, metrics = self.model(
+                        node_types=batch.node_types,
+                        edge_index=batch.edge_index,
+                        batch=batch.batch,
+                        node_attributes=getattr(batch, "node_attributes", None),
+                        node_attr_embedding=getattr(batch, "node_attr_embedding", None),
+                        edge_type=getattr(batch, "edge_type", None),
+                        negative_sampling_ratio=negative_sampling_ratio,
+                        positional_encodings=positional,
+                        edge_weight=getattr(batch, "edge_weight", None),
+                        node_ids=node_ids,
+                    )
+
+                loss_value = float(loss.detach().cpu().item())
+                scaled_loss = loss / self.grad_accum_steps
+                if self.mixed_precision and self.scaler is not None:
+                    self.scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+                accum_steps += 1
+
+                should_step = accum_steps >= self.grad_accum_steps
+                if should_step:
+                    if self.max_grad_norm is not None:
+                        if self.mixed_precision and self.scaler is not None:
+                            self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.max_grad_norm
+                        )
+                    if self.mixed_precision and self.scaler is not None:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accum_steps = 0
 
                 batch_duration = time.perf_counter() - batch_wall_start
                 if self.log_timing:
@@ -2183,7 +2239,7 @@ class OnlineTrainer:
                         *timing_parts,
                     )
 
-                epoch_loss += float(loss.detach().cpu().item())
+                epoch_loss += loss_value
                 batch_count += 1
 
                 for key, value in metrics.items():
@@ -2198,6 +2254,20 @@ class OnlineTrainer:
             if batch_count == 0:
                 raise RuntimeError("Training loader produced zero batches.")
 
+            if accum_steps > 0:
+                if self.max_grad_norm is not None:
+                    if self.mixed_precision and self.scaler is not None:
+                        self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm
+                    )
+                if self.mixed_precision and self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
             averaged_metrics = {k: v / batch_count for k, v in metric_sums.items()}
             self.history.append(averaged_metrics)
             if on_epoch_end is not None:
@@ -2209,7 +2279,7 @@ class OnlineTrainer:
 
             if verbose:
                 print(
-                    f"Epoch {epoch}/{epochs} loss={averaged_metrics['total_loss']:.4f} metrics={averaged_metrics}"
+                    f"Epoch {epoch}/{max_epochs} loss={averaged_metrics['total_loss']:.4f} metrics={averaged_metrics}"
                 )
 
             if (
@@ -2244,6 +2314,9 @@ class OnlineTrainer:
                                     f"[EARLY STOP] {self.early_stop_reason} (span={span:.4f})"
                                 )
                             break
+
+            if self.empty_cache_each_epoch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return self.history
 
@@ -2332,7 +2405,7 @@ if __name__ == "__main__":
     trainer = OnlineTrainer(model, optimizer)
     trainer.add_data(graphs)
     trainer.train(
-        epochs=5,
+        max_epochs=5,
         batch_size=8,
         negative_sampling_ratio=0.5,
         bucket_by_size=True,
