@@ -179,7 +179,7 @@ It can expand its vocabulary online, allowing new attributes to be assimilated w
 The resulting descriptor is concatenated with:
 A learned node-type embedding, encoding categorical identity in a compact, regularized form and graph-positional encodings derived from standardized Laplacian eigenvectors, normalized per subgraph to maintain numerical stability when batch sizes or graph orders vary.
 The fused vectors are processed through a relation-aware additive message-passing stack of graph convolutional layers using basis decomposition (a parameter sharing technique) across relation types.
-Relation-specific inter-cluster affinities are produced via a low-rank factorization: every relation learns coefficients over a shared cluster basis, bringing the parameter count down to $\mathcal{O}(R \cdot C \cdot rank_rel)$ instead of $\mathcal{O}(R \cdot C^2)$ (with $rank_rel \ll C$).
+Relation-specific inter-cluster affinities are produced via a low-rank factorization: every relation learns coefficients over a shared cluster basis, bringing the parameter count down to $\mathcal{O}(R \cdot C \cdot rank_r)$ instead of $\mathcal{O}(R \cdot C^2)$ (with $rank_r \ll C$).
 Each layer is followed by GraphNorm (default, for unbalanced batches) or LayerNorm, a ReLU activation, and optional dropout.
 Because the encoder operates directly on the supplied edge_index, it naturally accommodates cyclic connectivity and multiplex relation types without special handling.
 The final hidden states are recurrently updated to stabilize learning over irregular graph sizes by iteratively refining node embeddings until convergence rather than relying on a fixed-depth propagation schedule.
