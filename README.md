@@ -167,7 +167,7 @@ This ensures that any observed alignment reflects genuine structural similaritie
 Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [20], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
 This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits hSBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
-The model architecture tested was a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)**.
+The other model architecture tested was a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)**.
 This model was trained exclusively on the full graph to derive a single global partitioning that captures the complete relational structure.
 It learns a compact latent partition of the full knowledge graph while preserving relation-specific structure through low-rank factorization and hard-concrete gating.
 
