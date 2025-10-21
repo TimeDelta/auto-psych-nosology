@@ -554,6 +554,8 @@ class RGCNClusterEncoder(nn.Module):
             norm_module: nn.Module,
         ) -> torch.Tensor:
             out = inputs * src_scale_vec
+            # RGCNConv aggregates neighbor messages additively; src/dst scaling and
+            # relation-specific reweighting simply apply multiplicative pre/post factors.
             out = conv_module(out, edge_index, etype)
             out = out * dst_scale_vec
             if isinstance(norm_module, GraphNorm):
