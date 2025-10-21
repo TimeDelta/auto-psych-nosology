@@ -44,7 +44,8 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
         - **degree_penalty** (with **degree_correlation_sq**) measures the decorrelation between latent norms and node degree.
         - **consistency_loss** / **consistency_overlap** are the memory-bank temporal consistency terms (0 when disabled).
         - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
-        - **num_active_clusters** vs **expected_active_clusters** report hard vs. expected gate counts per batch.
+        - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete L0 expectation.
+        - **num_active_clusters_stochastic** retains the raw training-mode gate count if you need to debug EMA smoothing or gating noise.
         - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
         - **num_negatives** counts sampled negative edges that survived the per-graph cap.
         - **timing_sample_neg** and **timing_neg_logits** capture the wall-clock time (in seconds) spent sampling negatives and scoring them.

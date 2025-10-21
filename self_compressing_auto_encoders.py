@@ -1766,7 +1766,9 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         gate_expectation = self.cluster_gate.expected_l0()
         if gate_expectation.dim() == 0:
             gate_expectation = gate_expectation.unsqueeze(0)
-        active_count = (gate_sample >= self.active_gate_threshold).sum().float()
+        stochastic_active = (gate_sample >= self.active_gate_threshold).sum().float()
+        gate_eval = self.cluster_gate(training=False)
+        eval_active = (gate_eval >= self.active_gate_threshold).sum().float()
         expected_active = gate_expectation.sum()
 
         metrics: Dict[str, torch.Tensor] = {
@@ -1799,7 +1801,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             ),
             "degree_penalty": degree_penalty.detach(),
             "degree_correlation_sq": degree_corr.detach(),
-            "num_active_clusters": active_count.detach(),
+            "num_active_clusters": eval_active.detach(),
+            "num_active_clusters_stochastic": stochastic_active.detach(),
             "expected_active_clusters": expected_active.detach(),
         }
         if neg_conf_weight is not None:
