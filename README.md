@@ -167,61 +167,46 @@ This ensures that any observed alignment reflects genuine structural similaritie
 Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [20], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
 This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits hSBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
-The other model architecture tested was a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)**.
+The other model architecture tested was a **Relational Graph Convolutional Network Self-Compressing Autoencoder (RGCN-SCAE)**.
 This model was trained exclusively on the full graph to derive a single global partitioning that captures the complete relational structure.
 It learns a compact latent partition of the full knowledge graph while preserving relation-specific structure through low-rank factorization and hard-concrete gating.
 
 #### Encoder Architecture
-The encoder is a recurrent Graph Convolutional Network that outputs a latent assignment matrix of shape (#Nodes × #Clusters), forming the probabilistic basis for downstream partitioning via hard-concrete ($L_0$) gates [21].
+The encoder is an RGCN that couples a Deep Sets attribute encoder [21] with a stacked relational GCN that produces a temperature-controlled assignment matrix of shape |Nodes| $\times$ |Clusters|, forming the probabilistic basis for downstream partitioning via differentiable hard-concrete ($L_0$) gates [22].
 Each node is first encoded by a DeepSets-style node attribute encoder, implementing the Zaheer et al. $\rho$/$\phi$ formulation, that is permutation-invariant.
 This component integrates arbitrarily structured metadata—text learned embeddings, biomarkers and ontology terms.
 It can expand its vocabulary online, allowing new attributes to be assimilated without retraining existing embeddings.
 The resulting descriptor is concatenated with:
 A learned node-type embedding, encoding categorical identity in a compact, regularized form and graph-positional encodings derived from standardized Laplacian eigenvectors, normalized per subgraph to maintain numerical stability when batch sizes or graph orders vary.
 The fused vectors are processed through a relation-aware additive message-passing stack of graph convolutional layers using basis decomposition (a parameter sharing technique) across relation types.
-Relation-specific inter-cluster affinities are produced via a low-rank factorization: every relation learns coefficients over a shared cluster basis, bringing the parameter count down to $\mathcal{O}(R \cdot C \cdot rank_r)$ instead of $\mathcal{O}(R \cdot C^2)$ (with $rank_r \ll C$).
 Each layer is followed by GraphNorm (default, for unbalanced batches) or LayerNorm, a ReLU activation, and optional dropout.
 Because the encoder operates directly on the supplied edge_index, it naturally accommodates cyclic connectivity and multiplex relation types without special handling.
-The final hidden states are recurrently updated to stabilize learning over irregular graph sizes by iteratively refining node embeddings until convergence rather than relying on a fixed-depth propagation schedule.
-This recurrence normalizes representational dynamics across graphs with differing node counts, edge densities, and neighborhood radii: smaller graphs converge in fewer steps, while larger or denser ones continue refining until internal message consistency is reached.
-By decoupling learning stability from the absolute size of the input graph, the model maintains consistent gradient magnitudes and prevents over-smoothing or under-propagation in graphs that deviate from the mean size.
-The resulting output is a latent matrix whose rows correspond to nodes and columns to cluster units.
-These clusters are then sparsified by aforementioned hard-concrete ($L_0$) gates [21], producing a temperature-controlled, differentiable mask over latent dimensions.
-Cluster gates automatically select a subset of surviving latent clusters, driving parsimony in the learned representation.
-Auxiliary tensors (i.e. batch indices and gate logits) are returned for subsequent Sinkhorn balancing to enforce valid probability mass across nodes and clusters.
-Then, entropy-regularized clustering procedures that enforce consistent sparsity and diversity across training iterations are appolied.
+During training the encoder applies degree-proportional edge dropout, symmetric degree normalization and inverse-frequency relation reweighting.
+Together these steps keep gradients stable on multiplex graphs whose degree distributions and relation frequencies span orders of magnitude.
+The additive message-passing uses an RGCN stack with basis decomposition per relation and per-layer GraphNorm (or LayerNorm on request).
+After the stack, node embeddings can be augmented with a lightweight virtual-node context that injects graph-level statistics without scaling with |Vertices|.
+Let $h_i$ denote the resulting embedding for node $i$ and $P = [p_1, \dots, p_K]$ the prototype bank maintained via an exponential moving average.
+Embeddings are $L_2$-normalized, $\hat{h}_i = h_i / \lVert h_i \rVert_2$, and scored against prototypes with a temperature-controlled softmax
+$$s_{ik} = \frac{\hat{h}_i^{\top} p_k}{\tau_a} + \log g_k,$$
+where $\tau_a$ is the current assignment temperature and $g_k$ is the sample from the cluster hard-concrete gate.
+Sinkhorn balancing applies $T$ rounds of alternating row/column normalization with entropic regularization $\varepsilon$ to $\exp(s)$, yielding a doubly-stochastic assignment matrix $Q$ that approximately satisfies $Q\mathbf{1} = \mathbf{1}$ and $Q^\top \mathbf{1} = (n/K)\,\mathbf{1}$.
+The hard-concrete gates follow Louizos et al.'s [22] reparameterization with expected sparsity $\mathbb{E}[\mathrm{L}_0] = \sigma\left(\log \alpha - \tau_g \log \frac{-\gamma}{1+\zeta}\right)$, where $\alpha$ is the gate logit and $(\gamma, \zeta)$ the stretch parameters; annealing $\tau_g$ prevents premature collapse.
+A momentum memory bank anchors embeddings for repeated node IDs across sampled subgraphs, and the encoder records the batch-index vector $b \in \{0,\dots,B-1\}^N$ that the decoder and degree-orthogonality penalty consume downstream.
+The assignment matrix $Q$ and auxiliary tensors are then ready for $L_0$ sparsification.
 
 #### Decoder Architecture
-To improve expressivity while maintaining the strict size- and permutation-invariance required for subgraph-level training, the rGCN-SCAE decoder was designed using a **Deep Sets–style relational energy function** [22], [23].
-Unlike bilinear or message-passing decoders, which respectively underfit or introduce graph-size dependence, this formulation learns an invariant nonlinear mapping between pairs of latent embeddings and their relation type.
+The decoder maps the Sinkhorn-balanced cluster assignments back to multiplex edge logits through a low-rank relational energy model gated by the hard-concrete masks.
+Relation-specific inter-cluster affinities are produced via a low-rank factorization: every relation learns coefficients over a shared cluster basis, bringing the parameter count down to $\mathcal{O}(R \cdot C \cdot rank_r)$ instead of $\mathcal{O}(R \cdot C^2)$ (with $rank_r \ll C$).
+A learnable absent-edge bias per relation absorbs the background sparsity so the decoder can focus its capacity on informative deviations.
 
-Mathematically, for any relation type r and node pair (i,j):
-
-$$
-\hat{A}^{(r)}_{ij} =
-\sigma\!\Big(
-  W_o \,
-  \rho\!\Big(
-     \sum_{x \in \{\,z_i,\,z_j,\,e_r\,\}}
-     \phi(x)
-  \Big)
-\Big),
-$$
-
-where:
-- $(z_i, z_j \in \mathbb{R}^d)$ are latent node embeddings produced by the encoder,
-- $e_r$ is the learned embedding of relation type r,
-- $\phi(\cdot)$ projects each element into a shared latent space,
-- the summation (or mean) enforces permutation-invariance over the set $\{z_i,z_j,e_r\}$,
-- $\rho(\cdot)$ is a small multilayer perceptron mapping the pooled vector to a scalar edge energy,
-- $W_o$ is a linear projection converting that energy to a logit, and
-- $\sigma(\cdot)$ is the sigmoid function mapping logits to edge probabilities.
-
-This construction ensures identical edge likelihoods regardless of node ordering and independence from batch size or subgraph composition.
-The decoder creates relation-specific cluster affinities from a low-rank factorization: shared cluster bases (rank $k$) are combined with per-relation coefficients before being gated by a single hard-concrete mask shared across all relations.
-The factored weights then flow through the Deep Sets projection described above, so parameter count and activation size scale with $\mathcal{O}(C \cdot k)$ rather than $\mathcal{O}(C^2)$ while the shared gate enforces consistent sparsity patterns.
-Because the entire function operates on latent vectors rather than adjacency statistics, the reconstruction loss remains strictly size-invariant.
-This factorized Deep Sets architecture preserves efficiency and stability for contrastive training while providing sufficient capacity to model relation-specific nonlinearities and higher-order dependencies.
+For each mini-batch the decoder streams positive edges and sampled negatives in configurable chunks, multiplying source assignments by the gated relation weights and accumulating reconstruction losses.
+This, combined with gradient checkpointing can be used to avoid exhausting CPU/GPU memory.
+Relation frequencies reweight both positive and negative terms so that rare relation types retain influence, while optional type-restricted negative sampling and per-graph budgets keep contrastive updates aligned with ontology constraints.
+Entropy-aware reweighting of negatives, inverse-frequency scaling, and chunked evaluation preserve size invariance and stability even on the largest subgraphs.
+The relation-specific logits follow $\ell_{ijr} = a_i^{\top} W_r a_j + b_r,$ with assignment vectors $a_i = Q_{i\cdot}$ and low-rank weight matrices $W_r = \sigma(F_r B) \odot G_r$, where $F_r \in \mathbb{R}^{C\times d}$, $B \in \mathbb{R}^{d\times C}$, and $G_r$ is the current hard-concrete gate sample.
+Binary cross-entropy losses accumulate over observed edges $(i,j,r) \in E$ and sampled negatives $(i',j',r)$.
+Negative-sample losses are additionally scaled by a gate-entropy confidence factor $w_{\text{neg}} = 1 + \lambda \big(\max(H_g, H_{\min})^{-1} - 1\big)$, where $H_g = -\sum_k \pi_k \log_2 \pi_k$ is the gate entropy in bits computed from gate probabilities $\pi$ and $H_{\min}$ is the floor used in code.
+This keeps confident, low-entropy gates focused on harder negatives without destabilizing early training.
 
 #### Preventing Trivial / Degenerate Solutions
 Five primary forms of degenerate or trivial solutions are guarded against in this model: uniform embeddings, local collapse, global collapse, decoder memorization, and latent drift.
@@ -359,7 +344,7 @@ The two approaches are treated as triangulating evidence: concordant structure a
 - hSBM = Hierarchical Stochastic Block Model
 - ICD = International Classification of Diseases
 - RDoC = Research Domain Criteria
-- rGCN = Recurrent Graph Convolutional Network
+- RGCN = Relational Graph Convolutional Network
 - SCAE = Self-Compressing Auto-Encoder
 
 ## References
@@ -383,6 +368,5 @@ The two approaches are treated as triangulating evidence: concordant structure a
 1. D. Drysdale et al., “Resting-state connectivity biomarkers define neurophysiological subtypes of depression,” Nat. Med., vol. 23, pp. 28–38, 2017.
 1. S. Gao, K. Yu, Y. Yang, S. Yu, C. Shi, X. Wang, N. Tang, and H. Zhu, “Large language model powered knowledge graph construction for mental health exploration,” Nature Communications, vol. 16, no. 1, Art. no. 7526, 2025, doi: 10.1038/s41467-025-62781-z.
 1. T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership stochastic blockmodels for multiple networks and experimental interventions,” in Handbook of Mixed Membership Models and Their Applications, E. Airoldi, D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman & Hall/CRC Press, 2014, pp. 463–488.
-1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
 1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
-1. C. Feinauer and C. Lucibello, “Reconstruction of Pairwise Interactions Using Energy-Based Models,” in Proc. Mach. Learn. Res., vol. 145, 2022, pp. 1–17.
+1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
