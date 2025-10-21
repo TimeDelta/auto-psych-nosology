@@ -4,6 +4,7 @@
 *.html
 *.key
 *.ppt
+*.pptx
 *.json
 data/
 mlruns/
