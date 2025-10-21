@@ -190,7 +190,7 @@ Let $h_i$ denote the resulting embedding for node $i$ and $P = [p_1, \dots, p_K]
 Embeddings are $L_2$-normalized, $\hat{h}_i = h_i / \lVert h_i \rVert_2$, and scored against prototypes with a temperature-controlled softmax
 $$s_{ik} = \frac{\hat{h}_i^{\top} p_k}{\tau_a} + \log g_k,$$
 where $\tau_a$ is the current assignment temperature and $g_k$ is the sample from the cluster hard-concrete gate.
-Sinkhorn balancing applies $T$ rounds of alternating row/column normalization with entropic regularization $\varepsilon$ to $\exp(s)$, yielding a doubly-stochastic assignment matrix $Q$ that approximately satisfies $Q\mathbf{1} = \mathbf{1}$ and $Q^\top \mathbf{1} = (n/K)\,\mathbf{1}$.
+Sinkhorn balancing applies $T$ rounds of alternating row/column normalization with entropic regularization $\varepsilon$ to $\exp(s)$, yielding a doubly-stochastic assignment matrix $Q$ that approximately satisfies $Q\mathbf{1} = \mathbf{1}$ and $Q^\top \mathbf{1} = (n/K), \mathbf{1}$.
 The hard-concrete gates follow Louizos et al.'s [22] reparameterization with expected sparsity $\mathbb{E}[\mathrm{L}_0] = \sigma\left(\log \alpha - \tau_g \log \frac{-\gamma}{1+\zeta}\right)$, where $\alpha$ is the gate logit and $(\gamma, \zeta)$ the stretch parameters; annealing $\tau_g$ prevents premature collapse.
 A momentum memory bank anchors embeddings for repeated node IDs across sampled subgraphs, and the encoder records the batch-index vector $b \in \{0,\dots,B-1\}^N$ that the decoder and degree-orthogonality penalty consume downstream.
 The assignment matrix $Q$ and auxiliary tensors are then ready for $L_0$ sparsification.
@@ -215,16 +215,18 @@ Absent-edge modelling via type-aware negative sampling penalises trivial partiti
 The decoder contrasts observed edges against sampled non-edges inside each subgraph while operating on Sinkhorn-balanced assignment vectors $a_i$ rather than raw encoder features.
 For every relation r the decoder forms a low-rank, hard-gated interaction matrix $W_r$ (built from gated relation factors) and applies an absent-edge bias $b_r$.
 The reconstruction loss adds the average positive-edge binary cross-entropy and a ratio-corrected negative term for every graph g in the batch:
-    $$
-    \mathcal{L}_{\text{recon}} \;=\; \frac{1}{G} \sum_{g=1}^{G} \Bigg[
-        \frac{1}{|E_g|} \sum_{(i,j)\in E_g}
-        \mathrm{BCE}\!\Big(\sigma(a_i^\top W_{r_{ij}} a_j + b_{r_{ij}}),\,1\Big)
-        \;+\;
-        \frac{|E_g|}{|\tilde{E}_g|} \sum_{(i',j')\in \tilde{E}_g}
-        \mathrm{BCE}\!\Big(\sigma(a_{i'}^\top W_{r_{i'j'}} a_{j'} + b_{r_{i'j'}}),\,0\Big)
-    \Bigg],
-    $$
-    where $\tilde{E}_g$ contains the sampled negatives for graph g and G is the number of graphs in the mini-batch.
+
+$$
+\mathcal{L}_{\text{recon}} = \frac{1}{G} \sum_{g=1}^{G} \Bigg[
+    \frac{1}{|E_g|} \sum_{(i,j)\in E_g}
+    \mathrm{BCE}\Big(\sigma(a_i^\top W_{r_{ij}} a_j + b_{r_{ij}}),1\Big)
+    +
+    \frac{|E_g|}{|\tilde{E}_g|} \sum_{(i',j')\in \tilde{E}_g}
+    \mathrm{BCE}\Big(\sigma(a_{i'}^\top W_{r_{i'j'}} a_{j'} + b_{r_{i'j'}}),0\Big)
+\Bigg],
+$$
+
+where $\tilde{E}_g$ contains the sampled negatives for graph g and G is the number of graphs in the mini-batch.
 
 | Symbol | Meaning |
 | --- | --- |
@@ -247,14 +249,12 @@ For example, a situation could arise where local structure collapses but global 
 Negative sampling does not penalize this because such coarse partitions can still separate positives from random negatives effectively.
 Entropy regularization on the cluster assignment matrix counteracts this tendency by enforcing a floor on per-graph assignment entropy.
 For each graph g, it computes $H_g = -\frac{1}{|V_g|} \sum_{i \in g} \sum_{k=1}^{K} p_{ik} \log p_{ik}$ and applies a hinge,
-$$
-\mathcal{L}_{\text{entropy}} = \lambda_H \cdot \frac{1}{G} \sum_{g=1}^{G} \max\!\bigl(0,\, H_{\text{floor}} - H_g\bigr),
-$$
-so the term activates only when entropy dips below the target floor $H_{\text{floor}}$.
 
 $$
-\mathcal{L}_H = -\frac{1}{N} \sum_{i=1}^{N}\sum_{k=1}^{K} p_{ik}\,\log p_{ik}
+\mathcal{L}_{\text{entropy}} = \lambda_H \cdot \frac{1}{G} \sum_{g=1}^{G} \max\bigl(0, H_{\text{floor}} - H_g\bigr),
 $$
+
+so the term activates only when entropy dips below the target floor $H_{\text{floor}}$, where:
 
 | Symbol | Meaning |
 | --- | --- |
@@ -266,7 +266,13 @@ $$
 However, the entropy regularization only handles local degeneracy because it acts locally.
 The model could still produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure — all symptoms in one, all treatments in another, etc.
 To prevent this, the model matches the mean assignment usage against a Dirichlet-inspired prior stored as a categorical baseline $\pi$. Let $u_k = \frac{\sum_i p_{ik}}{\sum_{k'} \sum_i p_{ik'}}$ be the empirical cluster usage.
-It minimizes the KL divergence $\mathcal{L}_{\text{Dirichlet}} = \lambda_{\text{Dir}} \sum_{k=1}^{K} u_k \log \frac{u_k}{\pi_k}$, where:
+It minimizes the KL divergence
+
+$$
+\mathcal{L}_{\text{Dirichlet}} = \lambda_{\text{Dir}} \sum_{k=1}^{K} u_k \log \frac{u_k}{\pi_k},
+$$
+
+where:
 
 | Symbol | Meaning |
 | --- | --- |
@@ -279,8 +285,10 @@ This can occur when embeddings or decoder weights grow unbounded, allowing perfe
 To prevent this *reconstruction-dominant collapse*, the mean squared embedding norm per graph so that large batches do not dominate:
 
 $$
-\mathcal{L}_{\text{norm}} = \lambda_z \cdot \frac{1}{G} \sum_{g=1}^{G} \left( \frac{1}{|V_g|} \sum_{i \in g} \|z_i\|_2^2 \right).
+\mathcal{L}_{\text{norm}} = \lambda_z \cdot \frac{1}{G} \sum_{g=1}^{G} \left( \frac{1}{|V_g|} \sum_{i \in g} \|z_i\|_2^2 \right),
 $$
+
+where:
 
 | Symbol | Meaning |
 | --- | --- |
@@ -293,6 +301,8 @@ $$
 \mathcal{L}_{\text{mom}} = \frac{\lambda_{\text{KLD}}}{2G} \sum_{g=1}^{G} \sum_{d=1}^{D} \left( \mu_{g,d}^2 +
 \sigma_{g,d}^2 - \log \sigma_{g,d}^2 - 1 \right),
 $$
+
+where:
 
 | Symbol | Meaning |
 | --- | --- |
