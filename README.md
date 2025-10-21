@@ -226,19 +226,19 @@ The reconstruction loss adds the average positive-edge binary cross-entropy and 
     $$
     where $\tilde{E}_g$ contains the sampled negatives for graph g and G is the number of graphs in the mini-batch.
 
-    | Symbol | Meaning |
-    | --- | --- |
-    | G                          | Number of graphs (mini-batch components) evaluated in the loss. |
-    | E_g                        | Set of observed edges for graph g. |
-    | $\tilde{E}_g$              | Negative samples generated for graph g under the current negative-sampling policy. |
-    | $|E_g|$                    | Cardinality of E_g. |
-    | $|\tilde{E}_g|$            | Cardinality of $\tilde{E}_g$. |
-    | $a_i \in \Delta^{K-1}$     | Sinkhorn-balanced cluster assignment for node i (probability vector over K clusters). |
-    | $r{ij}$                    | Relation index of edge (i, j); selects decoder parameters for that relation. |
-    | $W{r}$                     | Low-rank, hard-gated relation weight matrix for relation r. |
-    | $b_r$                      | Learnable absent-edge bias for relation r. |
-    | $\sigma(\cdot)$            | Logistic sigmoid that converts logits to probabilities. |
-    | $\mathrm{BCE}(\hat{y}, y)$ | Binary cross-entropy between probability $\hat{y}$ and label y. |
+| Symbol | Meaning |
+| --- | --- |
+| G                          | Number of graphs (mini-batch components) evaluated in the loss. |
+| E_g                        | Set of observed edges for graph g. |
+| $\tilde{E}_g$              | Negative samples generated for graph g under the current negative-sampling policy. |
+| $|E_g|$                    | Cardinality of E_g. |
+| $|\tilde{E}_g|$            | Cardinality of $\tilde{E}_g$. |
+| $a_i \in \Delta^{K-1}$     | Sinkhorn-balanced cluster assignment for node i (probability vector over K clusters). |
+| $r{ij}$                    | Relation index of edge (i, j); selects decoder parameters for that relation. |
+| $W{r}$                     | Low-rank, hard-gated relation weight matrix for relation r. |
+| $b_r$                      | Learnable absent-edge bias for relation r. |
+| $\sigma(\cdot)$            | Logistic sigmoid that converts logits to probabilities. |
+| $\mathrm{BCE}(\hat{y}, y)$ | Binary cross-entropy between probability $\hat{y}$ and label y. |
 
 Intuitively, the first term rewards high similarity for real edges while the second penalizes the model when it predicts high similarity for random, non-existent connections.
 
