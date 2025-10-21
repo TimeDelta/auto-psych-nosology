@@ -266,11 +266,7 @@ $$
 However, the entropy regularization only handles local degeneracy because it acts locally.
 The model could still produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure — all symptoms in one, all treatments in another, etc.
 To prevent this, the model matches the mean assignment usage against a Dirichlet-inspired prior stored as a categorical baseline $\pi$. Let $u_k = \frac{\sum_i p_{ik}}{\sum_{k'} \sum_i p_{ik'}}$ be the empirical cluster usage.
-It minimizes the KL divergence
-$$
-\mathcal{L}_{\text{Dirichlet}} = \lambda_{\text{Dir}} \sum_{k=1}^{K} u_k \log \frac{u_k}{\pi_k},
-$$
-where $\pi_k$ is the normalised prior mass derived from the user-specified Dirichlet concentration parameters.
+It minimizes the KL divergence $\mathcal{L}_{\text{Dirichlet}} = \lambda_{\text{Dir}} \sum_{k=1}^{K} u_k \log \frac{u_k}{\pi_k}$, where:
 
 | Symbol | Meaning |
 | --- | --- |
