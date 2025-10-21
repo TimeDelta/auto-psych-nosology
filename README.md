@@ -167,31 +167,29 @@ This ensures that any observed alignment reflects genuine structural similaritie
 Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [20], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
 This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits hSBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
-
-Second, a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)** tailored to the heterogeneous, typed graph.
-The encoder is a recurrent GCN that outputs a #Nodes x #Clusters latent assignment matrix.
-This latent space is partitioned by Louizos et al.’s hard-concrete (L0) gates [21].
-Cluster gates drive automatic selection of the surviving latent clusters.
-Relation-specific inter-cluster affinities are produced via a low-rank factorization: every relation learns coefficients over a shared cluster basis, bringing the parameter count down to $\mathcal{O}(R \cdot C \cdot rank_rel)$ instead of $\mathcal{O}(R \cdot C^2)$ (with $rank_rel \ll C$).
-A single hard-concrete gate is shared across relations for cluster-to-cluster edges, pruning redundant pathways while the low-rank factors retain relation-specific weights inside each cluster.
-This lets the model treat, for example, some "symptom ↔ diagnosis" edges differently from "treatment ↔ biomarker" edges without paying the quadratic memory cost.
-For each relation type, the resulting slice of the factorized tensor is fed to a dedicated decoder head that reconstructs edges using the shared latent embeddings.
-This design allows relation-specific geometries to be learned while maintaining a common latent space.
-A single decoder conditioned on relation embeddings would instead force all relation types to share one generative function, often leading to interference and loss of type specificity.
-Because the encoder operates directly on the supplied `edge_index`, the model supports cyclic connectivity and multiplex relation types without special handling.
-The decoder mirrors this flexibility, enabling reconstruction of directed feedback motifs that are pervasive in psychiatric knowledge graphs.
+The model architecture tested was a **recurrent Graph Convolutional Network Self-Compressing Autoencoder (rGCN-SCAE)**.
+This model was trained exclusively on the full graph to derive a single global partitioning that captures the complete relational structure.
+It learns a compact latent partition of the full knowledge graph while preserving relation-specific structure through low-rank factorization and hard-concrete gating.
 
 #### Encoder Architecture
-The encoder is designed to fuse heterogeneous node evidence into a size-robust latent representation suitable for subsequent sparsification.
-Each node is first endowed with a permutation-invariant semantic descriptor obtained from a DeepSete node attribute encoder, which implements the Zaheer et al. $\phi/\rho$ formulation.
-This component admits arbitrarily structured metadata and expands its vocabulary online, ensuring that newly mined attributes can be assimilated without retraining embeddings from scratch.
-
-The semantic descriptors are concatenated with two additional signals: (i) a learned node-type embedding that preserves categorical identity while remaining compact enough to avoid over-parameterization, and (ii) graph-aware positional embeddings derived from standardized Laplacian eigenvectors when available.
-The latter are normalized per graph to prevent variance inflation when mini-batches mix subgraphs of widely differing order.
-
-Relation-aware message passing is effected through a stack of graph convolutional layers equipped with basis decomposition across relation types.
-Each layer is followed by either `GraphNorm` (the default choice, given its empirical stability on highly unbalanced batch compositions) or `LayerNorm`, a ReLU nonlinearity, and optional dropout.
-The stack yields node embeddings that remain well-conditioned across sampling regimes, and the module returns both the embeddings and auxiliary bookkeeping tensors (e.g., batch indices) that downstream Sinkhorn balancing and gate sampling procedures consume to form temperature-controlled cluster assignment matrices.
+The encoder is a recurrent Graph Convolutional Network that outputs a latent assignment matrix of shape (#Nodes × #Clusters), forming the probabilistic basis for downstream partitioning via hard-concrete ($L_0$) gates [21].
+Each node is first encoded by a DeepSets-style node attribute encoder, implementing the Zaheer et al. $\rho$/$\phi$ formulation, that is permutation-invariant.
+This component integrates arbitrarily structured metadata—text learned embeddings, biomarkers and ontology terms.
+It can expand its vocabulary online, allowing new attributes to be assimilated without retraining existing embeddings.
+The resulting descriptor is concatenated with:
+A learned node-type embedding, encoding categorical identity in a compact, regularized form and graph-positional encodings derived from standardized Laplacian eigenvectors, normalized per subgraph to maintain numerical stability when batch sizes or graph orders vary.
+The fused vectors are processed through a relation-aware additive message-passing stack of graph convolutional layers using basis decomposition (a parameter sharing technique) across relation types.
+Relation-specific inter-cluster affinities are produced via a low-rank factorization: every relation learns coefficients over a shared cluster basis, bringing the parameter count down to $\mathcal{O}(R \cdot C \cdot rank_rel)$ instead of $\mathcal{O}(R \cdot C^2)$ (with $rank_rel \ll C$).
+Each layer is followed by GraphNorm (default, for unbalanced batches) or LayerNorm, a ReLU activation, and optional dropout.
+Because the encoder operates directly on the supplied edge_index, it naturally accommodates cyclic connectivity and multiplex relation types without special handling.
+The final hidden states are recurrently updated to stabilize learning over irregular graph sizes by iteratively refining node embeddings until convergence rather than relying on a fixed-depth propagation schedule.
+This recurrence normalizes representational dynamics across graphs with differing node counts, edge densities, and neighborhood radii: smaller graphs converge in fewer steps, while larger or denser ones continue refining until internal message consistency is reached.
+By decoupling learning stability from the absolute size of the input graph, the model maintains consistent gradient magnitudes and prevents over-smoothing or under-propagation in graphs that deviate from the mean size.
+The resulting output is a latent matrix whose rows correspond to nodes and columns to cluster units.
+These clusters are then sparsified by aforementioned hard-concrete ($L_0$) gates [21], producing a temperature-controlled, differentiable mask over latent dimensions.
+Cluster gates automatically select a subset of surviving latent clusters, driving parsimony in the learned representation.
+Auxiliary tensors (i.e. batch indices and gate logits) are returned for subsequent Sinkhorn balancing to enforce valid probability mass across nodes and clusters.
+Then, entropy-regularized clustering procedures that enforce consistent sparsity and diversity across training iterations are appolied.
 
 #### Decoder Architecture
 To improve expressivity while maintaining the strict size- and permutation-invariance required for subgraph-level training, the rGCN-SCAE decoder was designed using a **Deep Sets–style relational energy function** [22], [23].
@@ -319,10 +317,10 @@ $$
 Training rGCN-SCAE models on multiplex graphs can exhibit several characteristic failure modes.
 Detailed mitigation strategies and hyperparameter guidelines are provided in [`training_stability.md`](training_stability.md).
 
-#### Adaptive Subgraph Sampling to Mitigate Overfitting
-A practical limitation of the basic rGCN-SCAE approach is that it would be trained on a single, fixed multiplex graph.
+#### Adaptive Subgraph Sampling for Stability Testing
+A practical limitation of this approach is that it is trained on a single, fixed multiplex graph.
 Without a distribution of graphs, the model risks overfitting to idiosyncratic topological patterns rather than learning generalizable relational principles.
-To mitigate this, a dataset was be created with different subgraphs sampled via node-hopping from randomly chosen seed nodes with the hop radius determined adaptively from local connectivity metrics such as node degree, clustering coefficient, and k-core index in order to preserve local connectivity and type proportions.
+To check the effect of training on only the full knowledge graph, a dataset was be created with different subgraphs sampled via node-hopping from randomly chosen seed nodes with the hop radius determined adaptively from local connectivity metrics such as node degree, clustering coefficient, and k-core index in order to preserve local connectivity and type proportions.
 For each seed s, a composite score $g(s) = z(c_s) + z(\kappa_s) - z(\deg_s)$ to select a hop radius $r(s) = \mathrm{clamp}_{[1,3]}(1 + \alpha g(s))$, encouraging larger neighborhoods in sparse or weakly clustered regions and smaller ones near dense hubs.
 
 | Symbol                          | Meaning                                                                       | Notes                                                                                                                                                                                      |
