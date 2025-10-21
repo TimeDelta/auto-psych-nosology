@@ -210,93 +210,99 @@ This keeps confident, low-entropy gates focused on harder negatives without dest
 
 #### Preventing Trivial / Degenerate Solutions
 Five primary forms of degenerate or trivial solutions are guarded against in this model: uniform embeddings, local collapse, global collapse, decoder memorization, and latent drift.
-Absent-edge modeling via negative sampling penalizes trivial solutions such as uniform embeddings that would otherwise predict every node pair as connected.
-The decoder explicitly contrasts observed edges with sampled non-edges drawn within each subgraph, forcing the model to assign distinct embeddings that separate real from spurious connections.
-That means clusters that lump everything together will get penalized because they will incorrectly predict connections between random node pairs that are not actually linked.
-Mathematically, this is an additional loss term for each relation type:
+Absent-edge modelling via type-aware negative sampling penalises trivial partitions even when node embeddings look uniform.
+The decoder contrasts observed edges against sampled non-edges inside each subgraph while operating on Sinkhorn-balanced assignment vectors $a_i$ rather than raw encoder features.
+For every relation r the decoder forms a low-rank, hard-gated interaction matrix $W_r$ (built from gated relation factors) and applies an absent-edge bias $b_r$.
+The reconstruction loss adds the average positive-edge binary cross-entropy and a ratio-corrected negative term for every graph g in the batch:
+    $$
+    \mathcal{L}_{\text{recon}} \;=\; \frac{1}{G} \sum_{g=1}^{G} \Bigg[
+        \frac{1}{|E_g|} \sum_{(i,j)\in E_g}
+        \mathrm{BCE}\!\Big(\sigma(a_i^\top W_{r_{ij}} a_j + b_{r_{ij}}),\,1\Big)
+        \;+\;
+        \frac{|E_g|}{|\tilde{E}_g|} \sum_{(i',j')\in \tilde{E}_g}
+        \mathrm{BCE}\!\Big(\sigma(a_{i'}^\top W_{r_{i'j'}} a_{j'} + b_{r_{i'j'}}),\,0\Big)
+    \Bigg],
+    $$
+    where $\tilde{E}_g$ contains the sampled negatives for graph g and G is the number of graphs in the mini-batch.
 
-$$
-\mathcal{L}
-= -\sum_{(i,j)\in E} \log \sigma\big(z_i^\top W z_j\big) - \sum_{(i',j')\notin E} \log \big[1-\sigma\big(z_{i'}^\top W z_{j'}\big)\big]
-$$
-
-| Symbol                                      | Meaning                                                                                                                                                                                                                                                      |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| $E$                                       | The set of observed positive edges in the multiplex graph. Each edge (i,j) indicates a real relation between node (i) and node (j).                                                                                                                      |
-| $(i', j') \notin E$                       | A set of *absent* edges (negative samples) — pairs of nodes that are *not* connected in the observed graph. These are drawn randomly (or stratified by node type) during training to contrast with positives.                                              |
-| $z_i \in \mathbb{R}^d$                    | Latent embedding vector for node (i) produced by the encoder (the rGCN-SCAE). Dimension (d) is the latent feature size.                                                                                                                                      |
-| $W \in \mathbb{R}^{d \times d}$           | Learnable relation (or global decoder) weight matrix that maps latent interactions to a scalar edge score. In a multiplex graph, there may be one such matrix per relation type (W_r).                                                                       |
-| $\sigma(\cdot)$                           | Logistic sigmoid function, $\sigma(x) = 1/(1 + e^{-x})$, mapping inner products to edge probabilities.                                                                                                                                                       |
-| $\log \sigma(z_i^\top W z_j)$             | Log-probability that the observed edge (i,j) is correctly reconstructed.                                                                                                                                                                                   |
-| $\log [1 - \sigma(z_{i'}^\top W z_{j'})]$ | Log-probability that a *non-edge* is correctly predicted as absent.                                                                                                                                                                                          |
-| $\mathcal{L}$                             | Total reconstruction loss — the binary cross-entropy objective over both observed and sampled absent edges. Minimizing $(\mathcal{L})$ trains embeddings $(z_i)$ so that connected nodes have high dot products, while unconnected ones have low similarity. |
+    | Symbol | Meaning |
+    | --- | --- |
+    | G                          | Number of graphs (mini-batch components) evaluated in the loss. |
+    | E_g                        | Set of observed edges for graph g. |
+    | $\tilde{E}_g$              | Negative samples generated for graph g under the current negative-sampling policy. |
+    | $|E_g|$                    | Cardinality of E_g. |
+    | $|\tilde{E}_g|$            | Cardinality of $\tilde{E}_g$. |
+    | $a_i \in \Delta^{K-1}$     | Sinkhorn-balanced cluster assignment for node i (probability vector over K clusters). |
+    | $r{ij}$                    | Relation index of edge (i, j); selects decoder parameters for that relation. |
+    | $W{r}$                     | Low-rank, hard-gated relation weight matrix for relation r. |
+    | $b_r$                      | Learnable absent-edge bias for relation r. |
+    | $\sigma(\cdot)$            | Logistic sigmoid that converts logits to probabilities. |
+    | $\mathrm{BCE}(\hat{y}, y)$ | Binary cross-entropy between probability $\hat{y}$ and label y. |
 
 Intuitively, the first term rewards high similarity for real edges while the second penalizes the model when it predicts high similarity for random, non-existent connections.
 
 However, this is not enough to prevent all situations of structure collapse.
 For example, a situation could arise where local structure collapses but global does not.
-The model could produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure — all symptoms in one, all treatments in another, etc.
 Negative sampling does not penalize this because such coarse partitions can still separate positives from random negatives effectively.
-Entropy regularization on the cluster assignment matrix counteracts this tendency by discouraging prematurely confident, low-entropy assignments.
-It maintains dispersion across latent clusters by keeping node-to-cluster probabilities sufficiently soft during early training, ensuring that multiple clusters remain active and receive gradient signal until the structure is well-formed.
-Mathematically, this loss term is:
+Entropy regularization on the cluster assignment matrix counteracts this tendency by enforcing a floor on per-graph assignment entropy.
+For each graph g, it computes $H_g = -\frac{1}{|V_g|} \sum_{i \in g} \sum_{k=1}^{K} p_{ik} \log p_{ik}$ and applies a hinge,
+$$
+\mathcal{L}_{\text{entropy}} = \lambda_H \cdot \frac{1}{G} \sum_{g=1}^{G} \max\!\bigl(0,\, H_{\text{floor}} - H_g\bigr),
+$$
+so the term activates only when entropy dips below the target floor $H_{\text{floor}}$.
 
 $$
 \mathcal{L}_H = -\frac{1}{N} \sum_{i=1}^{N}\sum_{k=1}^{K} p_{ik}\,\log p_{ik}
 $$
 
-| Symbol     | Meaning                                                                                                     |
-| ---------- | ----------------------------------------------------------------------------------------------------------- |
-| $K$        | Maximum number of latent clusters.                                                                          |
-| $N$        | Number of nodes (data points).                                                                              |
-| $p_{ik}$   | Soft assignment probability of node ( i ) to cluster ( k ).                                                 |
+| Symbol | Meaning |
+| --- | --- |
+| $H_g$              | Mean assignment entropy for graph g, $-\frac{1}{|V_g|}\sum_{i\in g}\sum_{k} p_{ik}\log p_{ik}$. |
+| $|V_g|$            | Number of nodes belonging to graph g. |
+| $H_{\text{floor}}$ | Target minimum entropy per graph (defaults to $\log K$ if unset). |
+| $\lambda_H$        | Weight assigned to the entropy penalty. |
 
 However, the entropy regularization only handles local degeneracy because it acts locally.
-For global degeneracy, a Dirichlet prior loss term is used because it constrains the aggregate cluster sizes across all nodes, discouraging the emergence of a few dominant mega-clusters while allowing moderate, data-driven variation in cluster sizes.
-This global prior complements the local entropy term by balancing overall cluster utilization, ensuring that each cluster contributes meaningfully to the reconstruction objective without enforcing strict uniformity.
-The equation for this loss term is:
-
+The model could still produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure — all symptoms in one, all treatments in another, etc.
+To prevent this, the model matches the mean assignment usage against a Dirichlet-inspired prior stored as a categorical baseline $\pi$. Let $u_k = \frac{\sum_i p_{ik}}{\sum_{k'} \sum_i p_{ik'}}$ be the empirical cluster usage.
+It minimizes the KL divergence
 $$
-\mathcal{L}_{\text{Dirichlet}}
-= -\sum_{k=1}^{K} (\alpha_k - 1)\,
-  \log\left(
-    \frac{1}{N}\sum_{i=1}^{N} p_{ik}
-  \right)
+\mathcal{L}_{\text{Dirichlet}} = \lambda_{\text{Dir}} \sum_{k=1}^{K} u_k \log \frac{u_k}{\pi_k},
 $$
+where $\pi_k$ is the normalised prior mass derived from the user-specified Dirichlet concentration parameters.
 
-| Symbol     | Meaning                                                                                                     |
-| ---------- | ----------------------------------------------------------------------------------------------------------- |
-| $K$        | Maximum number of latent clusters.                                                                          |
-| $N$        | Number of nodes (data points).                                                                              |
-| $p_{ik}$   | Soft assignment probability of node ( i ) to cluster ( k ).                                                 |
-| $\alpha_k$ | Concentration parameter of the Dirichlet prior; values ( < 1 ) encourage balanced but non-uniform clusters. |
+| Symbol | Meaning |
+| --- | --- |
+| $u_k$                  | Empirical mean cluster usage, normalised so $\sum_k u_k = 1$. |
+| $\pi_k$                | Prior cluster usage probability derived from the user-specified Dirichlet concentrations (normalised once). |
+| $\lambda_{\text{Dir}}$ | Weight applied to the KL penalty term. |
 
 Even with these local and global regularizers, the decoder can still exploit trivial optima by memorizing adjacency patterns rather than learning meaningful structure.
 This can occur when embeddings or decoder weights grow unbounded, allowing perfect reconstruction without informative latent geometry.
-To prevent this *reconstruction-dominant collapse*, an embedding norm regularization term is added to constrain latent magnitude and encourage geometric smoothness:
+To prevent this *reconstruction-dominant collapse*, the mean squared embedding norm per graph so that large batches do not dominate:
 
 $$
-\mathcal{L}_{\text{norm}} = \frac{\lambda_z}{N}\sum_{i=1}^{N} \|z_i\|_2^2
+\mathcal{L}_{\text{norm}} = \lambda_z \cdot \frac{1}{G} \sum_{g=1}^{G} \left( \frac{1}{|V_g|} \sum_{i \in g} \|z_i\|_2^2 \right).
 $$
 
-| Symbol        | Meaning                                                                                 |
-| ------------- | --------------------------------------------------------------------------------------- |
-| $\lambda_z$   | Weight controlling the strength of embedding norm regularization.                       |
-| $\|z_i\|_2^2$ | Squared L2 norm of the embedding vector for node $(i)$, penalizing large magnitudes.    |
+| Symbol | Meaning |
+| --- | --- |
+| $\lambda_z$ | Scaling factor for the latent L2 penalty. |
+| $z_i$       | Encoder embedding for node i before Sinkhorn balancing. |
 
-Finally, the latent posterior distribution could much drift or the latent space might collapse into a narrow region.
-To prevent this, a simple Kullback–Leibler divergence loss term is added:
+Finally, to stop latent drift and keep graph-level statistics well behaved, regularization is added of the first two moments of each graph’s embedding distribution toward a zero-mean, unit-variance Gaussian:
 
 $$
-\mathcal{L}_{\text{KLD}}
-= D_{\mathrm{KL}}\big(q(z_i) \,\|\, p(z)\big)
+\mathcal{L}_{\text{mom}} = \frac{\lambda_{\text{KLD}}}{2G} \sum_{g=1}^{G} \sum_{d=1}^{D} \left( \mu_{g,d}^2 +
+\sigma_{g,d}^2 - \log \sigma_{g,d}^2 - 1 \right),
 $$
 
-| Symbol                  | Meaning                                                                              |
-| ----------------------- | ------------------------------------------------------------------------------------ |
-| $q(z_i)$                | Approximate posterior distribution of latent embedding for node $(i)$.               |
-| $p(z)$                  | Prior distribution, typically $\mathcal{N}(0,I)$.                                    |
-| $D_{\mathrm{KL}}(q\|p)$ | Kullback–Leibler divergence measuring how far the posterior deviates from the prior. |
+| Symbol | Meaning |
+| --- | --- |
+| $D$                    | Latent dimensionality of the encoder outputs. |
+| $\mu_{g,d}$            | Empirical mean of latent dimension d over nodes in graph g. |
+| $\sigma_{g,d}^2$       | Empirical variance of latent dimension d over nodes in graph g (clamped to stay positive). |
+| $\lambda_{\text{KLD}}$ | Weight of the moment-based regulariser. |
 
 #### Stability and Regularization
 Training rGCN-SCAE models on multiplex graphs can exhibit several characteristic failure modes.
