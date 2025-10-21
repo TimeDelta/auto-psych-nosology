@@ -259,7 +259,7 @@ $$
 | Symbol | Meaning |
 | --- | --- |
 | $H_g$              | Mean assignment entropy for graph g, $-\frac{1}{|V_g|}\sum_{i\in g}\sum_{k} p_{ik}\log p_{ik}$. |
-| $|V_g|$            | Number of nodes belonging to graph g. |
+| $\|V_g\|$          | Number of nodes belonging to graph g. |
 | $H_{\text{floor}}$ | Target minimum entropy per graph (defaults to $\log K$ if unset). |
 | $\lambda_H$        | Weight assigned to the entropy penalty. |
 
