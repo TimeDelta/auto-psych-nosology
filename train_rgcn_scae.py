@@ -9,6 +9,8 @@ import math
 import random
 import re
 import time
+import warnings
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -898,21 +900,52 @@ def train_scae_on_graph(
 def save_partition(
     partition: PartitionResult, output_path: Path, graph: MultiplexGraph
 ) -> None:
-    reverse_node_map = graph.node_names
+    idx_to_id = graph.node_ids
+    idx_to_name = graph.node_names
+
     cluster_members_named: Dict[str, List[str]] = {}
+    cluster_member_ids: Dict[str, List[str]] = {}
+    node_to_cluster: Dict[str, int] = {}
+    name_collisions: Dict[str, List[str]] = defaultdict(list)
+
+    node_assignments = partition.node_to_cluster.tolist()
+
+    for node_index, cluster_idx in enumerate(node_assignments):
+        node_id = idx_to_id[node_index]
+        node_name = idx_to_name[node_index]
+        int_cluster = int(cluster_idx)
+
+        node_to_cluster[node_id] = int_cluster
+        if node_name:
+            name_collisions[node_name].append(node_id)
+
     for cluster_idx, member_idx in partition.cluster_members.items():
-        cluster_members_named[str(cluster_idx)] = [
-            reverse_node_map[i] for i in member_idx.tolist()
-        ]
+        key = str(cluster_idx)
+        member_ids = [idx_to_id[i] for i in member_idx.tolist()]
+        cluster_member_ids[key] = member_ids
+        cluster_members_named[key] = [idx_to_name[i] for i in member_idx.tolist()]
+
+    duplicated_names = {
+        name: ids for name, ids in name_collisions.items() if len(ids) > 1
+    }
+    if duplicated_names:
+        preview = ", ".join(
+            f"{name}->{len(ids)} ids"
+            for name, ids in list(duplicated_names.items())[:5]
+        )
+        warnings.warn(
+            "Detected non-unique node labels while saving the partition; "
+            "downstream tools should rely on node IDs. "
+            f"Colliding labels: {len(duplicated_names)} (samples: {preview})."
+        )
 
     payload = {
         "active_clusters": partition.active_clusters.tolist(),
         "gate_values": partition.gate_values.tolist(),
-        "node_to_cluster": {
-            reverse_node_map[i]: int(cluster_idx)
-            for i, cluster_idx in enumerate(partition.node_to_cluster.tolist())
-        },
+        "node_to_cluster": node_to_cluster,
+        "node_name_map": {idx_to_id[i]: idx_to_name[i] for i in range(len(idx_to_id))},
         "cluster_members": cluster_members_named,
+        "cluster_member_ids": cluster_member_ids,
     }
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
