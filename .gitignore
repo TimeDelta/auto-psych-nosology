@@ -6,6 +6,8 @@
 *.ppt
 *.pptx
 *.json
+*.pt
+*.npz
 data/
 mlruns/
 __pycache__/

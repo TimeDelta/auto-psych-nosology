@@ -2140,6 +2140,8 @@ class OnlineTrainer:
         self.device = resolved_device
         self.dataset: List[Data] = []
         self.history: List[Dict[str, float]] = []
+        self.total_epochs_trained: int = 0
+        self.last_run_epochs: int = 0
         # Track node counts per graph so we can bucket by size or enforce budgets.
         self._node_sizes: List[int] = []
         self.early_stop_epoch: Optional[int] = None
@@ -2235,11 +2237,19 @@ class OnlineTrainer:
         stability_tolerance: float = 0.0,
         stability_relative_tolerance: Optional[float] = None,
         min_epochs: int = 0,
+        start_epoch: int = 0,
     ) -> List[Dict[str, float]]:
         if max_epochs <= 0:
             raise ValueError("max epochs must be a positive integer.")
         if not self.dataset:
             raise ValueError("No graphs available to train on. Call add_data first.")
+
+        start_epoch = max(0, int(start_epoch))
+        epochs_to_run = int(max_epochs)
+        self.early_stop_epoch = None
+        self.early_stop_reason = None
+        self.last_run_epochs = 0
+        initial_history_len = len(self.history)
 
         pin_memory = self.device.type == "cuda"
         loader_kwargs = {"pin_memory": pin_memory}
@@ -2268,7 +2278,8 @@ class OnlineTrainer:
                 **loader_kwargs,
             )
 
-        for epoch in range(1, max_epochs + 1):
+        last_epoch = start_epoch
+        for epoch in range(start_epoch + 1, start_epoch + epochs_to_run + 1):
             self.model.train()
             batch_count = 0
             epoch_loss = 0.0
@@ -2397,7 +2408,11 @@ class OnlineTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             averaged_metrics = {k: v / batch_count for k, v in metric_sums.items()}
+            averaged_metrics["epoch"] = float(epoch)
+            averaged_metrics["run_epoch"] = float(epoch - start_epoch)
             self.history.append(averaged_metrics)
+            self.last_run_epochs = len(self.history) - initial_history_len
+            last_epoch = epoch
             if on_epoch_end is not None:
                 try:
                     on_epoch_end(epoch, averaged_metrics)
@@ -2407,7 +2422,7 @@ class OnlineTrainer:
 
             if verbose:
                 print(
-                    f"Epoch {epoch}/{max_epochs} loss={averaged_metrics['total_loss']:.4f} metrics={averaged_metrics}"
+                    f"Epoch {epoch} (run {int(epoch - start_epoch)}/{epochs_to_run}) loss={averaged_metrics['total_loss']:.4f} metrics={averaged_metrics}"
                 )
 
             if (
@@ -2446,6 +2461,10 @@ class OnlineTrainer:
             if self.empty_cache_each_epoch and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            if self.early_stop_epoch is not None:
+                break
+
+        self.total_epochs_trained = last_epoch
         return self.history
 
 

@@ -49,6 +49,56 @@ _TEXT_TOKEN_LIMIT_PER_FIELD = 32
 _TEXT_TOKEN_LIMIT_TOTAL = 128
 
 
+def _checkpoint_tracker_path(base: Path) -> Path:
+    if base.suffix:
+        return base.with_suffix(base.suffix + ".mlflow.json")
+    return base.with_name(base.name + ".mlflow.json")
+
+
+def _capture_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        try:
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        except RuntimeError:
+            pass
+    return state
+
+
+def _restore_rng_state(state: Optional[Mapping[str, Any]]) -> None:
+    if not state:
+        return
+    python_state = state.get("python")
+    if python_state is not None:
+        try:
+            random.setstate(python_state)
+        except Exception:
+            pass
+    numpy_state = state.get("numpy")
+    if numpy_state is not None:
+        try:
+            np.random.set_state(numpy_state)
+        except Exception:
+            pass
+    torch_state = state.get("torch")
+    if torch_state is not None:
+        try:
+            torch.random.set_rng_state(torch_state)
+        except Exception:
+            pass
+    if torch.cuda.is_available():
+        cuda_state = state.get("torch_cuda")
+        if cuda_state is not None:
+            try:
+                torch.cuda.set_rng_state_all(cuda_state)
+            except Exception:
+                pass
+
+
 def _tokenize_text(value: str) -> List[str]:
     if not value:
         return []
@@ -660,6 +710,7 @@ def _mlflow_run(
     experiment_name: Optional[str],
     run_name: Optional[str],
     tags: Mapping[str, str],
+    existing_run_id: Optional[str] = None,
 ):
     if not enabled:
         yield None
@@ -676,9 +727,13 @@ def _mlflow_run(
     if experiment_name:
         mlflow.set_experiment(experiment_name)
 
-    run_kwargs = {"run_name": run_name} if run_name else {}
+    run_kwargs: Dict[str, Any] = {}
+    if existing_run_id:
+        run_kwargs["run_id"] = existing_run_id
+    elif run_name:
+        run_kwargs["run_name"] = run_name
     with mlflow.start_run(**run_kwargs):
-        if tags:
+        if tags and not existing_run_id:
             mlflow.set_tags(tags)
         yield mlflow
 
@@ -727,9 +782,33 @@ def train_scae_on_graph(
     gradient_checkpointing: bool = False,
     pos_edge_chunk_size: Optional[int] = 16384,
     neg_edge_chunk_size: Optional[int] = 4096,
-) -> Tuple[SelfCompressingRGCNAutoEncoder, PartitionResult, List[Dict[str, float]]]:
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_every: int = 0,
+    resume: bool = False,
+    reset_optimizer: bool = False,
+    checkpoint_blob: Optional[Mapping[str, Any]] = None,
+    mlflow_run_id: Optional[str] = None,
+    mlflow_last_logged_step: Optional[int] = None,
+    mlflow_tracker_path: Optional[Path] = None,
+) -> Tuple[
+    SelfCompressingRGCNAutoEncoder,
+    PartitionResult,
+    List[Dict[str, float]],
+    Dict[str, Any],
+]:
     if num_clusters is None:
         num_clusters = _default_cluster_capacity(graph)
+
+    checkpoint_path = (
+        checkpoint_path.expanduser() if checkpoint_path is not None else None
+    )
+    resume_history: List[Dict[str, float]] = []
+    start_epoch = 0
+    used_resume = False
+    if mlflow_last_logged_step is None:
+        mlflow_last_logged_step = -1
+    else:
+        mlflow_last_logged_step = int(mlflow_last_logged_step)
 
     shared_vocab = SharedAttributeVocab(
         initial_names=[], embedding_dim=attr_encoder_dims[0]
@@ -787,6 +866,102 @@ def train_scae_on_graph(
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    checkpoint_signature: Dict[str, Any] = {
+        "model_class": type(model).__name__,
+        "num_clusters": int(num_clusters),
+        "hidden_dims": list(hidden_dims),
+        "type_embedding_dim": int(type_embedding_dim),
+        "attr_encoder_dims": list(attr_encoder_dims),
+        "num_node_types": len(graph.node_type_index),
+        "num_relations": max(1, len(graph.relation_index)),
+        "negative_sampling_ratio": float(negative_sampling_ratio),
+    }
+
+    def _validate_checkpoint_signature(saved: Mapping[str, Any]) -> None:
+        for key, expected in checkpoint_signature.items():
+            if key not in saved:
+                continue
+            if saved[key] != expected:
+                raise ValueError(
+                    f"Checkpoint signature mismatch for {key}: expected {expected}, found {saved[key]}"
+                )
+
+    if resume and checkpoint_path is not None:
+        checkpoint_data: Optional[Mapping[str, Any]] = checkpoint_blob
+        if checkpoint_data is None and checkpoint_path.exists():
+            try:
+                checkpoint_data = torch.load(checkpoint_path, map_location="cpu")
+            except Exception as exc:  # pragma: no cover - surface load errors
+                raise RuntimeError(
+                    f"Failed to load checkpoint from {checkpoint_path}: {exc}"
+                ) from exc
+
+        if checkpoint_data is not None:
+            saved_signature = checkpoint_data.get("signature")
+            if isinstance(saved_signature, Mapping):
+                _validate_checkpoint_signature(saved_signature)
+            elif saved_signature is not None:
+                raise ValueError(
+                    "Checkpoint signature is malformed; expected a mapping."
+                )
+
+            model_state = checkpoint_data.get("model_state")
+            if model_state is None:
+                raise ValueError("Checkpoint missing model_state for resume.")
+            model.load_state_dict(model_state)
+
+            if not reset_optimizer:
+                optimizer_state = checkpoint_data.get("optimizer_state")
+                if optimizer_state is not None:
+                    optimizer.load_state_dict(optimizer_state)
+
+            _restore_rng_state(checkpoint_data.get("rng_state"))
+
+            history_blob = checkpoint_data.get("history", [])
+            if isinstance(history_blob, list):
+                resume_history = [
+                    dict(entry) for entry in history_blob if isinstance(entry, Mapping)
+                ]
+            else:
+                resume_history = []
+
+            epoch_value = checkpoint_data.get("epoch")
+            if epoch_value is None:
+                start_epoch = len(resume_history)
+            else:
+                try:
+                    start_epoch = int(epoch_value)
+                except (TypeError, ValueError):
+                    start_epoch = len(resume_history)
+            start_epoch = max(start_epoch, len(resume_history))
+            prior_summary = checkpoint_data.get("run_summary")
+            if isinstance(prior_summary, Mapping):
+                if mlflow_run_id is None:
+                    prior_run_id = prior_summary.get("mlflow_run_id")
+                    if isinstance(prior_run_id, str) and prior_run_id:
+                        mlflow_run_id = prior_run_id
+                if mlflow_last_logged_step <= 0:
+                    prior_logged_step = prior_summary.get("mlflow_last_logged_step")
+                    if isinstance(prior_logged_step, (int, float)):
+                        mlflow_last_logged_step = max(
+                            mlflow_last_logged_step, int(prior_logged_step)
+                        )
+            used_resume = True
+            if verbose:
+                print(
+                    f"[INFO] Resumed from checkpoint {checkpoint_path} at epoch {start_epoch}"
+                )
+        elif checkpoint_path.exists():
+            if verbose:
+                print(
+                    f"[WARN] Resume requested but checkpoint {checkpoint_path} could not be loaded. Starting fresh."
+                )
+        else:
+            if verbose:
+                print(
+                    f"[WARN] Resume requested but checkpoint {checkpoint_path} was not found. Starting fresh."
+                )
+
     if ego_samples > 0:
         dataset = _build_adaptive_subgraph_dataset(
             graph,
@@ -834,28 +1009,126 @@ def train_scae_on_graph(
         max_grad_norm=max_grad_norm,
         empty_cache_each_epoch=empty_cache_each_epoch,
     )
+
+    if resume_history:
+        trainer.history = [dict(entry) for entry in resume_history]
+        trainer.total_epochs_trained = start_epoch
+        mlflow_last_logged_step = max(mlflow_last_logged_step, start_epoch)
+
     add_start = time.perf_counter()
     trainer.add_data(dataset)
     add_duration = time.perf_counter() - add_start
     if verbose:
         print(f"[TIMING] trainer.add_data took {add_duration:.3f}s")
 
-    history = trainer.train(
-        max_epochs=max_epochs,
-        batch_size=max(1, int(batch_size)),
-        negative_sampling_ratio=negative_sampling_ratio,
-        verbose=verbose,
-        bucket_by_size=node_budget is None,
-        node_budget=node_budget,
-        on_epoch_end=epoch_callback,
-        stability_metric="num_active_clusters"
-        if cluster_stability_window > 0
-        else None,
-        stability_window=cluster_stability_window,
-        stability_tolerance=cluster_stability_tolerance,
-        stability_relative_tolerance=cluster_stability_relative_tolerance,
-        min_epochs=min_epochs,
-    )
+    initial_history_len = len(trainer.history)
+    checkpoint_interval = max(0, int(checkpoint_every))
+
+    def _update_mlflow_tracker(step: int) -> None:
+        if mlflow_tracker_path is None or mlflow_run_id is None:
+            return
+        tracker_payload = {
+            "mlflow_run_id": mlflow_run_id,
+            "last_logged_step": int(step),
+        }
+        try:
+            mlflow_tracker_path.parent.mkdir(parents=True, exist_ok=True)
+            if mlflow_tracker_path.suffix:
+                tmp_tracker = mlflow_tracker_path.with_suffix(
+                    mlflow_tracker_path.suffix + ".tmp"
+                )
+            else:
+                tmp_tracker = mlflow_tracker_path.with_name(
+                    mlflow_tracker_path.name + ".tmp"
+                )
+            tmp_tracker.write_text(
+                json.dumps(tracker_payload, indent=2), encoding="utf-8"
+            )
+            tmp_tracker.replace(mlflow_tracker_path)
+        except Exception:
+            pass
+
+    def _write_checkpoint(epoch_idx: int, reason: str) -> None:
+        if checkpoint_path is None:
+            return
+        history_snapshot = [dict(entry) for entry in trainer.history]
+        payload = {
+            "version": 1,
+            "epoch": int(epoch_idx),
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "rng_state": _capture_rng_state(),
+            "history": history_snapshot,
+            "signature": checkpoint_signature,
+            "run_summary": {
+                "resume_used": used_resume,
+                "start_epoch": start_epoch,
+                "epochs_trained": trainer.last_run_epochs,
+                "total_epochs": trainer.total_epochs_trained,
+                "reason": reason,
+                "timestamp": time.time(),
+                "mlflow_run_id": mlflow_run_id,
+                "mlflow_last_logged_step": mlflow_last_logged_step,
+            },
+        }
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        if checkpoint_path.suffix:
+            tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+        else:
+            tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+        torch.save(payload, tmp_path)
+        tmp_path.replace(checkpoint_path)
+        if verbose:
+            print(
+                f"[INFO] Saved checkpoint to {checkpoint_path} at epoch {epoch_idx} ({reason})"
+            )
+
+    def _combined_epoch_callback(epoch_idx: int, metrics: Dict[str, float]) -> None:
+        nonlocal mlflow_last_logged_step
+        if epoch_callback is not None and epoch_idx > mlflow_last_logged_step:
+            epoch_callback(epoch_idx, metrics)
+            mlflow_last_logged_step = epoch_idx
+            _update_mlflow_tracker(mlflow_last_logged_step)
+        if (
+            checkpoint_path is not None
+            and checkpoint_interval > 0
+            and epoch_idx % checkpoint_interval == 0
+        ):
+            _write_checkpoint(epoch_idx, "interval")
+
+    if epoch_callback is not None or checkpoint_path is not None:
+        epoch_callback_for_trainer = _combined_epoch_callback
+    else:
+        epoch_callback_for_trainer = None
+
+    epochs_remaining = max(0, int(max_epochs) - int(start_epoch))
+    if epochs_remaining > 0:
+        history = trainer.train(
+            max_epochs=epochs_remaining,
+            batch_size=max(1, int(batch_size)),
+            negative_sampling_ratio=negative_sampling_ratio,
+            verbose=verbose,
+            bucket_by_size=node_budget is None,
+            node_budget=node_budget,
+            on_epoch_end=epoch_callback_for_trainer,
+            stability_metric="num_active_clusters"
+            if cluster_stability_window > 0
+            else None,
+            stability_window=cluster_stability_window,
+            stability_tolerance=cluster_stability_tolerance,
+            stability_relative_tolerance=cluster_stability_relative_tolerance,
+            min_epochs=min_epochs,
+            start_epoch=start_epoch,
+        )
+    else:
+        if verbose:
+            print(
+                "[INFO] No epochs remaining to train "
+                f"(start_epoch={start_epoch}, max_epochs={max_epochs})."
+            )
+        trainer.last_run_epochs = 0
+        trainer.total_epochs_trained = start_epoch
+        history = trainer.history
 
     if trainer.early_stop_epoch is not None:
         message = f"Early stop at epoch {trainer.early_stop_epoch}: {trainer.early_stop_reason}"
@@ -863,6 +1136,19 @@ def train_scae_on_graph(
             print(f"[INFO] {message}")
         if history:
             history[-1]["early_stop_epoch"] = float(trainer.early_stop_epoch)
+
+    epochs_trained_this_run = max(0, trainer.last_run_epochs)
+    if history:
+        history[-1]["epochs_trained_this_run"] = float(epochs_trained_this_run)
+        history[-1]["total_epochs_trained"] = float(trainer.total_epochs_trained)
+        history[-1]["resume_start_epoch"] = float(start_epoch)
+        history[-1]["resumed"] = float(1 if used_resume else 0)
+
+    if checkpoint_path is not None:
+        _write_checkpoint(trainer.total_epochs_trained, "final")
+
+    if mlflow_last_logged_step >= 0:
+        _update_mlflow_tracker(mlflow_last_logged_step)
 
     model.eval()
     with torch.no_grad():
@@ -894,7 +1180,19 @@ def train_scae_on_graph(
         min_cluster_size=min_cluster_size,
     )
 
-    return model, partition, history
+    training_summary = {
+        "epochs_trained": epochs_trained_this_run,
+        "total_epochs": trainer.total_epochs_trained,
+        "resume_used": used_resume,
+        "start_epoch": start_epoch,
+        "checkpoint_path": str(checkpoint_path)
+        if checkpoint_path is not None
+        else None,
+        "mlflow_run_id": mlflow_run_id,
+        "mlflow_last_logged_step": mlflow_last_logged_step,
+    }
+
+    return model, partition, history, training_summary
 
 
 def save_partition(
@@ -996,6 +1294,28 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Wrap rGCN encoder layers with torch.utils.checkpoint to shrink activation memory (extra compute).",
     )
     parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Optional path for saving and resuming training checkpoints (.pt).",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Save a checkpoint every N epochs (0 saves only after training finishes).",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        action="store_true",
+        help="Resume model and optimizer state from --checkpoint-path when it exists.",
+    )
+    parser.add_argument(
+        "--reset-optimizer",
+        action="store_true",
+        help="When resuming, discard the saved optimizer state and start fresh.",
+    )
+    parser.add_argument(
         "--pos-edge-chunk",
         type=int,
         default=16384,
@@ -1049,7 +1369,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cluster-stability-window",
         type=int,
-        default=15,
+        default=20,
         help="Number of trailing epochs used to test num_active_clusters stability for early stopping (0 disables).",
     )
     parser.add_argument(
@@ -1231,6 +1551,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--pos-edge-chunk must be non-negative")
     if args.neg_edge_chunk is not None and args.neg_edge_chunk < 0:
         parser.error("--neg-edge-chunk must be non-negative")
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be non-negative")
+    if args.resume_from_checkpoint and args.checkpoint_path is None:
+        parser.error("--resume-from-checkpoint requires --checkpoint-path")
 
     if args.stability and args.ego_samples == 0:
         args.ego_samples = 256
@@ -1248,6 +1572,56 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         args.clusters if args.clusters is not None else _default_cluster_capacity(graph)
     )
 
+    checkpoint_blob: Optional[Mapping[str, Any]] = None
+    resume_mlflow_run_id: Optional[str] = None
+    mlflow_last_logged_step: Optional[int] = None
+    mlflow_tracker_path: Optional[Path] = None
+    if args.checkpoint_path is not None:
+        mlflow_tracker_path = _checkpoint_tracker_path(args.checkpoint_path)
+        if mlflow_tracker_path.exists():
+            try:
+                tracker_blob = json.loads(
+                    mlflow_tracker_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                tracker_blob = None
+            if isinstance(tracker_blob, Mapping):
+                tracker_run = tracker_blob.get("mlflow_run_id")
+                if isinstance(tracker_run, str) and tracker_run:
+                    resume_mlflow_run_id = tracker_run
+                tracker_step = tracker_blob.get("last_logged_step")
+                if isinstance(tracker_step, (int, float)):
+                    mlflow_last_logged_step = int(tracker_step)
+
+    if (
+        args.resume_from_checkpoint
+        and args.checkpoint_path is not None
+        and args.checkpoint_path.exists()
+    ):
+        try:
+            checkpoint_blob = torch.load(args.checkpoint_path, map_location="cpu")
+        except Exception as exc:  # pragma: no cover - surface load errors
+            print(
+                f"[WARN] Failed to preload checkpoint {args.checkpoint_path}: {exc}. "
+                "Proceeding without prior state."
+            )
+            checkpoint_blob = None
+        if checkpoint_blob is not None:
+            run_summary = checkpoint_blob.get("run_summary")
+            if isinstance(run_summary, Mapping):
+                candidate_run_id = run_summary.get("mlflow_run_id")
+                if (
+                    resume_mlflow_run_id is None
+                    and isinstance(candidate_run_id, str)
+                    and candidate_run_id
+                ):
+                    resume_mlflow_run_id = candidate_run_id
+                candidate_logged_step = run_summary.get("mlflow_last_logged_step")
+                if mlflow_last_logged_step is None and isinstance(
+                    candidate_logged_step, (int, float)
+                ):
+                    mlflow_last_logged_step = int(candidate_logged_step)
+
     tags = _parse_mlflow_tags(args.mlflow_tags)
     with _mlflow_run(
         enabled=args.mlflow,
@@ -1255,7 +1629,13 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         experiment_name=args.mlflow_experiment,
         run_name=args.mlflow_run_name,
         tags=tags,
+        existing_run_id=resume_mlflow_run_id,
     ) as mlflow_client:
+        active_run_id: Optional[str] = None
+        if mlflow_client is not None:
+            active = mlflow_client.active_run()
+            if active is not None:
+                active_run_id = active.info.run_id
         if mlflow_client is not None:
             hidden_dims_param = ",".join(map(str, args.hidden)) if args.hidden else ""
             dirichlet_alpha_param = (
@@ -1337,7 +1717,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
             epoch_logger = _epoch_logger
 
-        model, partition, history = train_scae_on_graph(
+        model, partition, history, training_summary = train_scae_on_graph(
             graph,
             num_clusters=effective_num_clusters,
             hidden_dims=args.hidden,
@@ -1379,7 +1759,20 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             gradient_checkpointing=args.gradient_checkpointing,
             pos_edge_chunk_size=pos_edge_chunk,
             neg_edge_chunk_size=neg_edge_chunk,
+            checkpoint_path=args.checkpoint_path,
+            checkpoint_every=args.checkpoint_every,
+            resume=args.resume_from_checkpoint,
+            reset_optimizer=args.reset_optimizer,
+            checkpoint_blob=checkpoint_blob,
+            mlflow_run_id=active_run_id,
+            mlflow_last_logged_step=mlflow_last_logged_step,
+            mlflow_tracker_path=mlflow_tracker_path,
         )
+
+        epochs_completed_this_run = int(
+            training_summary.get("epochs_trained", len(history))
+        )
+        total_epochs_completed = int(training_summary.get("total_epochs", len(history)))
 
         if mlflow_client is not None:
             if history:
@@ -1390,11 +1783,18 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     mlflow_client.log_metric(
                         "early_stop_epoch", history[-1]["early_stop_epoch"]
                     )
-            mlflow_client.log_metric("epochs_completed", len(history))
+            mlflow_client.log_metric(
+                "epochs_completed", float(epochs_completed_this_run)
+            )
+            mlflow_client.log_metric("epochs_total", float(total_epochs_completed))
             mlflow_client.log_metric(
                 "num_active_clusters",
                 len(partition.active_clusters),
-                step=len(history) + 1,
+                step=total_epochs_completed + 1,
+            )
+            mlflow_client.log_metric(
+                "start_epoch_resume",
+                float(training_summary.get("start_epoch", 0)),
             )
             type_embedding = getattr(model.encoder, "node_type_embedding", None)
             if type_embedding is not None and hasattr(type_embedding, "embedding_dim"):
@@ -1408,11 +1808,28 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "attr_encoder_out_dim", int(attr_encoder.out_dim)
                 )
 
+            resume_flag = "true" if training_summary.get("resume_used") else "false"
+            mlflow_client.log_param("resume_from_checkpoint", resume_flag)
+            if training_summary.get("checkpoint_path"):
+                mlflow_client.log_param(  # record resolved path
+                    "checkpoint_path", training_summary["checkpoint_path"]
+                )
+
         save_partition(partition, args.out, graph)
         if mlflow_client is not None:
             mlflow_client.log_artifact(str(args.out))
             mlflow_client.log_metric(
                 "partition_active_clusters", len(partition.active_clusters)
+            )
+
+        if args.checkpoint_path is not None:
+            checkpoint_display = (
+                training_summary.get("checkpoint_path")
+                if training_summary.get("checkpoint_path")
+                else str(args.checkpoint_path)
+            )
+            print(
+                f"[INFO] Checkpoint stored at {checkpoint_display} after {total_epochs_completed} total epochs"
             )
 
     print(
