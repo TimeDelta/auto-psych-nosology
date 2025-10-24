@@ -68,121 +68,22 @@ def load_graph(graph_path: Path) -> nx.Graph:
     return G
 
 
-def _normalize_node_type(value: str | None) -> str:
-    return _norm(value) if value is not None else ""
-
-
-def _resolve_ambiguous_key(
-    key: str,
-    candidates: list[str],
-    G: nx.Graph,
-    node_type_priority: list[str],
-) -> tuple[str | None, str | None]:
-    """Apply deterministic heuristics to pick a single node from ambiguous matches."""
-
-    attr_order = ["node_identifier", "ontology_id", "canonical_name", "name"]
-    normalized_key = _norm(key)
-    narrowed = list(candidates)
-
-    # Prefer exact attribute matches (case-sensitive), narrowing candidates when possible.
-    for attr in attr_order:
-        exact_matches = [
-            node for node in narrowed if str(G.nodes[node].get(attr, "")) == key
-        ]
-        if len(exact_matches) == 1:
-            return exact_matches[0], f"attr:{attr}"
-        if exact_matches:
-            narrowed = exact_matches
-
-    # Case-insensitive matches on the same attributes.
-    for attr in attr_order:
-        exact_ci = [
-            node
-            for node in narrowed
-            if _norm(G.nodes[node].get(attr, "")) == normalized_key
-        ]
-        if len(exact_ci) == 1:
-            return exact_ci[0], f"attr_ci:{attr}"
-        if exact_ci:
-            narrowed = exact_ci
-
-    # Prioritise by node_type ordering if provided.
-    if node_type_priority:
-        normalized_priority = [_normalize_node_type(v) for v in node_type_priority]
-        for desired in normalized_priority:
-            type_matches = [
-                node
-                for node in narrowed
-                if _normalize_node_type(G.nodes[node].get("node_type")) == desired
-            ]
-            if len(type_matches) == 1:
-                return type_matches[0], f"node_type:{desired}"
-            if type_matches:
-                narrowed = type_matches
-
-    return None, None
-
-
 def align_partition_to_graph(
     G: nx.Graph,
     node_to_cluster: dict[str, int],
-    *,
-    ambiguity_policy: str = "skip",
-    node_type_priority: list[str] | None = None,
-) -> tuple[
-    dict[str, int],
-    list[str],
-    dict[str, list[str]],
-    dict[str, tuple[str, str]],
-    Counter,
-]:
-    """Map partition keys onto graph node IDs using node attributes when needed."""
-    name_index: dict[str, list[str]] = defaultdict(list)
-    for node, data in G.nodes(data=True):
-        for attr_key in ("canonical_name", "name", "node_identifier", "ontology_id"):
-            val = data.get(attr_key)
-            if val is None:
-                continue
-            val_str = str(val)
-            if val_str:
-                name_index[val_str].append(node)
-
+) -> tuple[dict[str, int], list[str],]:
+    """Align partition entries directly to graph node IDs, recording misses."""
     aligned: dict[str, int] = {}
     missing: list[str] = []
-    ambiguous: dict[str, list[str]] = {}
-    resolved: dict[str, tuple[str, str]] = {}
-    resolution_stats: Counter = Counter()
-    node_type_priority = node_type_priority or []
 
     for raw_key, cluster_id in node_to_cluster.items():
         key = str(raw_key)
         if key in G:
             aligned[key] = int(cluster_id)
-            continue
-        candidates = name_index.get(key)
-        if not candidates:
+        else:
             missing.append(key)
-            continue
-        if len(candidates) == 1:
-            aligned[candidates[0]] = int(cluster_id)
-            continue
 
-        if ambiguity_policy in {"resolve", "assign-first"}:
-            chosen, reason = _resolve_ambiguous_key(
-                key, candidates, G, node_type_priority
-            )
-            if chosen is None and ambiguity_policy == "assign-first":
-                chosen = sorted(candidates)[0]
-                reason = "fallback:first"
-            if chosen is not None:
-                aligned[chosen] = int(cluster_id)
-                resolved[key] = (chosen, reason)
-                resolution_stats[reason] += 1
-                continue
-
-        ambiguous[key] = candidates
-
-    return aligned, missing, ambiguous, resolved, resolution_stats
+    return aligned, missing
 
 
 def load_mapping_csv(csv_path: Path, id_col: str, label_col: str) -> pd.DataFrame:
@@ -917,25 +818,12 @@ def run_alignment(
     size_weighting: str = "log1p",
     min_cluster_size: int = 2,
     neighbors_k: int = 5,
-    ambiguity_policy: str = "skip",
-    node_type_priority: list[str] | None = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     G = load_graph(graph_path)
     node_to_cluster_raw = load_partition(partition_path)
-    (
-        node_to_cluster,
-        missing_nodes,
-        ambiguous_nodes,
-        resolved_nodes,
-        resolution_stats,
-    ) = align_partition_to_graph(
-        G,
-        node_to_cluster_raw,
-        ambiguity_policy=ambiguity_policy,
-        node_type_priority=node_type_priority,
-    )
+    node_to_cluster, missing_nodes = align_partition_to_graph(G, node_to_cluster_raw)
 
     if missing_nodes:
         preview = ", ".join(missing_nodes[:5])
@@ -944,33 +832,9 @@ def run_alignment(
         print(
             f"[align_partitions] Warning: {len(missing_nodes)} partition keys missing from graph (sample: {preview})."
         )
-    if resolved_nodes:
-        preview_items = list(resolved_nodes.items())[:3]
-        preview = ", ".join(f"{k}->{v[0]}" for k, v in preview_items)
-        if len(resolved_nodes) > 3:
-            preview += ", ..."
-        resolution_summary = ", ".join(
-            f"{reason}:{count}" for reason, count in resolution_stats.most_common(4)
-        )
-        print(
-            "[align_partitions] Info: "
-            f"Resolved {len(resolved_nodes)} ambiguous partition keys "
-            f"({resolution_summary}). Examples: {preview}."
-        )
-    if ambiguous_nodes:
-        preview_items = list(ambiguous_nodes.items())[:3]
-        preview = ", ".join(f"{k}->{len(v)} nodes" for k, v in preview_items)
-        if len(ambiguous_nodes) > 3:
-            preview += ", ..."
-        print(
-            "[align_partitions] Warning: "
-            f"{len(ambiguous_nodes)} partition keys matched multiple graph nodes; skipping (examples: {preview})."
-        )
 
     if not node_to_cluster:
-        raise ValueError(
-            "No partition entries align to graph nodes after attribute matching."
-        )
+        raise ValueError("No partition entries align to graph nodes.")
 
     part_s = pd.Series(node_to_cluster, name="cluster", dtype="int64")
 
@@ -1227,24 +1091,8 @@ if __name__ == "__main__":
         default=5,
         help="How many nearest neighbors to the cluster medoid to save in the explainability CSV.",
     )
-    ap.add_argument(
-        "--ambiguity-policy",
-        type=str,
-        choices=["skip", "resolve", "assign-first"],
-        default="skip",
-        help="How to handle partition keys that map to multiple graph nodes.",
-    )
-    ap.add_argument(
-        "--node-type-priority",
-        type=str,
-        default="disease,effect/phenotype,gene/protein,drug,pathway,anatomy",
-        help="Comma-separated priority order of node types used when resolving ambiguous keys.",
-    )
 
     args = ap.parse_args()
-    node_type_priority = [
-        part.strip() for part in args.node_type_priority.split(",") if part.strip()
-    ]
     run_alignment(
         graph_path=args.graph,
         partition_path=args.partition,
@@ -1265,6 +1113,4 @@ if __name__ == "__main__":
         size_weighting=args.size_weighting,
         min_cluster_size=args.min_cluster_size,
         neighbors_k=args.neighbors_k,
-        ambiguity_policy=args.ambiguity_policy,
-        node_type_priority=node_type_priority,
     )
