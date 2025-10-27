@@ -49,7 +49,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
         - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
         - **num_negatives** counts sampled negative edges that survived the per-graph cap.
         - **timing_sample_neg** and **timing_neg_logits** capture the wall-clock time (in seconds) spent sampling negatives and scoring them.
-- The rGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
+- The RGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
 - Partition training supports resumable checkpoints via `train_rgcn_scae.py`.
     - Pass `--checkpoint-path PATH.pt` to atomically persist model weights, optimizer state, history, and run metadata at the end of training (and optionally every `--checkpoint-every N` epochs).
     - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitialising the optimizer.
@@ -139,7 +139,7 @@ The stability will be high due to the large volume of papers expected to be pars
 The alignment will be reasonably high but not exact due to the vastly different methods in producing the final output (RDoC is mechanistically focused while HiTOP is focused on symptoms and this novel method will be automated).
 
 ## Methods
-By mining the scientific literature into a multiplex graph and partitioning it with information-theoretic methods, this project draws inspiration from generative modeling’s emphasis on latent structure while also addressing the critiques of purely data-driven ML.
+By using a knowledge graph that was mined from the scientific literature into a multiplex graph and partitioning it with information-theoretic methods, this project draws inspiration from generative modeling’s emphasis on latent structure while also addressing the critiques of purely data-driven ML.
 Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction.
 Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
@@ -156,7 +156,7 @@ For every surviving edge, the extractor reconstructs a unique node table, joinin
 Psychiatric scoring outputs (psy_score, psy_evidence, boolean flags, and the final is_psychiatric decision) are carried through so that later models can weight nodes by clinical relevance.
 Nodes lacking these columns receive neutral defaults to keep the table schema consistent.
 
-The filtered node/edge frames are projected into a multiplex networkx.MultiDiGraph, preserving node metadata and relation labels; reverse edges are optionally added when symmetrical analysis is required.
+The filtered node/edge frames are projected into a multiplex networkx.MultiDiGraph, preserving node metadata and relation labels.
 During weighted projection each undirected edge receives a prior determined by its relation label and is modulated by the mean psychiatric score of its incident nodes, suppressing ties to weakly psychiatric neighbors while never dropping them outright.
 Finally, the pipeline streams the psychiatric slice of PrimeKG into Parquet tables plus directed and weighted GraphML files, yielding artifacts whose every node and edge has survived both the semantic filters and the psychiatric relevance scoring requirements described above.
 
@@ -177,14 +177,14 @@ This model was trained exclusively on the full graph to derive a single global p
 It learns a compact latent partition of the full knowledge graph while preserving relation-specific structure through low-rank factorization and hard-concrete gating.
 
 #### Encoder Architecture
-The encoder is an RGCN that couples a Deep Sets attribute encoder [21] with a stacked relational GCN that produces a temperature-controlled assignment matrix of shape |Nodes| $\times$ |Clusters|, forming the probabilistic basis for downstream partitioning via differentiable hard-concrete ($L_0$) gates [22].
+The encoder couples a Deep Sets attribute encoder [21] with a stacked RGCN layers that produces a temperature-controlled assignment matrix of shape |Nodes| $\times$ |Clusters|, forming the probabilistic basis for downstream partitioning via differentiable hard-concrete ($L_0$) gates [22].
 Each node is first encoded by a DeepSets-style node attribute encoder, implementing the Zaheer et al. $\rho$/$\phi$ formulation, that is permutation-invariant.
 This component integrates arbitrarily structured metadata—text learned embeddings, biomarkers and ontology terms.
 It can expand its vocabulary online, allowing new attributes to be assimilated without retraining existing embeddings.
 The resulting descriptor is concatenated with:
-A learned node-type embedding, encoding categorical identity in a compact, regularized form and graph-positional encodings derived from standardized Laplacian eigenvectors, normalized per subgraph to maintain numerical stability when batch sizes or graph orders vary.
+A learned node-type embedding, encoding categorical identity in a compact, regularized form and graph-positional encodings derived from standardized Laplacian eigenvectors, normalized per subgraph to maintain numerical stability when batch sizes or graph orders vary, both of which are only relevant during stability check.
 The fused vectors are processed through a relation-aware additive message-passing stack of graph convolutional layers using basis decomposition (a parameter sharing technique) across relation types.
-Each layer is followed by GraphNorm (default, for unbalanced batches) or LayerNorm, a ReLU activation, and optional dropout.
+Each layer is followed by LayerNorm ***#TODO change from GraphNorm since only using complete graph now and default to GraphNorm for stability check***, a ReLU activation, and optional dropout.
 Because the encoder operates directly on the supplied edge_index, it naturally accommodates cyclic connectivity and multiplex relation types without special handling.
 During training the encoder applies degree-proportional edge dropout, symmetric degree normalization and inverse-frequency relation reweighting.
 Together these steps keep gradients stable on multiplex graphs whose degree distributions and relation frequencies span orders of magnitude.
@@ -215,7 +215,7 @@ This keeps confident, low-entropy gates focused on harder negatives without dest
 
 #### Preventing Trivial / Degenerate Solutions
 Five primary forms of degenerate or trivial solutions are guarded against in this model: uniform embeddings, local collapse, global collapse, decoder memorization, and latent drift.
-Absent-edge modelling via type-aware negative sampling penalises trivial partitions even when node embeddings look uniform.
+Absent-edge modeling via type-aware negative sampling penalizes trivial partitions even when node embeddings look uniform.
 The decoder contrasts observed edges against sampled non-edges inside each subgraph while operating on Sinkhorn-balanced assignment vectors $a_i$ rather than raw encoder features.
 For every relation r the decoder forms a low-rank, hard-gated interaction matrix $W_r$ (built from gated relation factors) and applies an absent-edge bias $b_r$.
 The reconstruction loss adds the average positive-edge binary cross-entropy and a ratio-corrected negative term for every graph g in the batch:
@@ -230,21 +230,21 @@ $$
 \Bigg],
 $$
 
-where $\tilde{E}_g$ contains the sampled negatives for graph g and G is the number of graphs in the mini-batch.
+where:
 
 | Symbol | Meaning |
 | --- | --- |
 | G                          | Number of graphs (mini-batch components) evaluated in the loss. |
-| E_g                        | Set of observed edges for graph g. |
+| E_g                        | Set of observed edges for graph $g$. |
 | $\tilde{E}_g$              | Negative samples generated for graph g under the current negative-sampling policy. |
-| $|E_g|$                    | Cardinality of E_g. |
+| $|E_g|$                    | Cardinality of $E_g$. |
 | $|\tilde{E}_g|$            | Cardinality of $\tilde{E}_g$. |
-| $a_i \in \Delta^{K-1}$     | Sinkhorn-balanced cluster assignment for node i (probability vector over K clusters). |
-| $r{ij}$                    | Relation index of edge (i, j); selects decoder parameters for that relation. |
-| $W{r}$                     | Low-rank, hard-gated relation weight matrix for relation r. |
-| $b_r$                      | Learnable absent-edge bias for relation r. |
+| $a_i \in \Delta^{K-1}$     | Sinkhorn-balanced cluster assignment for node i (probability vector over $K$ clusters). |
+| $r{ij}$                    | Relation index of edge $(i, j)$; selects decoder parameters for that relation. |
+| $W{r}$                     | Low-rank, hard-gated relation weight matrix for relation $r$. |
+| $b_r$                      | Learnable absent-edge bias for relation $r$. |
 | $\sigma(\cdot)$            | Logistic sigmoid that converts logits to probabilities. |
-| $\mathrm{BCE}(\hat{y}, y)$ | Binary cross-entropy between probability $\hat{y}$ and label y. |
+| $\mathrm{BCE}(\hat{y}, y)$ | Binary cross-entropy between probability $\hat{y}$ and label $y$. |
 
 Intuitively, the first term rewards high similarity for real edges while the second penalizes the model when it predicts high similarity for random, non-existent connections.
 
@@ -262,8 +262,8 @@ so the term activates only when entropy dips below the target floor $H_{\text{fl
 
 | Symbol | Meaning |
 | --- | --- |
-| $H_g$              | Mean assignment entropy for graph g, $-\frac{1}{|V_g|}\sum_{i\in g}\sum_{k} p_{ik}\log p_{ik}$. |
-| $\|V_g\|$          | Number of nodes belonging to graph g. |
+| $H_g$              | Mean assignment entropy for graph $g$, $-\frac{1}{|V_g|}\sum_{i\in g}\sum_{k} p_{ik}\log p_{ik}$. |
+| $\|V_g\|$          | Number of nodes belonging to graph $g$. |
 | $H_{\text{floor}}$ | Target minimum entropy per graph (defaults to $\log K$ if unset). |
 | $\lambda_H$        | Weight assigned to the entropy penalty. |
 
@@ -280,8 +280,8 @@ where:
 
 | Symbol | Meaning |
 | --- | --- |
-| $u_k$                  | Empirical mean cluster usage, normalised so $\sum_k u_k = 1$. |
-| $\pi_k$                | Prior cluster usage probability derived from the user-specified Dirichlet concentrations (normalised once). |
+| $u_k$                  | Empirical mean cluster usage, normalized so $\sum_k u_k = 1$. |
+| $\pi_k$                | Prior cluster usage probability derived from the user-specified Dirichlet concentrations (normalized once). |
 | $\lambda_{\text{Dir}}$ | Weight applied to the KL penalty term. |
 
 Even with these local and global regularizers, the decoder can still exploit trivial optima by memorizing adjacency patterns rather than learning meaningful structure.
@@ -292,12 +292,7 @@ $$
 \mathcal{L}_{\text{norm}} = \lambda_z \cdot \frac{1}{G} \sum_{g=1}^{G} \left( \frac{1}{|V_g|} \sum_{i \in g} \|z_i\|_2^2 \right),
 $$
 
-where:
-
-| Symbol | Meaning |
-| --- | --- |
-| $\lambda_z$ | Scaling factor for the latent L2 penalty. |
-| $z_i$       | Encoder embedding for node i before Sinkhorn balancing. |
+where $\lambda_z$ is the scaling factor for the latent $L_2$ penalty and $z_i$ is Encoder embedding for node $i$ before Sinkhorn balancing.
 
 Finally, to stop latent drift and keep graph-level statistics well behaved, regularization is added of the first two moments of each graph’s embedding distribution toward a zero-mean, unit-variance Gaussian:
 
@@ -311,12 +306,12 @@ where:
 | Symbol | Meaning |
 | --- | --- |
 | $D$                    | Latent dimensionality of the encoder outputs. |
-| $\mu_{g,d}$            | Empirical mean of latent dimension d over nodes in graph g. |
-| $\sigma_{g,d}^2$       | Empirical variance of latent dimension d over nodes in graph g (clamped to stay positive). |
-| $\lambda_{\text{KLD}}$ | Weight of the moment-based regulariser. |
+| $\mu_{g,d}$            | Empirical mean of latent dimension d over nodes in graph $g$. |
+| $\sigma_{g,d}^2$       | Empirical variance of latent dimension $d$ over nodes in graph $g$ (clamped to stay positive). |
+| $\lambda_{\text{KLD}}$ | Weight of the moment-based regularizer. |
 
 #### Stability and Regularization
-Training rGCN-SCAE models on multiplex graphs can exhibit several characteristic failure modes.
+Training RGCN-SCAE models on multiplex graphs can exhibit several characteristic failure modes.
 Detailed mitigation strategies and hyperparameter guidelines are provided in [`training_stability.md`](training_stability.md).
 
 #### Adaptive Subgraph Sampling for Stability Testing
@@ -328,26 +323,26 @@ For each seed s, a composite score $g(s) = z(c_s) + z(\kappa_s) - z(\deg_s)$ to 
 | Symbol                          | Meaning                                                                       | Notes                                                                                                                                                                                      |
 | ------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | $s$                             | The **seed node** from which the local subgraph (ego-net) is grown.           | Chosen randomly, optionally stratified by node degree or type.                                                                                                                             |
-| $c_s$                           | The **local clustering coefficient** of node s.                               | Measures how interconnected $s$’s neighbors are. In undirected projection form:$c_s = \frac{2T_s}{k_s(k_s-1)}$, where $T_s$ = number of triangles through s.                         |
-| $\kappa_s$                      | The **k-core index** (or **core number**) of node s.                          | Largest integer k such that s belongs to the k-core subgraph (all nodes with degree ≥ k). Reflects local structural “embeddedness.”                                                  |
-| $\deg_s$                        | The **degree** of node s.                                                     | Number of edges incident on s (can be total degree or weighted by relation type in multiplex setting).                                                                                   |
-| $z(\cdot)$                      | The **z-score normalization** operator.                                       | For any scalar node-level metric $(x_s):(z(x_s) = \frac{x_s - \mu_x}{\sigma_x})$, where $\mu_x$ and $\sigma_x$ are the mean and standard deviation of x across all nodes in the graph. |
+| $c_s$                           | The **local clustering coefficient** of node $s$.                               | Measures how interconnected $s$’s neighbors are. In undirected projection form:$c_s = \frac{2T_s}{k_s(k_s-1)}$, where $T_s$ = number of triangles through s.                         |
+| $\kappa_s$                      | The **k-core index** (or **core number**) of node $s$.                          | Largest integer $k$ such that $s$ belongs to the k-core subgraph (all nodes with degree ≥ $k$). Reflects local structural “embeddedness.”                                                  |
+| $\deg_s$                        | The **degree** of node $s$.                                                     | Number of edges incident on $s$ (can be total degree or weighted by relation type in multiplex setting).                                                                                   |
+| $z(\cdot)$                      | The **z-score normalization** operator.                                       | For any scalar node-level metric $(x_s):(z(x_s) = \frac{x_s - \mu_x}{\sigma_x})$, where $\mu_x$ and $\sigma_x$ are the mean and standard deviation of $x$ across all nodes in the graph. |
 | $g(s)$                          | The **composite connectivity score** used to adaptively choose hop radius.    | Higher $g(s)$ → larger $r(s)$; encourages exploring sparser regions more deeply.                                                                                                           |
-| $r(s)$                          | The **hop radius** (1–3) used to define the ego-net subgraph around seed s.   | Determined by scaling $g(s)$ via $\alpha$ and clamping to the range [1,3]).                                                                                                                |
+| $r(s)$                          | The **hop radius** (1–3) used to define the ego-net subgraph around seed $s$.   | Determined by scaling $g(s)$ via $\alpha$ and clamping to the range [1,3]).                                                                                                                |
 
 Each resulting subgraph consisted of the induced r-ball around the seed nodes, preserving local connectivity patterns and approximate node-type proportions without enforcing a fixed target size.
 This connectivity-aware hopping strategy generates a controlled distribution of partially overlapping ego-net subgraphs that collectively cover the full multiplex network, ensuring exposure to diverse local structures while maintaining coherence across samples.
 
-Parameters of the rGCN-SCAE were shared across subgraphs to maintain a single shared partitioning in the latent space.
+Parameters of the RGCN-SCAE were shared across subgraphs to maintain a single shared partitioning in the latent space.
 Since node attributes (text-derived embeddings, types, biomarkers, etc.) are stable across subgraphs, meaningful structure can still be derived despite the lack of full context in each training example.
-The final partitioning is derived from running the full knowledge graph through the trained rGCN-SCAE.
+The final partitioning is derived from running the full knowledge graph through the trained RGCN-SCAE.
 This procedure reframes training as an information-theoretic compression task applied repeatedly to partially overlapping realizations of the same knowledge manifold, allowing estimation of replication reliability and consensus structure while reducing overfitting to any single instantiation.
 
 #### Comparison
-Together, hSBM offers a likelihood-grounded categorical perspective, while rGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
+Together, hSBM offers a likelihood-grounded categorical perspective, while RGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
 The two approaches are treated as triangulating evidence: concordant structure across them increases confidence in emergent transdiagnostic clusters, whereas divergences highlight fronts for qualitative review.
 
-| Aspect                        | Recurrent Graph Convoplutional Network Self-Compressing Autoencoder (rGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (hSBM)                                                                                  |
+| Aspect                        | Recurrent Graph Convoplutional Network Self-Compressing Autoencoder (RGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (hSBM)                                                                                  |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | **Representation**            | Learns *continuous latent embeddings* for nodes and relations; nonlinear, differentiable, expressive.                                        | Assigns *discrete cluster memberships* via probabilistic inference on connectivity patterns.                              |
 | **Objective**                 | Minimizes reconstruction loss → learns information-optimal embeddings that compress the multiplex graph while preserving semantic structure. | Maximizes likelihood under a generative model → partitions graph to best explain edge densities between groups.             |
