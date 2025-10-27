@@ -37,14 +37,14 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
     - Metric explanations:
         - **total_loss** = weighted sum of reconstruction, sparsity, entropy, Dirichlet, embedding-norm, KL, consistency, gate-entropy, and degree penalties reported below.
         - **recon_loss** averages the BCE losses for positive and sampled negative edges per graph.
-        - **sparsity_loss**, **cluster_l0**, **inter_l0** track the hard-concrete L0 penalties that drive cluster/edge sparsity.
+        - **sparsity_loss**, **cluster_l0**, **inter_l0** track the hard-concrete $L_0$ penalties that drive cluster/edge sparsity.
         - **entropy_loss** encourages per-graph assignment entropy to stay above `--assignment-entropy-floor`.
         - **dirichlet_loss** is the KL term that keeps mean cluster usage close to the Dirichlet prior.
-        - **embedding_norm_loss** and **kld_loss** regularise latent vectors on a per-graph basis.
+        - **embedding_norm_loss** and **kld_loss** regularize latent vectors on a per-graph basis.
         - **degree_penalty** (with **degree_correlation_sq**) measures the decorrelation between latent norms and node degree.
         - **consistency_loss** / **consistency_overlap** are the memory-bank temporal consistency terms (0 when disabled).
         - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
-        - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete L0 expectation.
+        - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete $L_0$ expectation.
         - **num_active_clusters_stochastic** retains the raw training-mode gate count if you need to debug EMA smoothing or gating noise.
         - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
         - **num_negatives** counts sampled negative edges that survived the per-graph cap.
@@ -52,7 +52,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
 - The RGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
 - Partition training supports resumable checkpoints via `train_rgcn_scae.py`.
     - Pass `--checkpoint-path PATH.pt` to atomically persist model weights, optimizer state, history, and run metadata at the end of training (and optionally every `--checkpoint-every N` epochs).
-    - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitialising the optimizer.
+    - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
     - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
 - Training stops early when the stability metric you request stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `num_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
 - To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_hSBM_partitions.py](./create_hSBM_partitions.py).
@@ -175,6 +175,7 @@ This was used as a baseline.
 The other model architecture tested was a **Relational Graph Convolutional Network Self-Compressing Autoencoder (RGCN-SCAE)**.
 This model was trained exclusively on the full graph to derive a single global partitioning that captures the complete relational structure.
 It learns a compact latent partition of the full knowledge graph while preserving relation-specific structure through low-rank factorization and hard-concrete gating.
+The rest of this section pertains solely to the RGCN-SCAE partitioning.
 
 #### Encoder Architecture
 The encoder couples a Deep Sets attribute encoder [21] with a stacked RGCN layers that produces a temperature-controlled assignment matrix of shape |Nodes| $\times$ |Clusters|, forming the probabilistic basis for downstream partitioning via differentiable hard-concrete ($L_0$) gates [22].
@@ -209,11 +210,99 @@ This, combined with gradient checkpointing can be used to avoid exhausting CPU/G
 Relation frequencies reweight both positive and negative terms so that rare relation types retain influence, while optional type-restricted negative sampling and per-graph budgets keep contrastive updates aligned with ontology constraints.
 Entropy-aware reweighting of negatives, inverse-frequency scaling, and chunked evaluation preserve size invariance and stability even on the largest subgraphs.
 The relation-specific logits follow $\ell_{ijr} = a_i^{\top} W_r a_j + b_r,$ with assignment vectors $a_i = Q_{i\cdot}$ and low-rank weight matrices $W_r = \sigma(F_r B) \odot G_r$, where $F_r \in \mathbb{R}^{C\times d}$, $B \in \mathbb{R}^{d\times C}$, and $G_r$ is the current hard-concrete gate sample.
-Binary cross-entropy losses accumulate over observed edges $(i,j,r) \in E$ and sampled negatives $(i',j',r)$.
-Negative-sample losses are additionally scaled by a gate-entropy confidence factor $w_{\text{neg}} = 1 + \lambda \big(\max(H_g, H_{\min})^{-1} - 1\big)$, where $H_g = -\sum_k \pi_k \log_2 \pi_k$ is the gate entropy in bits computed from gate probabilities $\pi$ and $H_{\min}$ is the floor used in code.
-This keeps confident, low-entropy gates focused on harder negatives without destabilizing early training.
 
-#### Preventing Trivial / Degenerate Solutions
+#### Training
+##### Mitigating Cluster Collapse and Runaway Imbalance
+Cluster gates can collapse into a handful of latent units unless they are continually encouraged to share responsibility for the data.
+Each mini-batch is therefore projected into a near doubly-stochastic assignment matrix via a Sinkhorn normalization, and the prototypes that receive that mass are updated with an exponential moving average that discourages any single cluster from monopolizing the representation.
+A per-graph entropy hinge penalizes assignments that become overly concentrated on a small subset of clusters, while a Dirichlet prior stabilizes the long-term expected gate usage.
+The gate samples themselves are monitored in bits, so that low-entropy configurations trigger a restorative penalty.
+Temperature schedules modulate both gating and assignments, starting from a diffuse exploratory regime before gradually sharpening the decisions.
+A momentum memory bank anchors embeddings for repeated nodes, ensuring that overlapping ego-nets reinforce rather than contradict one another, and the hierarchy monitor that sits in the trainer audits convergence by tracking adjusted Rand index, variation of information , and effective cluster counts; it can rewind to the most stable checkpoint if any of those statistics deteriorate.
+
+##### Stabilizing Hard-Concrete Gates
+The hard-concrete relaxations that implement sparsity are prone to discontinuities and dead units.
+To keep them responsive, sparsity penalties are warmed up gradually so that the encoder and decoder can settle before being pushed toward sparsity.
+Gate logits are clipped before entering the hard-concrete transform, preventing them from saturating in regions where gradients vanish.
+Each gate draw is blended with an exponential moving average, reducing the variance of stochastic samples without biasing their mean.
+When a gate does fall dormant yet still receives assignment mass, a revival routine resets its log-parameter toward neutrality, reintroducing it into the active set.
+Detailed diagnostics—expected $L_0$ counts, instantaneous gate entropy, and gate samples—are recorded every epoch so that emerging instabilities are observable.
+
+##### Controlling Message-Passing Drift
+Multiplex message passing threatens to over-smooth node representations, especially in the presence of hubs.
+The encoder therefore drops edges at random and in proportion to degree, weakening the dominance of high-degree nodes while preserving the connectivity needed for learning.
+Feature normalization relies on graph-local statistics, which prevents mini-batch composition from distorting the scale of activations.
+Positional encodings derived from Laplacian eigenvectors are standardized within each graph, maintaining comparable variance even when graph sizes differ drastically.
+A virtual-node residual supplies graph-level context that does not depend on the number of vertices, stabilizing deeper stacks of relational convolutions.
+
+##### Addressing Degree and Hub Bias
+Even after the adjustments above, the latent space can correlate with degree if left unregulated.
+A dedicated orthogonality penalty therefore measures the squared correlation between latent coordinates and the logarithm of node degree, driving the optimizer toward representations that encode semantics rather than centrality.
+Degree-aware dropout complements this penalty by reducing the influence of hubs at the message-passing stage itself.
+
+##### Balancing Multiplex Relation Frequencies
+Relation types occur with wildly unequal frequencies, so the decoder would otherwise learn to ignore rare but semantically meaningful edges.
+Each relation is accordingly reweighted by the inverse of its empirical frequency before its contribution enters the loss.
+The decoder’s low-rank factorization further protects rare relations by tying them to a shared basis of cluster interactions: even sparsely observed relations can appropriate expressive factors without requiring a full, unshared parameter matrix, whereas abundant relations are free to explore a broader span of that basis.
+
+##### Hardening Negative Sampling
+Negative sampling supplies contrastive signal, but only if negatives remain challenging and diverse.
+The sampler generates negatives independently inside each graph component, respecting node-type compatibility and halting once a per-graph budget is reached so that large components do not dominate the mini-batch.
+Positive and negative logits are evaluated in memory-bounded chunks to avoid destabilizing the optimization on densely connected subgraphs.
+Most importantly, the contribution of negative edges is modulated by gate entropy: when the gating distribution remains broad, negatives exert a baseline influence; as the gates sharpen and entropy drops, their weight increases, deliberately steering the model toward harder discrimination precisely at the point where overconfidence could arise.
+
+##### Maintaining Cross-Batch Consistency
+Because training proceeds on overlapping ego-nets rather than fully shuffled samples, nodes can recur in distinct contexts.
+A momentum memory bank keyed by canonical node identifiers stores a running estimate of each embedding and penalizes deviations from that trajectory when the node reappears.
+At the same time, attribute dictionaries are cached and pre-encoded so that repeated visits do not inject stochastic variation through duplicated encoding passes.
+Together these measures ensure that the latent representation evolves coherently across batches.
+
+##### Latent Regularization and Diagnostics
+Per-graph latent magnitudes and variances are explicitly regularized: squared norms are averaged per graph to prevent large components from dominating, and a KL term pushes the empirical mean and variance toward a unit Gaussian.
+Assignment entropy, cluster usage, gate samples, reconstruction losses, and time spent in negative sampling are logged after every epoch, producing an audit trail that can be consulted when diagnosing instability or reproducing experimental claims.
+
+##### Trainer-Level Safeguards
+The trainer orchestrates the preceding mechanisms while enforcing practical guardrails.
+Mini-batches are constructed by a budget-aware sampler that limits the number of nodes admitted per step, so even pathological subgraphs remain tractable.
+Gradient accumulation, gradient clipping, and optional mixed precision provide additional numerical headroom.
+Stability-aware stopping criteria monitor sliding windows of the principal metrics—usually the number of active clusters—and halt the run once those metrics stay within prescribed absolute and relative bounds.
+The hierarchical monitor, operating over checkpoints, records the best-performing epoch and can trigger a rollback if later epochs regress.
+Checkpointing is performed atomically alongside optional MLflow logging, enabling deterministic recovery and rigorous experiment tracking.
+
+Collectively, these interventions ensure that the self-compressing RGCN maintains stable dynamics across the multiplex psychopathology graph while remaining verifiable under standard academic reporting conventions.
+
+##### Objective
+The objective is a minimization of a composite loss function that couples reconstruction fidelity with sparsity, entropy, and structural regularizers.
+The training loop minimizes
+
+$$
+\mathcal{L}_{\text{total}} = \begin{align*}\mathcal{L}_{\text{recon}}
++ \lambda_{L0}^{\text{enc}}\,\mathcal{L}_{\text{cluster-L0}}
++ \lambda_{L0}^{\text{dec}}\,\mathcal{L}_{\text{inter-L0}}
++ \lambda_{H}\,\mathcal{L}_{\text{entropy}}
++ \lambda_{\text{Dir}}\,\mathrm{KL}(u\,\|\,u_{\text{prior}})
++ \lambda_{\text{emb}}\,\mathcal{L}_{\text{emb-norm}} \\
++ \lambda_{\text{KLD}}\,\mathcal{L}_{\text{graph-KLD}}
++ \lambda_{\text{cons}}\,\mathcal{L}_{\text{consistency}}
++ \lambda_{\text{gate}}\,\mathcal{L}_{\text{gate-entropy}}
++ \lambda_{\text{deg}}\,\mathcal{L}_{\text{degree}},
+\end{align*}
+$$
+
+| Term | Meaning | Purpose |
+| --- | --- | --- |
+| $\mathcal{L}_{\text{recon}}$ | Per-graph BCE over observed edges and ratio-corrected negatives. | Ensures the decoder reproduces observed multiplex structure while penalizing spurious links. |
+| $\mathcal{L}_{\text{cluster-L0}}$ | Encoder gate expected $L_0$ penalty. | Encourages sparse cluster activation so latent capacity matches the data complexity. |
+| $\mathcal{L}_{\text{inter-L0}}$ | Decoder gate expected $L_0$ penalty. | Promotes sparsity in inter-cluster affinities, preventing dense relation matrices. |
+| $\mathcal{L}_{\text{entropy}}$ | Assignment entropy hinge keeping per-graph entropy above the floor. | Maintains diverse cluster usage within each ego-net to avoid local collapse. |
+| $\mathrm{KL}(u\,\|\,u_{\text{prior}})$ | KL divergence between observed cluster usage and the Dirichlet prior. | Aligns global cluster frequencies with the prescribed prior, deterring runaway imbalance. |
+| $\mathcal{L}_{\text{emb-norm}}$ | Mean squared latent magnitude per graph. | Keeps latent vectors bounded and comparable across differently sized subgraphs. |
+| $\mathcal{L}_{\text{graph-KLD}}$ | KL encouraging per-graph latent distributions toward unit Gaussians. | Regularises per-graph latent statistics to curb drift in mean and variance. |
+| $\mathcal{L}_{\text{consistency}}$ | Memory-bank consistency MSE for overlapping nodes. | Couples repeated node embeddings across batches to maintain cross-sample coherence. |
+| $\mathcal{L}_{\text{gate-entropy}}$ | Gate entropy hinge preventing collapse. | Reinflates gate diversity when stochastic samples become overly confident. |
+| $\mathcal{L}_{\text{degree}}$ | Squared correlation between latents and log degree. | Decouples latent geometry from degree-based artefacts and hub domination. |
+
+##### Reconstruction Loss and Entropy Controls
 Five primary forms of degenerate or trivial solutions are guarded against in this model: uniform embeddings, local collapse, global collapse, decoder memorization, and latent drift.
 Absent-edge modeling via type-aware negative sampling penalizes trivial partitions even when node embeddings look uniform.
 The decoder contrasts observed edges against sampled non-edges inside each subgraph while operating on Sinkhorn-balanced assignment vectors $a_i$ rather than raw encoder features.
@@ -247,6 +336,9 @@ where:
 | $\mathrm{BCE}(\hat{y}, y)$ | Binary cross-entropy between probability $\hat{y}$ and label $y$. |
 
 Intuitively, the first term rewards high similarity for real edges while the second penalizes the model when it predicts high similarity for random, non-existent connections.
+Binary cross-entropy losses therefore accumulate over observed edges $(i,j,r) \in E$ and sampled negatives $(i',j',r)$.
+The negative-sample term is additionally scaled by a gate-entropy confidence factor $w_{\text{neg}} = 1 + \lambda \big(\max(H_g, H_{\min})^{-1} - 1\big)$, where $H_g = -\sum_k \pi_k \log_2 \pi_k$ denotes the gate entropy in bits computed from gate probabilities $\pi$, and $H_{\min}$ is the code-level entropy floor.
+This weighting emphasizes challenging negatives when gate entropy collapses, while leaving early, high-entropy phases unaffected.
 
 However, this is not enough to prevent all situations of structure collapse.
 For example, a situation could arise where local structure collapses but global does not.
@@ -282,7 +374,7 @@ where:
 | --- | --- |
 | $u_k$                  | Empirical mean cluster usage, normalized so $\sum_k u_k = 1$. |
 | $\pi_k$                | Prior cluster usage probability derived from the user-specified Dirichlet concentrations (normalized once). |
-| $\lambda_{\text{Dir}}$ | Weight applied to the KL penalty term. |
+| $\lambda_{\text{Dir}}$ | Weight applied to the KL divergence penalty term. |
 
 Even with these local and global regularizers, the decoder can still exploit trivial optima by memorizing adjacency patterns rather than learning meaningful structure.
 This can occur when embeddings or decoder weights grow unbounded, allowing perfect reconstruction without informative latent geometry.
@@ -309,10 +401,6 @@ where:
 | $\mu_{g,d}$            | Empirical mean of latent dimension d over nodes in graph $g$. |
 | $\sigma_{g,d}^2$       | Empirical variance of latent dimension $d$ over nodes in graph $g$ (clamped to stay positive). |
 | $\lambda_{\text{KLD}}$ | Weight of the moment-based regularizer. |
-
-#### Stability and Regularization
-Training RGCN-SCAE models on multiplex graphs can exhibit several characteristic failure modes.
-Detailed mitigation strategies and hyperparameter guidelines are provided in [`training_stability.md`](training_stability.md).
 
 #### Adaptive Subgraph Sampling for Stability Testing
 A practical limitation of this approach is that it is trained on a single, fixed multiplex graph.
