@@ -130,21 +130,41 @@ Existing studies tend to focus on isolated modalities or conceptual frameworks, 
 This highlights the need for continued research into models that combine these strands into a biologically valid, parsimonious, and widely applicable classification system.
 
 ## Research Question
-Can a proof-of-concept transdiagnostic dimensional psychiatric nosology be developed in an automated way by mining the scientific literature into a multiplex knowledge graph and partitioning it using information-theoretic methods, and how does its structure compare with HiTOP and RDoC in terms of parsimony, stability, and alignment?
+Can a proof-of-concept transdiagnostic dimensional psychiatric nosology be developed in an automated way by mining the scientific literature into a multiplex knowledge graph and partitioning it using information-theoretic methods, and how does its structure compare with HiTOP and RDoC in terms of cluster coherence, parsimony, stability, and alignment?
 
 ## Hypothesis
-It can be developed in this way and the resulting nosology will roughly have parsimony (as measured by minimum description length) within 95% or better of, stability (as measured by bootstrapped variation of information and bootstrapped adjusted rand index) >= 85% of and alignment (as measured by normalized mutual information and adjusted rand index) >= 75% of HiTOP and RDoC.
-The parsimony will be so close to or better than HiTOP and RDoC due to the use of information-theoretic algorithms in the partitioning to optimize for compression.
-The stability will be high due to the large volume of papers expected to be parsed.
-The alignment will be reasonably high but not exact due to the vastly different methods in producing the final output (RDoC is mechanistically focused while HiTOP is focused on symptoms and this novel method will be automated).
+The automated pipeline is expected to yield a dimensional nosology whose structural efficiency remains within 10% of the HiTOP and RDoC label cardinalities (cluster-count ratio ≥ 0.9 relative to each framework) while maintaining SentenceTransformer-based semantic coherence means—and their bootstrap 90% confidence intervals—at or above the medians observed for matched HiTOP/RDoC partitions.
+Stability will be demonstrated by bootstrapping both the adjusted Rand index (ARI), targeting ≥ 0.85 of each framework’s self-alignment baseline, and the coherence estimates (targeting confidence interval widths ≤ 0.15), showing that clusters remain consistent under resampling despite corpus heterogeneity.
+Alignment will be evaluated with normalized and adjusted mutual information, homogeneity/completeness, and ARI (targets ≥ 0.75, ≥ 0.75, and ≥ 0.70 respectively), supported by Benjamini–Hochberg–corrected hypergeometric enrichments in which at least 60% of clusters achieve FDR < 0.05, per-cluster precision/recall/F1 summaries, and medoid-based semantic cosine similarities to canonical HiTOP/RDoC descriptors.
+Collectively these metrics test whether compression-oriented clustering on the literature can reproduce the breadth of symptom- and mechanism-focused nosologies while remaining parsimonious, stable, and interpretable.
+
+By testing whether an automated, data-driven method can reproduce or extend the dimensional structure of leading nosologies, this research explores the feasibility of a scalable and self-updating framework for psychiatric classification—one that could bridge the gap between biological findings and clinical phenomena without the overhead of manually defined diagnostic categories.
 
 ## Methods
+### Hypothesis Metrics Justification
+- **Parsimony metrics:** Structural economy is captured by the cluster-count ratio $|C| / |L_fw|$, where $|C|$ denotes the number of clusters with at least one aligned node and $|L_fw|$ is the number of HiTOP or RDoC labels.
+Semantic compactness is computed for every cluster by embedding member-node text with a SentenceTransformer model and averaging the pairwise cosines: for embeddings ${e_i}$ and cluster size $n$, the mean coherence is $(2 / [n(n−1)]) * Σ_{i<j} cos(e_i, e_j)$.
+Also reported is a log-size–weighted variant and non-parametric form of confidence intervals by bootstrap resampling the cosine sample 500 times.
+- **Stability metrics:** To quantify robustness, the pipeline reruns alignment on bootstrap subgraphs of the full knowledge graph and computes the ARI for each replicate.
+ARI is derived from the contingency table of cluster–label overlaps as $(\sum_{ij} \binom{n_{ij}}{2} − [\sum_{i} \binom{a_i}{2} {\sum_{j} \binom{b_j}{2}] / \binom{N}{2}) / (0.5[\sum_{i} \binom{a_i}{2} + \sum_{j} \binom{b_j}{2}] − [sum_{i} \binom{a_i}{2} \sum_{j} \binom{b_j}{2}] / \binom{N}{2})$, correcting for chance agreement.
+The bootstrap distribution is summarized (mean, spread, and percentile intervals) and coherence confidence interval widths are tracked as an orthogonal check on semantic stability.
+- **Alignment metrics:** Global correspondence is assessed with normalized mutual information using the arithmetic mean denominator, adjusted mutual information that subtracts the expected mutual information under a permutation null, the homogeneity/completeness/v-measure trio, and ARI.
+These rely on the shared node set between the learned partition and HiTOP/RDoC labels.
+Full confusion matrices accompany the summary statistics so that reviewers can inspect which domains contribute most to each score.
+- **Per-cluster alignment metrics:** Following the enrichment step, each cluster is paired with the label that attains the minimum false-discovery–rate value.
+Precision is $overlap / cluster_{size}$, recall is $overlap / label_{support}$, F1 score has the normal definition, and the overlap rate is $overlap / (cluster_size + label_support − overlap)$.
+- **Statistical enrichment:** For a cluster of size $n$ and a label with support $K$ in a population of $N$ aligned nodes, we compute a one-sided hypergeometric survival probability $P(X ≥ k)$ where $k$ is the observed overlap: $\sum_{i=k}^{min(n,K)} [\binom{K}{i} \binom{N−K}{n−i}] / \binom{N}{n}$.
+Benjamini–Hochberg correction [19] is then applied across all cluster–label pairs to produce FDR-controlling q-values.
+Only labels with $q$ < 0.05 are carried into the narrative alignment tables.
+- **Semantic correspondence diagnostics:** Medoid analysis identifies, for each cluster, the node whose embedding maximizes the average cosine to other members.
+Correlation summaries compute Pearson and Spearman coefficients between coherence statistics (means, confidence interval bounds, size-weighted variants) and alignment scores (F1, purity, overlap rate), indicating whether semantic tightness predicts external alignment.
+
 By using a knowledge graph that was mined from the scientific literature into a multiplex graph and partitioning it with information-theoretic methods, this project draws inspiration from generative modeling’s emphasis on latent structure while also addressing the critiques of purely data-driven ML.
 Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction.
 Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
 ### Knowledge Graph
-The knowledge graph was created from a subset of the BioMedKG dataset [19], which can be downloaded with: `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data`.
+The knowledge graph was created from a subset of the BioMedKG dataset [20], which can be downloaded with: `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data`.
 This data is then pared down to only the psychiatrically relevant nodes and edges by the [`create_graph.py`](./create_graph.py]) script.
 First, loading of the disease, drug, protein, and DNA modality tables happens and the hybrid `PsychiatricRelevanceScorer` is invoked, which fuses ontology membership, learned group labels, psychiatric drug neighborhoods, and cosine similarity to psychiatric prototype text snippets into a continuous relevance score.
 The high-confidence combinations still pass even if a single dimension underperforms, while low-scoring nodes are excluded.
@@ -165,11 +185,11 @@ Because the alignment metrics used to compare the emergent nosology with establi
 They are left in the original graph in order to make alignment calculations easier.
 This preserves semantically coherent nodes (symptoms, biomarkers, treatments, etc.) while keeping diagnostic labels available for later alignment checks and ensuring that the resulting graph structure emerges independently of existing nosological vocabularies.
 This entity-level masking substantially reduces over-masking and yields more biologically meaningful connectivity patterns versus a simple token-level method.
-Only after the final partitioning is complete will alignment metrics such as normalized mutual information and adjusted Rand index be computed against HiTOP and RDoC categories.
+Only after the final partitioning is complete will alignment metrics such as normalized mutual information and ARI be computed against HiTOP and RDoC categories.
 This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
 
 ### Partitioning
-Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [20], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
+Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [21], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
 This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits hSBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
 The other model architecture tested was a **Relational Graph Convolutional Network Self-Compressing Autoencoder (RGCN-SCAE)**.
@@ -178,7 +198,7 @@ It learns a compact latent partition of the full knowledge graph while preservin
 The rest of this section pertains solely to the RGCN-SCAE partitioning.
 
 #### Encoder Architecture
-The encoder couples a Deep Sets attribute encoder [21] with a stacked RGCN layers that produces a temperature-controlled assignment matrix of shape |Nodes| $\times$ |Clusters|, forming the probabilistic basis for downstream partitioning via differentiable hard-concrete ($L_0$) gates [22].
+The encoder couples a Deep Sets attribute encoder [22] with a stacked RGCN layers that produces a temperature-controlled assignment matrix of shape |Nodes| $\times$ |Clusters|, forming the probabilistic basis for downstream partitioning via differentiable hard-concrete ($L_0$) gates [23].
 Each node is first encoded by a DeepSets-style node attribute encoder, implementing the Zaheer et al. $\rho$/$\phi$ formulation, that is permutation-invariant.
 This component integrates arbitrarily structured metadata—text learned embeddings, biomarkers and ontology terms.
 It can expand its vocabulary online, allowing new attributes to be assimilated without retraining existing embeddings.
@@ -196,7 +216,7 @@ Embeddings are $L_2$-normalized, $\hat{h}_i = h_i / \lVert h_i \rVert_2$, and sc
 $$s_{ik} = \frac{\hat{h}_i^{\top} p_k}{\tau_a} + \log g_k,$$
 where $\tau_a$ is the current assignment temperature and $g_k$ is the sample from the cluster hard-concrete gate.
 Sinkhorn balancing applies $T$ rounds of alternating row/column normalization with entropic regularization $\varepsilon$ to $\exp(s)$, yielding a doubly-stochastic assignment matrix $Q$ that approximately satisfies $Q\mathbf{1} = \mathbf{1}$ and $Q^\top \mathbf{1} = (n/K), \mathbf{1}$.
-The hard-concrete gates follow Louizos et al.'s [22] reparameterization with expected sparsity $\mathbb{E}[\mathrm{L}_0] = \sigma\left(\log \alpha - \tau_g \log \frac{-\gamma}{1+\zeta}\right)$, where $\alpha$ is the gate logit and $(\gamma, \zeta)$ the stretch parameters; annealing $\tau_g$ prevents premature collapse.
+The hard-concrete gates follow Louizos et al.'s [23] reparameterization with expected sparsity $\mathbb{E}[\mathrm{L}_0] = \sigma\left(\log \alpha - \tau_g \log \frac{-\gamma}{1+\zeta}\right)$, where $\alpha$ is the gate logit and $(\gamma, \zeta)$ are the stretch parameters. Annealing $\tau_g$ prevents premature collapse.
 A momentum memory bank anchors embeddings for repeated node IDs across sampled subgraphs, and the encoder records the batch-index vector $b \in \{0,\dots,B-1\}^N$ that the decoder and degree-orthogonality penalty consume downstream.
 The assignment matrix $Q$ and auxiliary tensors are then ready for $L_0$ sparsification.
 
@@ -218,7 +238,8 @@ Each mini-batch is therefore projected into a near doubly-stochastic assignment 
 A per-graph entropy hinge penalizes assignments that become overly concentrated on a small subset of clusters, while a Dirichlet prior stabilizes the long-term expected gate usage.
 The gate samples themselves are monitored in bits, so that low-entropy configurations trigger a restorative penalty.
 Temperature schedules modulate both gating and assignments, starting from a diffuse exploratory regime before gradually sharpening the decisions.
-A momentum memory bank anchors embeddings for repeated nodes, ensuring that overlapping ego-nets reinforce rather than contradict one another, and the hierarchy monitor that sits in the trainer audits convergence by tracking adjusted Rand index, variation of information , and effective cluster counts; it can rewind to the most stable checkpoint if any of those statistics deteriorate.
+A momentum memory bank anchors embeddings for repeated nodes, ensuring that overlapping ego-nets reinforce rather than contradict one another, and the hierarchy monitor that sits in the trainer audits convergence by tracking ARI, variation of information, and effective cluster counts.
+It can rewind to the most stable checkpoint if any of those statistics deteriorate.
 
 ##### Stabilizing Hard-Concrete Gates
 The hard-concrete relaxations that implement sparsity are prone to discontinuities and dead units.
@@ -439,6 +460,7 @@ The two approaches are treated as triangulating evidence: concordant structure a
 | **Output**                    | Produces a *latent manifold* where distances encode both structural and semantic similarity — enabling *continuous transdiagnostic spectra*. | Produces discrete, possibly hierarchical clusters — enforcing categorical partitions reminiscent of DSM-like divisions.     |
 
 ## Abbreviations
+- ARI = adjusted Rand index
 - DSM = Diagnostic and Statistical Manual of Mental Disorders
 - HiTOP = Hierarchical Taxonomy of Psychopathology
 - hSBM = Hierarchical Stochastic Block Model
@@ -466,6 +488,7 @@ The two approaches are treated as triangulating evidence: concordant structure a
 1. L. Wang et al., “BIOS: An algorithmically generated biomedical knowledge graph,” arXiv preprint arXiv:2203.09975, 2022.
 1. W. Wei et al., “NetMoST: A network-based machine learning approach for subtyping schizophrenia using polygenic SNP allele biomarkers,” arXiv preprint arXiv:2305.07005, 2023.
 1. D. Drysdale et al., “Resting-state connectivity biomarkers define neurophysiological subtypes of depression,” Nat. Med., vol. 23, pp. 28–38, 2017.
+1. Y. Benjamini and Y. Hochberg, "Controlling the false discovery rate: A practical and powerful approach to multiple testing," J. Roy. Statist. Soc. B (Methodological), vol. 57, no. 1, pp. 289–300, 1995.
 1. S. Gao, K. Yu, Y. Yang, S. Yu, C. Shi, X. Wang, N. Tang, and H. Zhu, “Large language model powered knowledge graph construction for mental health exploration,” Nature Communications, vol. 16, no. 1, Art. no. 7526, 2025, doi: 10.1038/s41467-025-62781-z.
 1. T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership stochastic blockmodels for multiple networks and experimental interventions,” in Handbook of Mixed Membership Models and Their Applications, E. Airoldi, D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman & Hall/CRC Press, 2014, pp. 463–488.
 1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
