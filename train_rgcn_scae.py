@@ -400,6 +400,16 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
     )
 
 
+@dataclass(frozen=True)
+class _AutoRegularizerConfig:
+    entropy_weight: float
+    dirichlet_weight: float
+    embedding_norm_weight: float
+    kld_weight: float
+    entropy_eps: float
+    dirichlet_alpha: float
+
+
 def _default_cluster_capacity(graph: MultiplexGraph) -> int:
     """Heuristic for the latent cluster capacity used by the SCAE."""
 
@@ -412,6 +422,54 @@ def _default_cluster_capacity(graph: MultiplexGraph) -> int:
     # graphs so decoders can differentiate relation patterns.
     relation_floor = num_relations * 4
     return min(num_nodes, max(sqrt_capacity, relation_floor))
+
+
+def _auto_regularizer_config(
+    num_nodes: int,
+    num_edges: int,
+    num_clusters: int,
+    min_cluster_size: int,
+) -> _AutoRegularizerConfig:
+    """Derive regularizer defaults from graph statistics.
+
+    The heuristics keep prior strengths roughly invariant for graphs where the
+    cluster capacity scales with :math:`\sqrt{N}` while still adapting to
+    denser graphs by increasing the regularisation weight to counteract
+    over-connection driven collapse.
+    """
+
+    node_scale = max(num_nodes, 1)
+    cluster_scale = max(1, min(num_clusters, node_scale))
+    sqrt_nodes = max(math.sqrt(node_scale), 1.0)
+    density = num_edges / float(node_scale) if node_scale else 0.0
+
+    # Clamp the scale so extremely dense graphs do not explode the weights, but
+    # sparse graphs still receive a meaningful prior.
+    base_scale = cluster_scale / sqrt_nodes
+    base_scale = min(3.0, max(0.3, base_scale))
+    density_scale = min(2.0, max(0.5, density / 25.0 + 0.5))
+    scale = base_scale * density_scale
+
+    entropy_weight = 1e-3 * scale
+    dirichlet_weight = 1e-3 * scale
+    embedding_norm_weight = 1e-4 * scale
+    kld_weight = 1e-3 * max(0.5, min(2.5, base_scale + density_scale / 2.0))
+
+    entropy_eps = max(1e-12, 1e-10 / (1.0 + math.log10(node_scale + 1.0)))
+
+    avg_nodes_per_cluster = node_scale / float(cluster_scale)
+    min_cluster = max(min_cluster_size, 1)
+    occupancy_target = min_cluster / max(avg_nodes_per_cluster, 1.0)
+    dirichlet_alpha = min(2.0, max(0.05, occupancy_target))
+
+    return _AutoRegularizerConfig(
+        entropy_weight=entropy_weight,
+        dirichlet_weight=dirichlet_weight,
+        embedding_norm_weight=embedding_norm_weight,
+        kld_weight=kld_weight,
+        entropy_eps=entropy_eps,
+        dirichlet_alpha=dirichlet_alpha,
+    )
 
 
 def _parse_mlflow_tags(raw_tags: Optional[Sequence[str]]) -> Dict[str, str]:
@@ -756,12 +814,12 @@ def train_scae_on_graph(
     min_cluster_size: int = 1,
     device: Optional[str] = None,
     verbose: bool = True,
-    entropy_weight: float = 1e-3,
+    entropy_weight: Optional[float] = None,
     dirichlet_alpha: Optional[Sequence[float]] = None,
-    dirichlet_weight: float = 1e-3,
-    embedding_norm_weight: float = 1e-4,
-    kld_weight: float = 1e-3,
-    entropy_eps: float = 1e-12,
+    dirichlet_weight: Optional[float] = None,
+    embedding_norm_weight: Optional[float] = None,
+    kld_weight: Optional[float] = None,
+    entropy_eps: Optional[float] = None,
     max_negatives: Optional[int] = None,
     ego_samples: int = 0,
     ego_alpha: float = 0.75,
@@ -798,6 +856,66 @@ def train_scae_on_graph(
 ]:
     if num_clusters is None:
         num_clusters = _default_cluster_capacity(graph)
+
+    node_count = int(graph.data.node_types.numel())
+    edge_index_tensor = getattr(graph.data, "edge_index", None)
+    edge_count = int(edge_index_tensor.size(1)) if edge_index_tensor is not None else 0
+    auto_regularizers = _auto_regularizer_config(
+        num_nodes=node_count,
+        num_edges=edge_count,
+        num_clusters=num_clusters,
+        min_cluster_size=min_cluster_size,
+    )
+
+    resolved_entropy_weight = (
+        float(entropy_weight)
+        if entropy_weight is not None
+        else auto_regularizers.entropy_weight
+    )
+    resolved_dirichlet_weight = (
+        float(dirichlet_weight)
+        if dirichlet_weight is not None
+        else auto_regularizers.dirichlet_weight
+    )
+    resolved_embedding_norm_weight = (
+        float(embedding_norm_weight)
+        if embedding_norm_weight is not None
+        else auto_regularizers.embedding_norm_weight
+    )
+    resolved_kld_weight = (
+        float(kld_weight) if kld_weight is not None else auto_regularizers.kld_weight
+    )
+    resolved_entropy_eps = (
+        float(entropy_eps) if entropy_eps is not None else auto_regularizers.entropy_eps
+    )
+
+    regularizer_sources = {
+        "entropy_weight": "user" if entropy_weight is not None else "auto",
+        "dirichlet_weight": "user" if dirichlet_weight is not None else "auto",
+        "embedding_norm_weight": "user"
+        if embedding_norm_weight is not None
+        else "auto",
+        "kld_weight": "user" if kld_weight is not None else "auto",
+        "entropy_eps": "user" if entropy_eps is not None else "auto",
+    }
+
+    provided_dirichlet_alpha_values: Optional[List[float]] = None
+    if dirichlet_alpha:
+        provided_dirichlet_alpha_values = [float(value) for value in dirichlet_alpha]
+
+    if provided_dirichlet_alpha_values:
+        if len(provided_dirichlet_alpha_values) == 1:
+            dirichlet_param: Union[
+                float, Sequence[float]
+            ] = provided_dirichlet_alpha_values[0]
+        else:
+            dirichlet_param = provided_dirichlet_alpha_values
+        dirichlet_alpha_source = "user"
+    else:
+        dirichlet_param = auto_regularizers.dirichlet_alpha
+        dirichlet_alpha_source = "auto"
+
+    regularizer_sources["dirichlet_alpha"] = dirichlet_alpha_source
 
     checkpoint_path = (
         checkpoint_path.expanduser() if checkpoint_path is not None else None
@@ -837,13 +955,6 @@ def train_scae_on_graph(
             f"duration={encoder_duration:.3f}s",
         )
 
-    if dirichlet_alpha is None:
-        dirichlet_param: Union[float, Sequence[float]] = 0.5
-    elif len(dirichlet_alpha) == 1:
-        dirichlet_param = dirichlet_alpha[0]
-    else:
-        dirichlet_param = dirichlet_alpha
-
     model = SelfCompressingRGCNAutoEncoder(
         num_node_types=len(graph.node_type_index),
         attr_encoder=attr_encoder,
@@ -852,12 +963,12 @@ def train_scae_on_graph(
         hidden_dims=list(hidden_dims),
         type_embedding_dim=type_embedding_dim,
         negative_sampling_ratio=negative_sampling_ratio,
-        entropy_weight=entropy_weight,
+        entropy_weight=resolved_entropy_weight,
         dirichlet_alpha=dirichlet_param,
-        dirichlet_weight=dirichlet_weight,
-        embedding_norm_weight=embedding_norm_weight,
-        kld_weight=kld_weight,
-        entropy_eps=entropy_eps,
+        dirichlet_weight=resolved_dirichlet_weight,
+        embedding_norm_weight=resolved_embedding_norm_weight,
+        kld_weight=resolved_kld_weight,
+        entropy_eps=resolved_entropy_eps,
         max_negatives_per_graph=max_negatives,
         active_gate_threshold=gate_threshold,
         use_gradient_checkpointing=gradient_checkpointing,
@@ -875,7 +986,21 @@ def train_scae_on_graph(
         "num_node_types": len(graph.node_type_index),
         "num_relations": max(1, len(graph.relation_index)),
         "negative_sampling_ratio": float(negative_sampling_ratio),
+        "entropy_weight": float(resolved_entropy_weight),
+        "dirichlet_weight": float(resolved_dirichlet_weight),
+        "embedding_norm_weight": float(resolved_embedding_norm_weight),
+        "kld_weight": float(resolved_kld_weight),
+        "entropy_eps": float(resolved_entropy_eps),
     }
+
+    if isinstance(dirichlet_param, Sequence) and not isinstance(
+        dirichlet_param, (str, bytes)
+    ):
+        checkpoint_signature["dirichlet_alpha"] = [
+            float(value) for value in dirichlet_param
+        ]
+    else:
+        checkpoint_signature["dirichlet_alpha"] = float(dirichlet_param)
 
     def _validate_checkpoint_signature(saved: Mapping[str, Any]) -> None:
         for key, expected in checkpoint_signature.items():
@@ -1180,6 +1305,31 @@ def train_scae_on_graph(
         min_cluster_size=min_cluster_size,
     )
 
+    resolved_regularizers: Dict[str, Any] = {
+        "entropy_weight": float(resolved_entropy_weight),
+        "dirichlet_weight": float(resolved_dirichlet_weight),
+        "embedding_norm_weight": float(resolved_embedding_norm_weight),
+        "kld_weight": float(resolved_kld_weight),
+        "entropy_eps": float(resolved_entropy_eps),
+    }
+    if isinstance(dirichlet_param, Sequence) and not isinstance(
+        dirichlet_param, (str, bytes)
+    ):
+        resolved_regularizers["dirichlet_alpha"] = [
+            float(value) for value in dirichlet_param
+        ]
+    else:
+        resolved_regularizers["dirichlet_alpha"] = float(dirichlet_param)
+
+    auto_regularizer_values: Dict[str, float] = {
+        "entropy_weight": float(auto_regularizers.entropy_weight),
+        "dirichlet_weight": float(auto_regularizers.dirichlet_weight),
+        "embedding_norm_weight": float(auto_regularizers.embedding_norm_weight),
+        "kld_weight": float(auto_regularizers.kld_weight),
+        "entropy_eps": float(auto_regularizers.entropy_eps),
+        "dirichlet_alpha": float(auto_regularizers.dirichlet_alpha),
+    }
+
     training_summary = {
         "epochs_trained": epochs_trained_this_run,
         "total_epochs": trainer.total_epochs_trained,
@@ -1190,6 +1340,16 @@ def train_scae_on_graph(
         else None,
         "mlflow_run_id": mlflow_run_id,
         "mlflow_last_logged_step": mlflow_last_logged_step,
+        "regularizer_config": {
+            "values": resolved_regularizers,
+            "auto": auto_regularizer_values,
+            "sources": regularizer_sources,
+            "graph_stats": {
+                "num_nodes": node_count,
+                "num_edges": edge_count,
+                "num_clusters": num_clusters,
+            },
+        },
     }
 
     return model, partition, history, training_summary
@@ -1363,8 +1523,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--entropy-weight",
         type=float,
-        default=1e-3,
-        help="Weight applied to the entropy regularizer",
+        default=None,
+        help="Weight applied to the entropy regularizer (auto-derived from graph statistics when omitted)",
     )
     parser.add_argument(
         "--cluster-stability-window",
@@ -1394,26 +1554,26 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dirichlet-weight",
         type=float,
-        default=1e-3,
-        help="Weight for the Dirichlet prior regularizer",
+        default=None,
+        help="Weight for the Dirichlet prior regularizer (auto-derived from graph statistics when omitted)",
     )
     parser.add_argument(
         "--embedding-norm-weight",
         type=float,
-        default=1e-4,
-        help="Weight for the embedding norm regularizer",
+        default=None,
+        help="Weight for the embedding norm regularizer (auto-derived from graph statistics when omitted)",
     )
     parser.add_argument(
         "--kld-weight",
         type=float,
-        default=1e-3,
-        help="Weight for the KL divergence regularizer",
+        default=None,
+        help="Weight for the KL divergence regularizer (auto-derived from graph statistics when omitted)",
     )
     parser.add_argument(
         "--entropy-eps",
         type=float,
-        default=1e-12,
-        help="Numerical floor for entropy/Dirichlet calculations",
+        default=None,
+        help="Numerical floor for entropy/Dirichlet calculations (auto-derived from graph statistics when omitted)",
     )
     parser.add_argument(
         "--ego-samples",
@@ -1659,7 +1819,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     else "",
                     "gate_threshold": args.gate_threshold,
                     "min_cluster_size": args.min_cluster_size,
-                    "entropy_weight": args.entropy_weight,
+                    "entropy_weight_arg": (
+                        args.entropy_weight
+                        if args.entropy_weight is not None
+                        else "auto"
+                    ),
                     "mixed_precision": args.mixed_precision,
                     "grad_accum_steps": args.grad_accum,
                     "max_grad_norm": args.max_grad_norm
@@ -1677,10 +1841,22 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "cluster_stability_window": args.cluster_stability_window,
                     "cluster_stability_tol": args.cluster_stability_tol,
                     "cluster_stability_rel_tol": args.cluster_stability_rel_tol,
-                    "dirichlet_weight": args.dirichlet_weight,
-                    "embedding_norm_weight": args.embedding_norm_weight,
-                    "kld_weight": args.kld_weight,
-                    "entropy_eps": args.entropy_eps,
+                    "dirichlet_weight_arg": (
+                        args.dirichlet_weight
+                        if args.dirichlet_weight is not None
+                        else "auto"
+                    ),
+                    "embedding_norm_weight_arg": (
+                        args.embedding_norm_weight
+                        if args.embedding_norm_weight is not None
+                        else "auto"
+                    ),
+                    "kld_weight_arg": (
+                        args.kld_weight if args.kld_weight is not None else "auto"
+                    ),
+                    "entropy_eps_arg": (
+                        args.entropy_eps if args.entropy_eps is not None else "auto"
+                    ),
                     "ego_samples": args.ego_samples,
                     "ego_alpha": args.ego_alpha,
                     "ego_min_radius": args.ego_min_radius,
@@ -1689,7 +1865,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "ego_min_edges": args.ego_min_edges,
                     "hidden_dims": hidden_dims_param,
                     "effective_num_clusters": effective_num_clusters,
-                    "dirichlet_alpha": dirichlet_alpha_param,
+                    "dirichlet_alpha_arg": dirichlet_alpha_param or "auto",
                 }
             )
             mlflow_client.log_params(
@@ -1775,6 +1951,25 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         total_epochs_completed = int(training_summary.get("total_epochs", len(history)))
 
         if mlflow_client is not None:
+            regularizer_config = training_summary.get("regularizer_config", {})
+            regularizer_values = regularizer_config.get("values", {})
+            regularizer_sources = regularizer_config.get("sources", {})
+            auto_regularizers = regularizer_config.get("auto", {})
+
+            resolved_param_payload: Dict[str, Any] = {}
+            for key, value in regularizer_values.items():
+                if isinstance(value, list):
+                    resolved_param_payload[f"{key}"] = ",".join(map(str, value))
+                else:
+                    resolved_param_payload[f"{key}"] = float(value)
+            for key, source in regularizer_sources.items():
+                resolved_param_payload[f"{key}_source"] = source
+            for key, value in auto_regularizers.items():
+                resolved_param_payload[f"{key}_auto"] = float(value)
+
+            if resolved_param_payload:
+                mlflow_client.log_params(resolved_param_payload)
+
             if history:
                 final_loss = history[-1].get("loss")
                 if final_loss is not None and math.isfinite(final_loss):
