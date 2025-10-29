@@ -251,11 +251,28 @@ def infer_framework_labels_tailored(
                 return lab
         return None
 
-    node_type = nx.get_node_attributes(G, "node_type")
+    raw_node_type = nx.get_node_attributes(G, "node_type")
+    node_type = {n: _norm(raw_node_type.get(n, "")) for n in G.nodes}
     node_name = nx.get_node_attributes(G, "name")
 
-    disease_nodes = [n for n, t in node_type.items() if t == "disease"]
-    phenotype_nodes = [n for n, t in node_type.items() if t == "effect/phenotype"]
+    DISEASE_TYPES = {
+        "disease",
+        "disorder",
+        "condition",
+        "diagnosis",
+    }
+    PHENOTYPE_TYPES = {
+        "effect/phenotype",
+        "phenotype",
+        "sign/symptom",
+        "symptom",
+        "trait",
+    }
+    GENE_TYPES = {"gene/protein", "gene", "protein"}
+    DRUG_TYPES = {"drug", "medication", "compound", "treatment"}
+
+    disease_nodes = [n for n, t in node_type.items() if t in DISEASE_TYPES]
+    phenotype_nodes = [n for n, t in node_type.items() if t in PHENOTYPE_TYPES]
 
     hitop, rdoc = {}, {}
 
@@ -275,19 +292,31 @@ def infer_framework_labels_tailored(
     disease_to_drug = defaultdict(list)
     for u, v, data in G.edges(data=True):
         r = data.get("relation", "")
-        nu, nv = node_type.get(u), node_type.get(v)
+        nu, nv = node_type.get(u, ""), node_type.get(v, "")
         if r == "disease_phenotype_positive":
-            d, p = (u, v) if nu == "disease" else (v, u)
-            if node_type.get(d) == "disease" and node_type.get(p) == "effect/phenotype":
-                disease_to_phen[d].append(p)
+            if nu in DISEASE_TYPES and nv in PHENOTYPE_TYPES:
+                d, p = u, v
+            elif nv in DISEASE_TYPES and nu in PHENOTYPE_TYPES:
+                d, p = v, u
+            else:
+                continue
+            disease_to_phen[d].append(p)
         elif r == "disease_protein":
-            d, g = (u, v) if nu == "disease" else (v, u)
-            if node_type.get(d) == "disease" and node_type.get(g) == "gene/protein":
-                disease_to_gene[d].append(g)
+            if nu in DISEASE_TYPES and nv in GENE_TYPES:
+                d, g = u, v
+            elif nv in DISEASE_TYPES and nu in GENE_TYPES:
+                d, g = v, u
+            else:
+                continue
+            disease_to_gene[d].append(g)
         elif r in ("indication", "off-label use"):
-            d, dr = (u, v) if nu == "disease" else (v, u)
-            if node_type.get(d) == "disease" and node_type.get(dr) == "drug":
-                disease_to_drug[d].append(dr)
+            if nu in DISEASE_TYPES and nv in DRUG_TYPES:
+                d, dr = u, v
+            elif nv in DISEASE_TYPES and nu in DRUG_TYPES:
+                d, dr = v, u
+            else:
+                continue
+            disease_to_drug[d].append(dr)
 
     # 3) RDoC propagation (depth >=1)
     if prop_depth >= 1:
@@ -316,11 +345,11 @@ def infer_framework_labels_tailored(
     if prop_depth >= 2:
         next_votes = defaultdict(list)
         for g, lab in list(rdoc.items()):
-            if node_type.get(g) == "gene/protein":
+            if node_type.get(g, "") in GENE_TYPES:
                 for nbr in G.neighbors(g):
-                    if nbr not in rdoc and node_type.get(nbr) in (
-                        "drug",
-                        "gene/protein",
+                    nbr_type = node_type.get(nbr, "")
+                    if nbr not in rdoc and (
+                        nbr_type in DRUG_TYPES or nbr_type in GENE_TYPES
                     ):
                         next_votes[nbr].append(lab)
         for n, labs in next_votes.items():
