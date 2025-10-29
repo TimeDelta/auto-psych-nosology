@@ -472,6 +472,105 @@ def _auto_regularizer_config(
     )
 
 
+def _analyze_calibration_history(
+    history: Sequence[Mapping[str, Any]],
+    base_lr: float,
+    current_gate_threshold: float,
+    num_clusters: int,
+    min_cluster_size: int,
+) -> Dict[str, Any]:
+    losses: List[float] = []
+    active_clusters: List[float] = []
+    for record in history:
+        loss_val = record.get("loss")
+        if isinstance(loss_val, (int, float)) and math.isfinite(loss_val):
+            losses.append(float(loss_val))
+        active_val = record.get("num_active_clusters")
+        if isinstance(active_val, (int, float)) and math.isfinite(active_val):
+            active_clusters.append(float(active_val))
+
+    lr_multiplier = 1.0
+    notes: List[str] = []
+    loss_slope = 0.0
+    loss_curvature = 0.0
+    mean_loss = None
+    if len(losses) >= 2:
+        mean_loss = sum(losses) / len(losses)
+        loss_slope = (losses[-1] - losses[0]) / max(1, len(losses) - 1)
+        if len(losses) >= 3:
+            second_diffs = [
+                losses[i + 1] - 2 * losses[i] + losses[i - 1]
+                for i in range(1, len(losses) - 1)
+            ]
+            if second_diffs:
+                loss_curvature = sum(second_diffs) / len(second_diffs)
+
+        scale_loss = max(abs(mean_loss or losses[0]), 1e-6)
+        if loss_slope > 0.01 * scale_loss:
+            lr_multiplier *= 0.5
+            notes.append("loss increasing; halving lr")
+        elif (
+            abs(loss_slope) < 0.002 * scale_loss
+            and abs(loss_curvature) < 0.001 * scale_loss
+        ):
+            lr_multiplier *= 1.1
+            notes.append("loss flat; modest lr increase")
+
+        curvature_ratio = abs(loss_curvature) / scale_loss
+        if curvature_ratio > 0.05:
+            lr_multiplier *= 0.8
+            notes.append("high curvature; damping lr")
+
+    lr_multiplier = min(1.5, max(0.1, lr_multiplier))
+    adjusted_lr = base_lr * lr_multiplier
+
+    gate_adjustment = 0.0
+    mean_active = None
+    variance_active = None
+    rel_variance_active = None
+    if active_clusters:
+        mean_active = sum(active_clusters) / len(active_clusters)
+        variance_active = sum(
+            (value - mean_active) ** 2 for value in active_clusters
+        ) / len(active_clusters)
+        rel_variance_active = variance_active / max(mean_active**2, 1e-6)
+
+        if variance_active > 1.0 or (
+            rel_variance_active is not None and rel_variance_active > 0.05
+        ):
+            gate_adjustment += 0.05
+            notes.append("active cluster variance high; raising gate threshold")
+        elif mean_active is not None:
+            conservative_capacity = max(
+                min_cluster_size * 1.5, 0.3 * max(num_clusters, 1)
+            )
+            if (
+                mean_active < conservative_capacity
+                and (rel_variance_active or 0.0) < 0.01
+            ):
+                gate_adjustment -= 0.05
+                notes.append(
+                    "active cluster count low and stable; lowering gate threshold"
+                )
+
+    new_gate_threshold = min(0.95, max(0.05, current_gate_threshold + gate_adjustment))
+
+    return {
+        "lr_multiplier": lr_multiplier,
+        "adjusted_lr": adjusted_lr,
+        "base_lr": base_lr,
+        "loss_slope": loss_slope,
+        "loss_curvature": loss_curvature,
+        "mean_loss": mean_loss,
+        "mean_active_clusters": mean_active,
+        "var_active_clusters": variance_active,
+        "rel_var_active_clusters": rel_variance_active,
+        "gate_threshold": new_gate_threshold,
+        "notes": notes,
+        "history_length": len(history),
+    }
+
+
 def _parse_mlflow_tags(raw_tags: Optional[Sequence[str]]) -> Dict[str, str]:
     if not raw_tags:
         return {}
@@ -848,6 +947,7 @@ def train_scae_on_graph(
     mlflow_run_id: Optional[str] = None,
     mlflow_last_logged_step: Optional[int] = None,
     mlflow_tracker_path: Optional[Path] = None,
+    calibration_epochs: int = 0,
 ) -> Tuple[
     SelfCompressingRGCNAutoEncoder,
     PartitionResult,
@@ -916,6 +1016,10 @@ def train_scae_on_graph(
         dirichlet_alpha_source = "auto"
 
     regularizer_sources["dirichlet_alpha"] = dirichlet_alpha_source
+
+    base_learning_rate = float(lr)
+    effective_learning_rate = base_learning_rate
+    base_gate_threshold = float(gate_threshold)
 
     checkpoint_path = (
         checkpoint_path.expanduser() if checkpoint_path is not None else None
@@ -1226,10 +1330,92 @@ def train_scae_on_graph(
     else:
         epoch_callback_for_trainer = None
 
-    epochs_remaining = max(0, int(max_epochs) - int(start_epoch))
-    if epochs_remaining > 0:
+    total_epochs_available = max(0, int(max_epochs) - int(start_epoch))
+    warmup_epochs = min(max(0, int(calibration_epochs)), total_epochs_available)
+    calibration_summary: Optional[Dict[str, Any]] = None
+
+    if warmup_epochs > 0 and not used_resume:
+        if verbose:
+            print(f"[INFO] Starting calibration warm-up for {warmup_epochs} epoch(s)")
+        history_start = len(trainer.history)
+        trainer.train(
+            max_epochs=warmup_epochs,
+            batch_size=max(1, int(batch_size)),
+            negative_sampling_ratio=negative_sampling_ratio,
+            verbose=verbose,
+            bucket_by_size=node_budget is None,
+            node_budget=node_budget,
+            on_epoch_end=epoch_callback_for_trainer,
+            stability_metric=None,
+            stability_window=0,
+            stability_tolerance=0.0,
+            stability_relative_tolerance=None,
+            min_epochs=0,
+            start_epoch=start_epoch,
+        )
+        warmup_history = trainer.history[history_start:]
+        calibration_summary = _analyze_calibration_history(
+            warmup_history,
+            base_lr=lr,
+            current_gate_threshold=gate_threshold,
+            num_clusters=num_clusters,
+            min_cluster_size=min_cluster_size,
+        )
+
+        adjusted_lr = float(calibration_summary["adjusted_lr"])
+        if not math.isclose(adjusted_lr, effective_learning_rate, rel_tol=1e-6):
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = adjusted_lr
+            optimizer.defaults["lr"] = adjusted_lr
+            if verbose:
+                print(
+                    f"[INFO] Calibration adjusted learning rate from {effective_learning_rate:.4g} to {adjusted_lr:.4g}"
+                )
+        effective_learning_rate = adjusted_lr
+
+        new_gate_threshold = float(calibration_summary["gate_threshold"])
+        if not math.isclose(new_gate_threshold, gate_threshold, rel_tol=1e-6):
+            gate_threshold = new_gate_threshold
+            model.active_gate_threshold = new_gate_threshold
+            if verbose:
+                print(
+                    "[INFO] Calibration updated gate threshold to "
+                    f"{new_gate_threshold:.3f}"
+                )
+
+        calibration_summary["warmup_epochs"] = trainer.last_run_epochs
+        calibration_summary["base_gate_threshold"] = base_gate_threshold
+        calibration_summary["adjusted_gate_threshold"] = gate_threshold
+        calibration_summary["base_lr"] = base_learning_rate
+        calibration_summary["effective_lr"] = effective_learning_rate
+        calibration_summary["notes"] = calibration_summary.get("notes", [])
+
+        start_epoch = trainer.total_epochs_trained
+        total_epochs_available = max(0, int(max_epochs) - int(start_epoch))
+    elif warmup_epochs > 0 and used_resume:
+        calibration_summary = {
+            "lr_multiplier": 1.0,
+            "adjusted_lr": effective_learning_rate,
+            "base_lr": base_learning_rate,
+            "loss_slope": 0.0,
+            "loss_curvature": 0.0,
+            "mean_loss": None,
+            "mean_active_clusters": None,
+            "var_active_clusters": None,
+            "rel_var_active_clusters": None,
+            "gate_threshold": gate_threshold,
+            "base_gate_threshold": base_gate_threshold,
+            "adjusted_gate_threshold": gate_threshold,
+            "notes": ["calibration skipped because training resumed from checkpoint"],
+            "history_length": 0,
+            "warmup_epochs": 0,
+            "effective_lr": effective_learning_rate,
+        }
+
+    if total_epochs_available > 0:
+        remaining_min_epochs = max(0, int(min_epochs) - int(start_epoch))
         history = trainer.train(
-            max_epochs=epochs_remaining,
+            max_epochs=total_epochs_available,
             batch_size=max(1, int(batch_size)),
             negative_sampling_ratio=negative_sampling_ratio,
             verbose=verbose,
@@ -1242,7 +1428,7 @@ def train_scae_on_graph(
             stability_window=cluster_stability_window,
             stability_tolerance=cluster_stability_tolerance,
             stability_relative_tolerance=cluster_stability_relative_tolerance,
-            min_epochs=min_epochs,
+            min_epochs=remaining_min_epochs,
             start_epoch=start_epoch,
         )
     else:
@@ -1350,6 +1536,9 @@ def train_scae_on_graph(
                 "num_clusters": num_clusters,
             },
         },
+        "calibration_summary": calibration_summary,
+        "effective_learning_rate": effective_learning_rate,
+        "gate_threshold": gate_threshold,
     }
 
     return model, partition, history, training_summary
@@ -1430,6 +1619,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--clusters", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--calibration-epochs",
+        type=int,
+        default=10,
+        help="Warm-up epochs run before main training to auto-adjust learning rate and gate threshold (0 disables)",
+    )
     parser.add_argument("--hidden", type=int, nargs="*", default=(128, 128))
     parser.add_argument(
         "--batch-size",
@@ -1943,6 +2138,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             mlflow_run_id=active_run_id,
             mlflow_last_logged_step=mlflow_last_logged_step,
             mlflow_tracker_path=mlflow_tracker_path,
+            calibration_epochs=args.calibration_epochs,
         )
 
         epochs_completed_this_run = int(
@@ -1967,8 +2163,55 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             for key, value in auto_regularizers.items():
                 resolved_param_payload[f"{key}_auto"] = float(value)
 
+            resolved_param_payload["learning_rate_resolved"] = float(
+                training_summary.get("effective_learning_rate", args.lr)
+            )
+            resolved_param_payload["gate_threshold_resolved"] = float(
+                training_summary.get("gate_threshold", args.gate_threshold)
+            )
+
+            calibration_details = training_summary.get("calibration_summary") or {}
+            if calibration_details:
+                resolved_param_payload["calibration_lr_multiplier"] = float(
+                    calibration_details.get("lr_multiplier", 1.0)
+                )
+                resolved_param_payload["calibration_warmup_epochs"] = int(
+                    calibration_details.get("warmup_epochs", 0)
+                )
+                resolved_param_payload["calibration_gate_threshold"] = float(
+                    calibration_details.get(
+                        "adjusted_gate_threshold",
+                        training_summary.get("gate_threshold", args.gate_threshold),
+                    )
+                )
+                notes = calibration_details.get("notes", [])
+                if notes:
+                    resolved_param_payload["calibration_notes"] = " | ".join(notes)
+
             if resolved_param_payload:
                 mlflow_client.log_params(resolved_param_payload)
+
+            if calibration_details:
+                calibration_metrics: Dict[str, float] = {}
+                for metric_key in (
+                    "loss_slope",
+                    "loss_curvature",
+                    "mean_active_clusters",
+                    "var_active_clusters",
+                    "rel_var_active_clusters",
+                ):
+                    metric_value = calibration_details.get(metric_key)
+                    if isinstance(metric_value, (int, float)) and math.isfinite(
+                        metric_value
+                    ):
+                        calibration_metrics[f"calibration_{metric_key}"] = float(
+                            metric_value
+                        )
+                if calibration_metrics:
+                    mlflow_client.log_metrics(
+                        calibration_metrics,
+                        step=int(training_summary.get("start_epoch", 0)),
+                    )
 
             if history:
                 final_loss = history[-1].get("loss")
