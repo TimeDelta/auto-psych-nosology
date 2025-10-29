@@ -45,7 +45,8 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
         - **consistency_loss** / **consistency_overlap** are the memory-bank temporal consistency terms (0 when disabled).
         - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
         - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete $L_0$ expectation.
-        - **num_active_clusters_stochastic** retains the raw training-mode gate count if you need to debug EMA smoothing or gating noise.
+        - **realized_active_clusters** runs a full argmax pass and counts clusters that actually win nodes after enforcing `--min-cluster-size`.
+        - **num_active_clusters_stochastic** retains the raw training-mode gate count when needing to debug EMA smoothing or gating noise.
         - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
         - **num_negatives** counts sampled negative edges that survived the per-graph cap.
         - **timing_sample_neg** and **timing_neg_logits** capture the wall-clock time (in seconds) spent sampling negatives and scoring them.
@@ -54,7 +55,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
     - Pass `--checkpoint-path PATH.pt` to atomically persist model weights, optimizer state, history, and run metadata at the end of training (and optionally every `--checkpoint-every N` epochs).
     - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
     - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
-- Training stops early when the stability metric you request stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `num_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
+- Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
 - To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_hSBM_partitions.py](./create_hSBM_partitions.py).
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
 

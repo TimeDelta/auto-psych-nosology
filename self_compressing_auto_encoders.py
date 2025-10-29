@@ -2222,6 +2222,88 @@ class OnlineTrainer:
         self.dataset.clear()
         self._node_sizes.clear()
 
+    def _compute_realized_clusters(
+        self,
+        min_cluster_size: int,
+        eval_batch_size: int = 1,
+    ) -> int:
+        """Run a full eval pass to count clusters with assigned nodes post-argmax."""
+
+        if not self.dataset:
+            return 0
+
+        min_cluster = max(1, int(min_cluster_size))
+        was_training = self.model.training
+        device = self.device
+
+        eval_loader = DataLoader(
+            self.dataset,
+            batch_size=max(1, int(eval_batch_size)),
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+        )
+
+        with torch.no_grad():
+            self.model.eval()
+            gate_eval = self.model.cluster_gate(training=False).detach().to(device)
+            active_mask = gate_eval >= self.model.active_gate_threshold
+            if torch.count_nonzero(active_mask) == 0:
+                active_mask[gate_eval.argmax()] = True
+
+            counts = torch.zeros(
+                self.model.num_clusters, device=device, dtype=torch.long
+            )
+
+            for batch in eval_loader:
+                batch = batch.to(device)
+
+                positional = None
+                for candidate in (
+                    "positional_encodings",
+                    "laplacian_positional_encoding",
+                    "laplacian_eigvecs",
+                ):
+                    if hasattr(batch, candidate):
+                        positional = getattr(batch, candidate)
+                        break
+
+                node_ids = None
+                for candidate in (
+                    "global_node_ids",
+                    "node_ids",
+                    "original_node_ids",
+                    "node_names",
+                ):
+                    if hasattr(batch, candidate):
+                        node_ids = getattr(batch, candidate)
+                        break
+
+                _, assignments, _ = self.model(
+                    node_types=batch.node_types,
+                    edge_index=batch.edge_index,
+                    batch=batch.batch,
+                    node_attributes=getattr(batch, "node_attributes", None),
+                    node_attr_embedding=getattr(batch, "node_attr_embedding", None),
+                    edge_type=getattr(batch, "edge_type", None),
+                    negative_sampling_ratio=0.0,
+                    positional_encodings=positional,
+                    edge_weight=getattr(batch, "edge_weight", None),
+                    node_ids=node_ids,
+                )
+
+                labels = assignments.argmax(dim=1)
+                batch_counts = torch.bincount(labels, minlength=self.model.num_clusters)
+                counts += batch_counts.to(device=device, dtype=torch.long)
+
+        realized_mask = counts >= min_cluster
+        realized_mask &= active_mask.to(device)
+        realized_count = int(realized_mask.sum().item())
+
+        if was_training:
+            self.model.train()
+
+        return realized_count
+
     def train(
         self,
         max_epochs: int = 100,
@@ -2238,6 +2320,7 @@ class OnlineTrainer:
         stability_relative_tolerance: Optional[float] = None,
         min_epochs: int = 0,
         start_epoch: int = 0,
+        realized_cluster_min_size: int = 1,
     ) -> List[Dict[str, float]]:
         if max_epochs <= 0:
             raise ValueError("max epochs must be a positive integer.")
@@ -2408,6 +2491,8 @@ class OnlineTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             averaged_metrics = {k: v / batch_count for k, v in metric_sums.items()}
+            realized_count = self._compute_realized_clusters(realized_cluster_min_size)
+            averaged_metrics["realized_active_clusters"] = float(realized_count)
             averaged_metrics["epoch"] = float(epoch)
             averaged_metrics["run_epoch"] = float(epoch - start_epoch)
             self.history.append(averaged_metrics)

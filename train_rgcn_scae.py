@@ -1352,6 +1352,7 @@ def train_scae_on_graph(
             stability_relative_tolerance=None,
             min_epochs=0,
             start_epoch=start_epoch,
+            realized_cluster_min_size=min_cluster_size,
         )
         warmup_history = trainer.history[history_start:]
         calibration_summary = _analyze_calibration_history(
@@ -1422,7 +1423,7 @@ def train_scae_on_graph(
             bucket_by_size=node_budget is None,
             node_budget=node_budget,
             on_epoch_end=epoch_callback_for_trainer,
-            stability_metric="num_active_clusters"
+            stability_metric="realized_active_clusters"
             if cluster_stability_window > 0
             else None,
             stability_window=cluster_stability_window,
@@ -1430,6 +1431,7 @@ def train_scae_on_graph(
             stability_relative_tolerance=cluster_stability_relative_tolerance,
             min_epochs=remaining_min_epochs,
             start_epoch=start_epoch,
+            realized_cluster_min_size=min_cluster_size,
         )
     else:
         if verbose:
@@ -1725,19 +1727,19 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--cluster-stability-window",
         type=int,
         default=20,
-        help="Number of trailing epochs used to test num_active_clusters stability for early stopping (0 disables).",
+        help="Number of trailing epochs used to test realized_active_clusters stability (post-argmax) for early stopping (0 disables).",
     )
     parser.add_argument(
         "--cluster-stability-tol",
         type=float,
         default=0.0,
-        help="Absolute tolerance for num_active_clusters variation across the stability window.",
+        help="Absolute tolerance for realized_active_clusters variation across the stability window.",
     )
     parser.add_argument(
         "--cluster-stability-rel-tol",
         type=float,
         default=0.0,
-        help="Relative tolerance (fraction of the mean) allowed for num_active_clusters across the window.",
+        help="Relative tolerance (fraction of the mean) allowed for realized_active_clusters across the window.",
     )
     parser.add_argument(
         "--dirichlet-alpha",
