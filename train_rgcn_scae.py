@@ -10,9 +10,9 @@ import random
 import re
 import time
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
     Any,
@@ -30,6 +30,7 @@ from typing import (
 import networkx as nx
 import numpy as np
 import torch
+from sklearn.metrics import adjusted_rand_score
 from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph
 
@@ -97,6 +98,38 @@ def _restore_rng_state(state: Optional[Mapping[str, Any]]) -> None:
                 torch.cuda.set_rng_state_all(cuda_state)
             except Exception:
                 pass
+
+
+@dataclass
+class HierarchyConfig:
+    max_levels: int = 1
+    stability_window: int = 10
+    ari_threshold: float = 0.985
+    vi_threshold_factor: float = 0.02
+    min_cluster_mass: float = 0.005
+    mdl_delta_threshold: float = 0.001
+    entropy_var_threshold: float = 1e-4
+    hysteresis_fraction: float = 0.10
+    hysteresis_epochs: int = 5
+    promotion_cooldown: int = 3
+    max_levels_without_gain: int = 2
+    spectral_check: bool = False
+    vi_log_base: float = math.e
+    promotion_metadata_path: Optional[Path] = None
+    enable_hierarchy: bool = False
+
+
+@dataclass
+class HierarchyMetrics:
+    epoch: int
+    total_loss: float
+    ari: float
+    vi: float
+    c_eff: float
+    gate_entropy: float
+    mdl: float
+    num_active_clusters: int
+    window_data: Dict[str, float] = field(default_factory=dict)
 
 
 def _tokenize_text(value: str) -> List[str]:
@@ -571,6 +604,265 @@ def _analyze_calibration_history(
     }
 
 
+def _entropy_from_probs(probs: np.ndarray, eps: float = 1e-12) -> float:
+    safe = np.clip(probs, eps, 1.0)
+    return float(-np.sum(safe * np.log(safe)))
+
+
+def _variation_of_information(labels_a: np.ndarray, labels_b: np.ndarray) -> float:
+    if labels_a.size == 0 or labels_b.size == 0:
+        return 0.0
+    values_a, counts_a = np.unique(labels_a, return_counts=True)
+    values_b, counts_b = np.unique(labels_b, return_counts=True)
+    p_a = counts_a / counts_a.sum()
+    p_b = counts_b / counts_b.sum()
+
+    entropy_a = _entropy_from_probs(p_a)
+    entropy_b = _entropy_from_probs(p_b)
+
+    contingency = {}
+    for la, lb in zip(labels_a, labels_b):
+        contingency[(la, lb)] = contingency.get((la, lb), 0) + 1
+    total = labels_a.size
+    mutual = 0.0
+    for (la, lb), count in contingency.items():
+        p_ab = count / total
+        p_la = p_a[np.where(values_a == la)[0][0]]
+        p_lb = p_b[np.where(values_b == lb)[0][0]]
+        mutual += p_ab * math.log(max(p_ab / (p_la * p_lb), 1e-12))
+
+    vi = entropy_a + entropy_b - 2.0 * mutual
+    return float(max(vi, 0.0))
+
+
+def _effective_cluster_count(
+    prob_matrix: np.ndarray, method: str = "entropy", min_mass: float = 0.0
+) -> float:
+    p_c = prob_matrix.mean(axis=0)
+    if method == "count":
+        return float(np.sum(p_c >= min_mass))
+    return float(math.exp(_entropy_from_probs(p_c + 1e-12)))
+
+
+def _gate_entropy(prob_matrix: np.ndarray) -> float:
+    p_c = prob_matrix.mean(axis=0)
+    return _entropy_from_probs(p_c + 1e-12)
+
+
+def _compute_epoch_assignments(
+    model: SelfCompressingRGCNAutoEncoder,
+    graph: MultiplexGraph,
+    device: torch.device,
+    gate_threshold: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    model.eval()
+    with torch.no_grad():
+        node_types = graph.data.node_types.to(device)
+        edge_index = graph.data.edge_index.to(device)
+        batch_vec = torch.zeros(node_types.size(0), dtype=torch.long, device=device)
+        edge_type = getattr(graph.data, "edge_type", None)
+        if edge_type is not None and edge_type.numel() > 0:
+            edge_type = edge_type.to(device)
+        else:
+            edge_type = None
+        loss, assignments, metrics = model(
+            node_types=node_types,
+            edge_index=edge_index,
+            batch=batch_vec,
+            node_attributes=getattr(graph.data, "node_attributes", None),
+            edge_type=edge_type,
+            negative_sampling_ratio=0.0,
+        )
+
+    soft = assignments.detach().cpu().numpy()
+    hard = soft.argmax(axis=1)
+    gate_values = metrics.get("cluster_gate_sample")
+    if gate_values is not None:
+        gate_np = gate_values.detach().cpu().numpy()
+    else:
+        gate_np = np.ones(soft.shape[1], dtype=float)
+
+    active = gate_np >= gate_threshold
+    return soft, hard, active.astype(float), {"loss": float(loss.detach().cpu().item())}
+
+
+def _increase_parsimony(
+    model: SelfCompressingRGCNAutoEncoder, factor: float = 1.25
+) -> None:
+    if hasattr(model, "entropy_weight"):
+        model.entropy_weight = float(model.entropy_weight) * factor
+    if hasattr(model, "dirichlet_weight"):
+        model.dirichlet_weight = float(model.dirichlet_weight) * factor
+    if hasattr(model, "gate_entropy_weight"):
+        model.gate_entropy_weight = float(model.gate_entropy_weight) * factor
+
+
+def _rolling_stats(values: Iterable[float]) -> Tuple[float, float, float]:
+    arr = np.array(list(values), dtype=float)
+    if arr.size == 0:
+        return 0.0, 0.0, 0.0
+    return float(arr.mean()), float(arr.std()), float(arr.ptp())
+
+
+class HierarchyMonitor:
+    def __init__(
+        self,
+        level_index: int,
+        config: HierarchyConfig,
+        graph: MultiplexGraph,
+        gate_threshold: float,
+        min_cluster_mass: float,
+        vi_log_base: float,
+        promotion_dir: Optional[Path] = None,
+    ) -> None:
+        self.level_index = level_index
+        self.config = config
+        self.graph = graph
+        self.gate_threshold = gate_threshold
+        self.min_cluster_mass = min_cluster_mass
+        self.vi_log_base = vi_log_base
+        self.history: deque[HierarchyMetrics] = deque(maxlen=config.stability_window)
+        self.prev_hard: Optional[np.ndarray] = None
+        self.prev_soft: Optional[np.ndarray] = None
+        self.best_mdl: float = float("inf")
+        self.best_checkpoint_epoch: Optional[int] = None
+        self.checkpoint_path: Optional[Path] = None
+        self.promoted = False
+        self.last_promotion_epoch: Optional[int] = None
+        self.hysteresis_counter: int = 0
+        self.c_target: Optional[float] = None
+        self.metadata_dir = promotion_dir
+        if promotion_dir is not None:
+            promotion_dir.mkdir(parents=True, exist_ok=True)
+
+    def _compute_metrics(
+        self,
+        epoch_idx: int,
+        trainer_metrics: Dict[str, float],
+        model: SelfCompressingRGCNAutoEncoder,
+        trainer_device: torch.device,
+    ) -> HierarchyMetrics:
+        soft, hard, active, aux = _compute_epoch_assignments(
+            model=model,
+            graph=self.graph,
+            device=trainer_device,
+            gate_threshold=self.gate_threshold,
+        )
+        total_loss = float(trainer_metrics.get("total_loss", aux.get("loss", 0.0)))
+        if self.prev_hard is None:
+            ari = 1.0
+            vi = 0.0
+        else:
+            ari = float(adjusted_rand_score(self.prev_hard, hard))
+            vi = _variation_of_information(self.prev_hard, hard)
+
+        c_eff = _effective_cluster_count(
+            soft, method="entropy", min_mass=self.min_cluster_mass
+        )
+        gate_entropy = _gate_entropy(soft)
+        num_active_clusters = int(np.sum(active >= 0.5))
+
+        metrics = HierarchyMetrics(
+            epoch=epoch_idx,
+            total_loss=total_loss,
+            ari=ari,
+            vi=vi,
+            c_eff=c_eff,
+            gate_entropy=gate_entropy,
+            mdl=total_loss,
+            num_active_clusters=num_active_clusters,
+        )
+
+        self.prev_hard = hard
+        self.prev_soft = soft
+        return metrics
+
+    def _check_stability(self) -> bool:
+        if len(self.history) < self.config.stability_window:
+            return False
+        window = list(self.history)
+        ari_mean = np.mean([m.ari for m in window])
+        vi_range = np.ptp([m.vi for m in window])
+        c_range = np.ptp([m.c_eff for m in window])
+        c_min = np.min([m.c_eff for m in window])
+        if ari_mean < self.config.ari_threshold:
+            return False
+        n = self.graph.data.node_types.size(0)
+        vi_cap = self.config.vi_threshold_factor * math.log(max(n, 2), self.vi_log_base)
+        if vi_range > vi_cap:
+            return False
+        if c_range > 1.0:
+            return False
+        if c_min < max(1.0, self.min_cluster_mass * n):
+            return False
+        gate_var = np.var([m.gate_entropy for m in window])
+        if gate_var > self.config.entropy_var_threshold:
+            return False
+        mdl_changes = np.diff([m.mdl for m in window])
+        if mdl_changes.size > 0:
+            mdl_mean_delta = np.mean(np.abs(mdl_changes))
+            if mdl_mean_delta > self.config.mdl_delta_threshold * max(
+                window[-1].mdl, 1e-6
+            ):
+                return False
+        return True
+
+    def _check_hysteresis(self) -> bool:
+        if self.c_target is None:
+            return False
+        if not self.history:
+            return False
+        current = self.history[-1].c_eff
+        if current <= self.c_target * (1.0 + self.config.hysteresis_fraction):
+            self.hysteresis_counter = 0
+            return False
+        self.hysteresis_counter += 1
+        return self.hysteresis_counter >= self.config.hysteresis_epochs
+
+    def set_checkpoint_path(self, path: Path) -> None:
+        self.checkpoint_path = path
+
+    def update_gate_threshold(self, gate_threshold: float) -> None:
+        self.gate_threshold = gate_threshold
+
+    def on_epoch_end(
+        self,
+        epoch_idx: int,
+        trainer_metrics: Dict[str, float],
+        model: SelfCompressingRGCNAutoEncoder,
+        trainer_device: torch.device,
+        save_checkpoint: Callable[[int, str], None],
+    ) -> Tuple[Optional[str], HierarchyMetrics]:
+        metrics = self._compute_metrics(
+            epoch_idx, trainer_metrics, model, trainer_device
+        )
+        self.history.append(metrics)
+        if metrics.mdl < self.best_mdl:
+            self.best_mdl = metrics.mdl
+            self.best_checkpoint_epoch = epoch_idx
+            save_checkpoint(epoch_idx, f"best_level_{self.level_index}")
+
+        if self.c_target is None:
+            self.c_target = metrics.c_eff
+
+        if self._check_hysteresis():
+            self.hysteresis_counter = 0
+            return "rollback", metrics
+
+        if self._check_stability():
+            self.c_target = metrics.c_eff
+            return "promote", metrics
+
+        return None, metrics
+
+    def reset_after_rollback(self) -> None:
+        self.history.clear()
+        self.prev_hard = None
+        self.prev_soft = None
+        self.c_target = None
+        self.hysteresis_counter = 0
+
+
 def _parse_mlflow_tags(raw_tags: Optional[Sequence[str]]) -> Dict[str, str]:
     if not raw_tags:
         return {}
@@ -948,6 +1240,7 @@ def train_scae_on_graph(
     mlflow_last_logged_step: Optional[int] = None,
     mlflow_tracker_path: Optional[Path] = None,
     calibration_epochs: int = 0,
+    hierarchy_monitor: Optional[HierarchyMonitor] = None,
 ) -> Tuple[
     SelfCompressingRGCNAutoEncoder,
     PartitionResult,
@@ -1312,10 +1605,34 @@ def train_scae_on_graph(
                 f"[INFO] Saved checkpoint to {checkpoint_path} at epoch {epoch_idx} ({reason})"
             )
 
-    def _combined_epoch_callback(epoch_idx: int, metrics: Dict[str, float]) -> None:
+    def _combined_epoch_callback(
+        epoch_idx: int, metrics: Dict[str, float]
+    ) -> Optional[str]:
         nonlocal mlflow_last_logged_step
+        merged_metrics = dict(metrics)
+        signal: Optional[str] = None
+
+        if hierarchy_monitor is not None:
+            signal, hier_metrics = hierarchy_monitor.on_epoch_end(
+                epoch_idx=epoch_idx,
+                trainer_metrics=metrics,
+                model=model,
+                trainer_device=trainer.device,
+                save_checkpoint=_write_checkpoint,
+            )
+            merged_metrics.update(
+                {
+                    "hierarchical/ari": hier_metrics.ari,
+                    "hierarchical/vi": hier_metrics.vi,
+                    "hierarchical/c_eff": hier_metrics.c_eff,
+                    "hierarchical/gate_entropy": hier_metrics.gate_entropy,
+                    "hierarchical/mdl": hier_metrics.mdl,
+                    "hierarchical/num_active_clusters": hier_metrics.num_active_clusters,
+                }
+            )
+
         if epoch_callback is not None and epoch_idx > mlflow_last_logged_step:
-            epoch_callback(epoch_idx, metrics)
+            epoch_callback(epoch_idx, merged_metrics)
             mlflow_last_logged_step = epoch_idx
             _update_mlflow_tracker(mlflow_last_logged_step)
         if (
@@ -1324,6 +1641,7 @@ def train_scae_on_graph(
             and epoch_idx % checkpoint_interval == 0
         ):
             _write_checkpoint(epoch_idx, "interval")
+        return signal
 
     if epoch_callback is not None or checkpoint_path is not None:
         epoch_callback_for_trainer = _combined_epoch_callback
@@ -1378,6 +1696,8 @@ def train_scae_on_graph(
         if not math.isclose(new_gate_threshold, gate_threshold, rel_tol=1e-6):
             gate_threshold = new_gate_threshold
             model.active_gate_threshold = new_gate_threshold
+            if hierarchy_monitor is not None:
+                hierarchy_monitor.update_gate_threshold(new_gate_threshold)
             if verbose:
                 print(
                     "[INFO] Calibration updated gate threshold to "
@@ -1392,7 +1712,6 @@ def train_scae_on_graph(
         calibration_summary["notes"] = calibration_summary.get("notes", [])
 
         start_epoch = trainer.total_epochs_trained
-        total_epochs_available = max(0, int(max_epochs) - int(start_epoch))
     elif warmup_epochs > 0 and used_resume:
         calibration_summary = {
             "lr_multiplier": 1.0,
@@ -1413,8 +1732,23 @@ def train_scae_on_graph(
             "effective_lr": effective_learning_rate,
         }
 
-    if total_epochs_available > 0:
+    promotion_signal: Optional[str] = None
+    while True:
+        epochs_remaining = max(0, int(max_epochs) - int(start_epoch))
+        if epochs_remaining <= 0:
+            if verbose:
+                print(
+                    "[INFO] No epochs remaining to train "
+                    f"(start_epoch={start_epoch}, max_epochs={max_epochs})."
+                )
+            trainer.last_run_epochs = 0
+            trainer.total_epochs_trained = start_epoch
+            history = trainer.history
+            break
+
+        total_epochs_available = epochs_remaining
         remaining_min_epochs = max(0, int(min_epochs) - int(start_epoch))
+
         history = trainer.train(
             max_epochs=total_epochs_available,
             batch_size=max(1, int(batch_size)),
@@ -1433,15 +1767,107 @@ def train_scae_on_graph(
             start_epoch=start_epoch,
             realized_cluster_min_size=min_cluster_size,
         )
-    else:
-        if verbose:
-            print(
-                "[INFO] No epochs remaining to train "
-                f"(start_epoch={start_epoch}, max_epochs={max_epochs})."
-            )
-        trainer.last_run_epochs = 0
-        trainer.total_epochs_trained = start_epoch
-        history = trainer.history
+
+        signal = trainer.callback_signal
+        if signal == "rollback":
+            if checkpoint_path is None or not checkpoint_path.exists():
+                if verbose:
+                    print(
+                        "[WARN] Rollback requested but no checkpoint available; continuing."
+                    )
+                promotion_signal = None
+                break
+            try:
+                restore_blob = torch.load(checkpoint_path, map_location="cpu")
+            except Exception as exc:
+                print(
+                    f"[WARN] Failed to load checkpoint for rollback {checkpoint_path}: {exc}"
+                )
+                promotion_signal = None
+                break
+
+            model.load_state_dict(restore_blob.get("model_state", model.state_dict()))
+            if not reset_optimizer:
+                opt_state = restore_blob.get("optimizer_state")
+                if opt_state is not None:
+                    optimizer.load_state_dict(opt_state)
+            _restore_rng_state(restore_blob.get("rng_state"))
+
+            restored_history = restore_blob.get("history", [])
+            trainer.history = [dict(entry) for entry in restored_history]
+            trainer.total_epochs_trained = int(restore_blob.get("epoch", start_epoch))
+            trainer.last_run_epochs = 0
+            start_epoch = trainer.total_epochs_trained
+            if hierarchy_monitor is not None:
+                hierarchy_monitor.reset_after_rollback()
+                _increase_parsimony(model)
+            mlflow_last_logged_step = max(mlflow_last_logged_step, start_epoch)
+            trainer.callback_signal = None
+            continue
+
+        promotion_signal = signal
+        start_epoch = trainer.total_epochs_trained
+        trainer.callback_signal = None
+        break
+        history = trainer.train(
+            max_epochs=total_epochs_available,
+            batch_size=max(1, int(batch_size)),
+            negative_sampling_ratio=negative_sampling_ratio,
+            verbose=verbose,
+            bucket_by_size=node_budget is None,
+            node_budget=node_budget,
+            on_epoch_end=epoch_callback_for_trainer,
+            stability_metric="realized_active_clusters"
+            if cluster_stability_window > 0
+            else None,
+            stability_window=cluster_stability_window,
+            stability_tolerance=cluster_stability_tolerance,
+            stability_relative_tolerance=cluster_stability_relative_tolerance,
+            min_epochs=remaining_min_epochs,
+            start_epoch=start_epoch,
+            realized_cluster_min_size=min_cluster_size,
+        )
+
+        signal = trainer.callback_signal
+        if signal == "rollback":
+            if checkpoint_path is None or not checkpoint_path.exists():
+                if verbose:
+                    print(
+                        "[WARN] Rollback requested but no checkpoint available; continuing."
+                    )
+                promotion_signal = None
+                break
+            try:
+                restore_blob = torch.load(checkpoint_path, map_location="cpu")
+            except Exception as exc:
+                print(
+                    f"[WARN] Failed to load checkpoint for rollback {checkpoint_path}: {exc}"
+                )
+                promotion_signal = None
+                break
+
+            model.load_state_dict(restore_blob.get("model_state", model.state_dict()))
+            if not reset_optimizer:
+                opt_state = restore_blob.get("optimizer_state")
+                if opt_state is not None:
+                    optimizer.load_state_dict(opt_state)
+            _restore_rng_state(restore_blob.get("rng_state"))
+
+            restored_history = restore_blob.get("history", [])
+            trainer.history = [dict(entry) for entry in restored_history]
+            trainer.total_epochs_trained = int(restore_blob.get("epoch", start_epoch))
+            trainer.last_run_epochs = 0
+            start_epoch = trainer.total_epochs_trained
+            if hierarchy_monitor is not None:
+                hierarchy_monitor.reset_after_rollback()
+                _increase_parsimony(model)
+            mlflow_last_logged_step = max(mlflow_last_logged_step, start_epoch)
+            trainer.callback_signal = None
+            continue
+
+        promotion_signal = signal
+        start_epoch = trainer.total_epochs_trained
+        break
 
     if trainer.early_stop_epoch is not None:
         message = f"Early stop at epoch {trainer.early_stop_epoch}: {trainer.early_stop_reason}"
@@ -1541,9 +1967,241 @@ def train_scae_on_graph(
         "calibration_summary": calibration_summary,
         "effective_learning_rate": effective_learning_rate,
         "gate_threshold": gate_threshold,
+        "promotion_signal": promotion_signal,
     }
 
     return model, partition, history, training_summary
+
+
+def build_supergraph_from_partition(
+    graph: MultiplexGraph,
+    partition: PartitionResult,
+    level_idx: int,
+) -> MultiplexGraph:
+    node_ids = graph.node_ids
+    node_types = graph.data.node_types.cpu().numpy()
+    node_to_cluster = partition.node_to_cluster
+    if isinstance(node_to_cluster, torch.Tensor):
+        cluster_assignments = node_to_cluster.detach().cpu().numpy().astype(int)
+    elif isinstance(node_to_cluster, np.ndarray):
+        cluster_assignments = node_to_cluster.astype(int)
+    elif isinstance(node_to_cluster, Mapping):
+        cluster_assignments = np.array(
+            [int(node_to_cluster[str(node_id)]) for node_id in node_ids], dtype=int
+        )
+    else:
+        cluster_assignments = np.array(
+            [int(node_to_cluster[idx]) for idx in range(len(node_ids))], dtype=int
+        )
+    unique_clusters = np.array(sorted(np.unique(cluster_assignments)), dtype=int)
+    cluster_index = {cluster: idx for idx, cluster in enumerate(unique_clusters)}
+    num_clusters = unique_clusters.size
+
+    cluster_members: Dict[int, List[int]] = {idx: [] for idx in range(num_clusters)}
+    for node_idx, cluster in enumerate(cluster_assignments):
+        cluster_members[cluster_index[cluster]].append(node_idx)
+
+    aggregated_types = []
+    for idx in range(num_clusters):
+        members = cluster_members[idx]
+        if not members:
+            aggregated_types.append(0)
+            continue
+        type_counts = np.bincount(node_types[members])
+        aggregated_types.append(int(type_counts.argmax()))
+
+    edge_index = graph.data.edge_index
+    edge_type_tensor = getattr(graph.data, "edge_type", None)
+    new_edges: List[Tuple[int, int]] = []
+    new_edge_types: List[int] = []
+    for edge_idx in range(edge_index.size(1)):
+        src = int(edge_index[0, edge_idx])
+        dst = int(edge_index[1, edge_idx])
+        c_src = cluster_index[int(cluster_assignments[src])]
+        c_dst = cluster_index[int(cluster_assignments[dst])]
+        new_edges.append((c_src, c_dst))
+        if edge_type_tensor is not None and edge_type_tensor.numel() > 0:
+            new_edge_types.append(int(edge_type_tensor[edge_idx].item()))
+
+    if new_edges:
+        new_edge_index = torch.tensor(new_edges, dtype=torch.long).t().contiguous()
+    else:
+        new_edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    if new_edge_types:
+        new_edge_type = torch.tensor(new_edge_types, dtype=torch.long)
+    else:
+        new_edge_type = torch.empty((0,), dtype=torch.long)
+
+    cluster_node_ids = [f"L{level_idx}_C{cluster}" for cluster in unique_clusters]
+    cluster_node_labels = [
+        f"Level{level_idx}::{cluster}" for cluster in unique_clusters
+    ]
+    aggregated_attributes: List[Dict[str, Any]] = []
+    for idx, members in cluster_members.items():
+        attrs = {"members": [node_ids[m] for m in members]}
+        aggregated_attributes.append(attrs)
+
+    data = Data(
+        node_types=torch.tensor(aggregated_types, dtype=torch.long),
+        edge_index=new_edge_index,
+        edge_type=new_edge_type,
+    )
+    data.node_names = cluster_node_labels
+    data.node_ids = cluster_node_ids
+    data.node_type_names = list(graph.node_type_index.keys())
+    data.edge_type_names = list(graph.relation_index.keys())
+    data.node_attributes = aggregated_attributes
+
+    return MultiplexGraph(
+        data=data,
+        node_index={node_id: idx for idx, node_id in enumerate(cluster_node_ids)},
+        node_type_index=graph.node_type_index,
+        relation_index=graph.relation_index,
+        node_attributes=aggregated_attributes,
+        node_labels=cluster_node_labels,
+        node_ids=cluster_node_ids,
+    )
+
+
+def train_hierarchical_scae(
+    graph: MultiplexGraph,
+    args,
+    base_kwargs: Dict[str, Any],
+    hierarchy_config: HierarchyConfig,
+    mlflow_client: Optional[Any],
+    initial_checkpoint_blob: Optional[Mapping[str, Any]],
+    resume_mlflow_run_id: Optional[str],
+    mlflow_last_logged_step: Optional[int],
+) -> Tuple[
+    SelfCompressingRGCNAutoEncoder,
+    PartitionResult,
+    List[Dict[str, float]],
+    Dict[str, Any],
+    List[PartitionResult],
+    Path,
+]:
+    current_graph = graph
+    all_partitions: List[PartitionResult] = []
+    accumulated_mdls: List[float] = []
+    promotion_dir = None
+    if hierarchy_config.promotion_metadata_path is not None:
+        promotion_dir = hierarchy_config.promotion_metadata_path
+
+    model = None
+    partition = None
+    history: List[Dict[str, float]] = []
+    training_summary: Dict[str, Any] = {}
+    checkpoint_blob = initial_checkpoint_blob
+    run_id = resume_mlflow_run_id
+    last_logged_step = mlflow_last_logged_step
+
+    final_output_path = Path(args.out)
+
+    for level in range(max(1, hierarchy_config.max_levels)):
+        level_out_path = Path(args.out)
+        if hierarchy_config.max_levels > 1:
+            stem = level_out_path.stem
+            suffix = level_out_path.suffix or ".json"
+            level_out_path = level_out_path.with_name(f"{stem}_L{level}{suffix}")
+        if (
+            level == hierarchy_config.max_levels - 1
+            or not hierarchy_config.enable_hierarchy
+        ):
+            final_output_path = level_out_path
+
+        level_checkpoint_path = None
+        if args.checkpoint_path is not None:
+            base_ckpt = args.checkpoint_path
+            if hierarchy_config.max_levels > 1:
+                stem = base_ckpt.stem
+                suffix = base_ckpt.suffix or ".pt"
+                level_checkpoint_path = base_ckpt.with_name(f"{stem}_L{level}{suffix}")
+            else:
+                level_checkpoint_path = base_ckpt
+
+        tracker_path = None
+        if level_checkpoint_path is not None:
+            tracker_path = _checkpoint_tracker_path(level_checkpoint_path)
+
+        monitor = None
+        if hierarchy_config.enable_hierarchy:
+            metadata_dir = None
+            if promotion_dir is not None:
+                metadata_dir = promotion_dir / f"level_{level}"
+            monitor = HierarchyMonitor(
+                level_index=level,
+                config=hierarchy_config,
+                graph=current_graph,
+                gate_threshold=base_kwargs.get("gate_threshold", 0.5),
+                min_cluster_mass=hierarchy_config.min_cluster_mass,
+                vi_log_base=hierarchy_config.vi_log_base,
+                promotion_dir=metadata_dir,
+            )
+
+        model, partition, history, training_summary = train_scae_on_graph(
+            graph=current_graph,
+            checkpoint_path=level_checkpoint_path,
+            checkpoint_every=args.checkpoint_every,
+            resume=args.resume_from_checkpoint and level == 0,
+            reset_optimizer=args.reset_optimizer,
+            checkpoint_blob=checkpoint_blob if level == 0 else None,
+            mlflow_run_id=run_id,
+            mlflow_last_logged_step=last_logged_step,
+            mlflow_tracker_path=tracker_path,
+            hierarchy_monitor=monitor,
+            **base_kwargs,
+        )
+
+        all_partitions.append(partition)
+        final_loss = history[-1].get("total_loss") if history else None
+        if final_loss is not None:
+            accumulated_mdls.append(float(final_loss))
+
+        try:
+            save_partition(partition, level_out_path, current_graph)
+        except Exception as exc:
+            print(f"[WARN] Failed to save hierarchy level {level} partition: {exc}")
+
+        if hierarchy_config.enable_hierarchy and monitor is not None:
+            if monitor.metadata_dir is not None:
+                meta_path = monitor.metadata_dir / "metrics.json"
+                try:
+                    monitor.metadata_dir.mkdir(parents=True, exist_ok=True)
+                    meta_payload = {
+                        "level": level,
+                        "epochs": [asdict(m) for m in monitor.history],
+                        "best_checkpoint_epoch": monitor.best_checkpoint_epoch,
+                    }
+                    meta_path.write_text(
+                        json.dumps(meta_payload, indent=2), encoding="utf-8"
+                    )
+                except Exception:
+                    pass
+
+        signal = training_summary.get("promotion_signal")
+        if (
+            not hierarchy_config.enable_hierarchy
+            or signal != "promote"
+            or level + 1 >= hierarchy_config.max_levels
+        ):
+            break
+
+        current_graph = build_supergraph_from_partition(
+            current_graph, partition, level_idx=level + 1
+        )
+        checkpoint_blob = None
+        last_logged_step = training_summary.get("mlflow_last_logged_step")
+
+    final_partition = all_partitions[-1]
+    return (
+        model,
+        final_partition,
+        history,
+        training_summary,
+        all_partitions,
+        final_output_path,
+    )
 
 
 def save_partition(
@@ -1862,6 +2520,60 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Additional MLflow tag(s) as KEY=VALUE. May be supplied multiple times.",
     )
+    parser.add_argument(
+        "--hierarchy-levels",
+        type=int,
+        default=1,
+        help="Number of hierarchical promotions to attempt (1 disables hierarchy).",
+    )
+    parser.add_argument(
+        "--hierarchy-window",
+        type=int,
+        default=10,
+        help="Rolling window size (in epochs) for stability detection.",
+    )
+    parser.add_argument(
+        "--hierarchy-ari-threshold",
+        type=float,
+        default=0.985,
+        help="Mean ARI threshold over the stability window to trigger promotion.",
+    )
+    parser.add_argument(
+        "--hierarchy-vi-factor",
+        type=float,
+        default=0.02,
+        help="Multiplier for log(N) used to bound variation of information range.",
+    )
+    parser.add_argument(
+        "--hierarchy-min-cluster-mass",
+        type=float,
+        default=0.005,
+        help="Minimum average cluster mass required during promotion checks.",
+    )
+    parser.add_argument(
+        "--hierarchy-mdl-delta",
+        type=float,
+        default=1e-3,
+        help="Maximum relative change in MDL allowed across the stability window.",
+    )
+    parser.add_argument(
+        "--hierarchy-entropy-var",
+        type=float,
+        default=1e-4,
+        help="Maximum variance of gate entropy over the window to treat as stable.",
+    )
+    parser.add_argument(
+        "--hierarchy-hysteresis-frac",
+        type=float,
+        default=0.10,
+        help="Fractional increase in effective clusters that triggers hysteresis rollback when sustained.",
+    )
+    parser.add_argument(
+        "--hierarchy-hysteresis-epochs",
+        type=int,
+        default=5,
+        help="Number of consecutive epochs violating hysteresis before rollback.",
+    )
     return parser
 
 
@@ -1912,9 +2624,26 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--checkpoint-every must be non-negative")
     if args.resume_from_checkpoint and args.checkpoint_path is None:
         parser.error("--resume-from-checkpoint requires --checkpoint-path")
+    if args.hierarchy_levels < 1:
+        parser.error("--hierarchy-levels must be at least 1")
+    if args.hierarchy_window < 1:
+        parser.error("--hierarchy-window must be positive")
 
     if args.stability and args.ego_samples == 0:
         args.ego_samples = 256
+
+    hierarchy_config = HierarchyConfig(
+        max_levels=max(1, args.hierarchy_levels),
+        stability_window=args.hierarchy_window,
+        ari_threshold=args.hierarchy_ari_threshold,
+        vi_threshold_factor=args.hierarchy_vi_factor,
+        min_cluster_mass=args.hierarchy_min_cluster_mass,
+        mdl_delta_threshold=args.hierarchy_mdl_delta,
+        entropy_var_threshold=args.hierarchy_entropy_var,
+        hysteresis_fraction=args.hierarchy_hysteresis_frac,
+        hysteresis_epochs=args.hierarchy_hysteresis_epochs,
+        enable_hierarchy=args.hierarchy_levels > 1,
+    )
 
     pos_edge_chunk = args.pos_edge_chunk if args.pos_edge_chunk > 0 else None
     neg_edge_chunk = args.neg_edge_chunk if args.neg_edge_chunk > 0 else None
@@ -2090,58 +2819,85 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
             epoch_logger = _epoch_logger
 
-        model, partition, history, training_summary = train_scae_on_graph(
-            graph,
-            num_clusters=effective_num_clusters,
-            hidden_dims=args.hidden,
-            max_epochs=args.max_epochs,
-            min_epochs=args.min_epochs,
-            cluster_stability_window=args.cluster_stability_window,
-            cluster_stability_tolerance=args.cluster_stability_tol,
-            cluster_stability_relative_tolerance=args.cluster_stability_rel_tol,
-            lr=args.lr,
-            negative_sampling_ratio=args.negative_sampling,
-            gate_threshold=args.gate_threshold,
-            min_cluster_size=args.min_cluster_size,
-            device=args.device,
-            verbose=not args.quiet,
-            entropy_weight=args.entropy_weight,
-            dirichlet_alpha=args.dirichlet_alpha,
-            dirichlet_weight=args.dirichlet_weight,
-            embedding_norm_weight=args.embedding_norm_weight,
-            kld_weight=args.kld_weight,
-            entropy_eps=args.entropy_eps,
-            max_negatives=args.max_negatives,
-            batch_size=args.batch_size,
-            ego_samples=args.ego_samples,
-            ego_alpha=args.ego_alpha,
-            ego_min_radius=args.ego_min_radius,
-            ego_max_radius=args.ego_max_radius,
-            ego_seed=args.ego_seed,
-            ego_min_nodes=args.ego_min_nodes,
-            ego_min_edges=args.ego_min_edges,
-            ego_max_nodes=args.ego_max_nodes,
-            ego_max_edges=args.ego_max_edges,
-            node_budget=args.node_budget,
-            epoch_callback=epoch_logger,
-            cache_node_attributes=not args.no_attr_cache,
-            mixed_precision=args.mixed_precision,
-            grad_accum_steps=args.grad_accum,
-            max_grad_norm=args.max_grad_norm,
-            empty_cache_each_epoch=args.cuda_empty_cache,
-            gradient_checkpointing=args.gradient_checkpointing,
-            pos_edge_chunk_size=pos_edge_chunk,
-            neg_edge_chunk_size=neg_edge_chunk,
-            checkpoint_path=args.checkpoint_path,
-            checkpoint_every=args.checkpoint_every,
-            resume=args.resume_from_checkpoint,
-            reset_optimizer=args.reset_optimizer,
-            checkpoint_blob=checkpoint_blob,
-            mlflow_run_id=active_run_id,
-            mlflow_last_logged_step=mlflow_last_logged_step,
-            mlflow_tracker_path=mlflow_tracker_path,
-            calibration_epochs=args.calibration_epochs,
-        )
+        train_kwargs = {
+            "num_clusters": effective_num_clusters,
+            "hidden_dims": args.hidden,
+            "max_epochs": args.max_epochs,
+            "min_epochs": args.min_epochs,
+            "cluster_stability_window": args.cluster_stability_window,
+            "cluster_stability_tolerance": args.cluster_stability_tol,
+            "cluster_stability_relative_tolerance": args.cluster_stability_rel_tol,
+            "lr": args.lr,
+            "negative_sampling_ratio": args.negative_sampling,
+            "gate_threshold": args.gate_threshold,
+            "min_cluster_size": args.min_cluster_size,
+            "device": args.device,
+            "verbose": not args.quiet,
+            "entropy_weight": args.entropy_weight,
+            "dirichlet_alpha": args.dirichlet_alpha,
+            "dirichlet_weight": args.dirichlet_weight,
+            "embedding_norm_weight": args.embedding_norm_weight,
+            "kld_weight": args.kld_weight,
+            "entropy_eps": args.entropy_eps,
+            "max_negatives": args.max_negatives,
+            "batch_size": args.batch_size,
+            "ego_samples": args.ego_samples,
+            "ego_alpha": args.ego_alpha,
+            "ego_min_radius": args.ego_min_radius,
+            "ego_max_radius": args.ego_max_radius,
+            "ego_seed": args.ego_seed,
+            "ego_min_nodes": args.ego_min_nodes,
+            "ego_min_edges": args.ego_min_edges,
+            "ego_max_nodes": args.ego_max_nodes,
+            "ego_max_edges": args.ego_max_edges,
+            "node_budget": args.node_budget,
+            "epoch_callback": epoch_logger,
+            "cache_node_attributes": not args.no_attr_cache,
+            "mixed_precision": args.mixed_precision,
+            "grad_accum_steps": args.grad_accum,
+            "max_grad_norm": args.max_grad_norm,
+            "empty_cache_each_epoch": args.cuda_empty_cache,
+            "gradient_checkpointing": args.gradient_checkpointing,
+            "pos_edge_chunk_size": pos_edge_chunk,
+            "neg_edge_chunk_size": neg_edge_chunk,
+            "calibration_epochs": args.calibration_epochs,
+        }
+
+        if hierarchy_config.enable_hierarchy:
+            (
+                model,
+                partition,
+                history,
+                training_summary,
+                all_partitions,
+                final_output_path,
+            ) = train_hierarchical_scae(
+                graph,
+                args,
+                base_kwargs=train_kwargs,
+                hierarchy_config=hierarchy_config,
+                mlflow_client=mlflow_client,
+                initial_checkpoint_blob=checkpoint_blob,
+                resume_mlflow_run_id=active_run_id,
+                mlflow_last_logged_step=mlflow_last_logged_step,
+            )
+        else:
+            tracker_path = mlflow_tracker_path
+            model, partition, history, training_summary = train_scae_on_graph(
+                graph,
+                checkpoint_path=args.checkpoint_path,
+                checkpoint_every=args.checkpoint_every,
+                resume=args.resume_from_checkpoint,
+                reset_optimizer=args.reset_optimizer,
+                checkpoint_blob=checkpoint_blob,
+                mlflow_run_id=active_run_id,
+                mlflow_last_logged_step=mlflow_last_logged_step,
+                mlflow_tracker_path=tracker_path,
+                hierarchy_monitor=None,
+                **train_kwargs,
+            )
+            all_partitions = [partition]
+            final_output_path = Path(args.out)
 
         epochs_completed_this_run = int(
             training_summary.get("epochs_trained", len(history))
@@ -2236,6 +2992,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 "start_epoch_resume",
                 float(training_summary.get("start_epoch", 0)),
             )
+            if hierarchy_config.enable_hierarchy:
+                mlflow_client.log_param(
+                    "hierarchy_levels_completed", len(all_partitions)
+                )
             type_embedding = getattr(model.encoder, "node_type_embedding", None)
             if type_embedding is not None and hasattr(type_embedding, "embedding_dim"):
                 mlflow_client.log_param(
@@ -2255,9 +3015,14 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "checkpoint_path", training_summary["checkpoint_path"]
                 )
 
-        save_partition(partition, args.out, graph)
+        output_path = (
+            final_output_path if hierarchy_config.enable_hierarchy else Path(args.out)
+        )
+        if not hierarchy_config.enable_hierarchy:
+            save_partition(partition, output_path, graph)
+
         if mlflow_client is not None:
-            mlflow_client.log_artifact(str(args.out))
+            mlflow_client.log_artifact(str(output_path))
             mlflow_client.log_metric(
                 "partition_active_clusters", len(partition.active_clusters)
             )
@@ -2272,8 +3037,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 f"[INFO] Checkpoint stored at {checkpoint_display} after {total_epochs_completed} total epochs"
             )
 
+    output_path = (
+        final_output_path if hierarchy_config.enable_hierarchy else Path(args.out)
+    )
     print(
-        f"Saved partition with {len(partition.active_clusters)} clusters to {args.out}"
+        f"Saved partition with {len(partition.active_clusters)} clusters to {output_path}"
     )
 
 

@@ -2142,6 +2142,7 @@ class OnlineTrainer:
         self.history: List[Dict[str, float]] = []
         self.total_epochs_trained: int = 0
         self.last_run_epochs: int = 0
+        self.callback_signal: Optional[Any] = None
         # Track node counts per graph so we can bucket by size or enforce budgets.
         self._node_sizes: List[int] = []
         self.early_stop_epoch: Optional[int] = None
@@ -2333,6 +2334,7 @@ class OnlineTrainer:
         self.early_stop_reason = None
         self.last_run_epochs = 0
         initial_history_len = len(self.history)
+        self.callback_signal = None
 
         pin_memory = self.device.type == "cuda"
         loader_kwargs = {"pin_memory": pin_memory}
@@ -2498,12 +2500,12 @@ class OnlineTrainer:
             self.history.append(averaged_metrics)
             self.last_run_epochs = len(self.history) - initial_history_len
             last_epoch = epoch
+            callback_result = None
             if on_epoch_end is not None:
-                try:
-                    on_epoch_end(epoch, averaged_metrics)
-                except Exception:
-                    # Ensure training continues even if logging hook fails.
-                    pass
+                callback_result = on_epoch_end(epoch, averaged_metrics)
+            if callback_result is not None:
+                self.callback_signal = callback_result
+                break
 
             if verbose:
                 print(
