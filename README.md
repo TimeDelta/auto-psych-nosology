@@ -250,6 +250,15 @@ Each gate draw is blended with an exponential moving average, reducing the varia
 When a gate does fall dormant yet still receives assignment mass, a revival routine resets its log-parameter toward neutrality, reintroducing it into the active set.
 Detailed diagnostics—expected $L_0$ counts, instantaneous gate entropy, and gate samples—are recorded every epoch so that emerging instabilities are observable.
 
+##### Gate Revival Hook
+During every optimisation step the trainer measures both the instantaneous hard-concrete sample for each cluster gate and its mean assignment mass within the mini-batch.
+If a gate’s sample drops below `revival_gate_threshold` (default 0.05) while the same cluster is still attracting more than `revival_usage_threshold` of the assignment probability (default 0.05), the hook treats the gate as “dormant but demanded” and rewrites its underlying `log_alpha` back to the neutral revival logit (0.0).
+That reset returns the gate to the middle of the stretched hard-concrete interval so that subsequent temperature annealing and sparsity penalties can decide afresh whether the unit should remain active.
+
+Setting either threshold to `0` disables the hook entirely, which can be helpful when intentionally pruning clusters.
+Custom values can be supplied by overriding `SelfCompressingRGCNAutoEncoder(..., revival_gate_threshold=..., revival_usage_threshold=...)` inside `train_rgcn_scae.py` (or an equivalent trainer), ensuring that scripted runs inherit the desired policy without modifying the core module.
+The hook operates before cluster-usage statistics are logged, so metrics such as `expected_active_clusters`, `gate_entropy_bits`, and `realized_active_clusters` in MLflow or console histories always reflect the post-revival state.
+
 ##### Controlling Message-Passing Drift
 Multiplex message passing threatens to over-smooth node representations, especially in the presence of hubs.
 The encoder therefore drops edges at random and in proportion to degree, weakening the dominance of high-degree nodes while preserving the connectivity needed for learning.
