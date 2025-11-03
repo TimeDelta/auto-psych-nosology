@@ -32,11 +32,12 @@ python align_partitions.py \
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -196,32 +197,262 @@ def _contains_any(text: str, subs: list[str]) -> bool:
     return any(sub in t for sub in subs)
 
 
+def _match_rules_multi(text: str, rules: list[tuple[list[str], str]]) -> list[str]:
+    """Return every label whose keyword list is found in the provided text."""
+    matches: list[str] = []
+    for keys, lab in rules:
+        if _contains_any(text, keys):
+            matches.append(lab)
+    return matches
+
+
+def _default_data_path(*parts: str) -> Path:
+    base = Path(__file__).resolve().parent
+    return base.joinpath(*parts)
+
+
+def _node_text_candidates(G: nx.Graph, nid: str) -> list[str]:
+    texts: list[str] = []
+    node_data = G.nodes[nid]
+    for field in ("name", "canonical_name", "group_name_bert", "node_identifier"):
+        val = node_data.get(field)
+        if val:
+            texts.append(str(val))
+    meta_raw = node_data.get("metadata")
+    if meta_raw:
+        try:
+            meta_obj = json.loads(meta_raw)
+            if isinstance(meta_obj, dict):
+                texts.extend(str(v) for v in meta_obj.values() if isinstance(v, str))
+            else:
+                texts.append(str(meta_raw))
+        except json.JSONDecodeError:
+            texts.append(str(meta_raw))
+    return texts
+
+
+_HPO_FRAMEWORK_CACHE: dict[
+    str, tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]
+] = {}
+
+
+def _load_hpo_framework_maps(
+    hpo_terms_path: Path,
+    hitop_rules: list[tuple[list[str], str]],
+    rdoc_rules: list[tuple[list[str], str]],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    cache_key = str(hpo_terms_path.resolve())
+    if cache_key in _HPO_FRAMEWORK_CACHE:
+        return _HPO_FRAMEWORK_CACHE[cache_key]
+
+    if not hpo_terms_path.exists():
+        result = ({}, {})
+        _HPO_FRAMEWORK_CACHE[cache_key] = result
+        return result
+
+    records: dict[str, dict[str, list[str]]] = {}
+    children: defaultdict[str, list[str]] = defaultdict(list)
+
+    with hpo_terms_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            term_id = (row.get("id") or "").strip()
+            if not term_id:
+                continue
+            name = (row.get("name") or "").strip()
+            synonyms_raw = row.get("synonyms") or ""
+            synonyms = [s.strip() for s in synonyms_raw.split("|") if s.strip()]
+            texts = [name] if name else []
+            texts.extend(synonyms)
+            parents_raw = row.get("parents") or ""
+            parents = [p.strip() for p in parents_raw.split("|") if p.strip()]
+            records[term_id] = {"texts": texts, "parents": parents}
+            for parent in parents:
+                children[parent].append(term_id)
+
+    hitop_map: dict[str, set[str]] = {term: set() for term in records}
+    rdoc_map: dict[str, set[str]] = {term: set() for term in records}
+
+    for term, info in records.items():
+        for text in info["texts"]:
+            hitop_map[term].update(_match_rules_multi(text, hitop_rules))
+            rdoc_map[term].update(_match_rules_multi(text, rdoc_rules))
+
+    hitop_seed = {term for term, labels in hitop_map.items() if labels}
+    rdoc_seed = {term for term, labels in rdoc_map.items() if labels}
+
+    def propagate_down(seed_terms: set[str], label_map: dict[str, set[str]]):
+        queue: deque[str] = deque(seed_terms)
+        visited: set[str] = set()
+        while queue:
+            term = queue.popleft()
+            if term in visited:
+                continue
+            visited.add(term)
+            labels = label_map.get(term)
+            if not labels:
+                continue
+            for child in children.get(term, []):
+                if child in label_map and not label_map[child]:
+                    label_map[child] = set(labels)
+                    queue.append(child)
+
+    propagate_down(hitop_seed, hitop_map)
+    propagate_down(rdoc_seed, rdoc_map)
+
+    frozen_hitop = {
+        term: tuple(sorted(labels)) for term, labels in hitop_map.items() if labels
+    }
+    frozen_rdoc = {
+        term: tuple(sorted(labels)) for term, labels in rdoc_map.items() if labels
+    }
+
+    result = (frozen_hitop, frozen_rdoc)
+    _HPO_FRAMEWORK_CACHE[cache_key] = result
+    return result
+
+
 def infer_framework_labels_tailored(
-    G: nx.Graph, prop_depth: int = 1
+    G: nx.Graph,
+    prop_depth: int = 1,
+    hpo_terms_path: Path | None = None,
 ) -> tuple[pd.Series, pd.Series]:
-    """Auto-infer HiTOP & RDoC from node attributes + edges; control RDoC propagation depth."""
+    """Auto-infer HiTOP & RDoC from node attributes, ontology links, and graph propagation."""
     HITOP_RULES = [
         (
-            ["schizo", "psychosis", "halluc", "delusion", "mania", "manic"],
+            [
+                "schizo",
+                "psychosis",
+                "halluc",
+                "delusion",
+                "mania",
+                "manic",
+                "psychotic",
+                "paranoi",
+                "catatoni",
+                "thought disorder",
+                "grandiose",
+            ],
             "Thought Disorder",
         ),
-        (["depress", "anhedon", "dysthym"], "Internalizing"),
-        (["anx", "phobi", "panic", "ptsd", "worry", "ruminat"], "Internalizing"),
-        (["somat", "functional neurolog", "conversion"], "Somatoform"),
         (
-            ["adhd", "impuls", "substance", "alcohol", "nicotin"],
+            [
+                "depress",
+                "anhedon",
+                "dysthym",
+                "melanchol",
+                "sadness",
+                "hopeless",
+                "tearful",
+                "worthless",
+                "suicid",
+                "self-harm",
+                "self harm",
+                "low mood",
+            ],
+            "Internalizing",
+        ),
+        (
+            [
+                "anx",
+                "phobi",
+                "panic",
+                "ptsd",
+                "worry",
+                "ruminat",
+                "fear",
+                "stress",
+                "trauma",
+                "hypervigil",
+                "avoidant",
+            ],
+            "Internalizing",
+        ),
+        (
+            [
+                "somat",
+                "functional neurolog",
+                "conversion",
+                "psychogenic",
+                "bodily distress",
+                "somatoform",
+                "medically unexplained",
+            ],
+            "Somatoform",
+        ),
+        (
+            [
+                "adhd",
+                "impuls",
+                "hyperactiv",
+                "substance",
+                "alcohol",
+                "nicotin",
+                "addict",
+                "gambl",
+                "binge",
+                "opiate",
+            ],
             "Disinhibited Externalizing",
         ),
         (
-            ["oppositional defiant", "conduct", "antisocial", "anger", "aggress"],
+            [
+                "oppositional defiant",
+                "odd",
+                "conduct",
+                "antisocial",
+                "anger",
+                "aggress",
+                "hostil",
+                "violence",
+                "rage",
+                "irritab",
+            ],
             "Antagonistic Externalizing",
         ),
-        (["withdraw", "detachment", "asocial"], "Detachment"),
-        (["obsess", "compuls"], "Obsessive/Compulsive"),
+        (
+            [
+                "withdraw",
+                "detachment",
+                "asocial",
+                "apathy",
+                "avolition",
+                "social withdrawal",
+            ],
+            "Detachment",
+        ),
+        (["obsess", "compuls", "ritual", "checking", "hoard"], "Obsessive/Compulsive"),
     ]
     RDOC_RULES = [
-        (["fear", "threat", "loss", "stress", "avoid"], "Negative Valence"),
-        (["reward", "approach", "motivat", "reinforc"], "Positive Valence"),
+        (
+            [
+                "fear",
+                "threat",
+                "loss",
+                "stress",
+                "avoid",
+                "worry",
+                "anxi",
+                "panic",
+                "trauma",
+                "distress",
+            ],
+            "Negative Valence",
+        ),
+        (
+            [
+                "reward",
+                "approach",
+                "motivat",
+                "reinforc",
+                "pleasure",
+                "seeking",
+                "craving",
+                "anticipat",
+                "habit",
+            ],
+            "Positive Valence",
+        ),
         (
             [
                 "memory",
@@ -231,18 +462,55 @@ def infer_framework_labels_tailored(
                 "language",
                 "cognitive",
                 "cognition",
+                "learning",
+                "perception",
+                "decision",
+                "planning",
             ],
             "Cognitive Systems",
         ),
         (
-            ["empathy", "attachment", "face", "theory of mind", "social"],
+            [
+                "empathy",
+                "attachment",
+                "face",
+                "theory of mind",
+                "social",
+                "communication",
+                "affiliation",
+                "interaction",
+                "relationship",
+            ],
             "Social Processes",
         ),
         (
-            ["sleep", "circadian", "arousal", "autonomic", "homeostasis"],
+            [
+                "sleep",
+                "circadian",
+                "arousal",
+                "autonomic",
+                "homeostasis",
+                "insomnia",
+                "wake",
+                "fatigue",
+                "alertness",
+                "stress reactivity",
+            ],
             "Arousal/Regulatory Systems",
         ),
-        (["motor", "sensorimotor", "movement"], "Sensorimotor Systems"),
+        (
+            [
+                "motor",
+                "sensorimotor",
+                "movement",
+                "gait",
+                "coordination",
+                "muscle",
+                "balance",
+                "tremor",
+            ],
+            "Sensorimotor Systems",
+        ),
     ]
 
     def map_by_rules(name: str, rules):
@@ -250,6 +518,27 @@ def infer_framework_labels_tailored(
             if _contains_any(name, keys):
                 return lab
         return None
+
+    def first_label_from_texts(texts: list[str], rules) -> str | None:
+        for text in texts:
+            lab = map_by_rules(text, rules)
+            if lab:
+                return lab
+        return None
+
+    resolved_hpo: Path | None
+    if hpo_terms_path is not None:
+        resolved_hpo = Path(hpo_terms_path)
+    else:
+        default_hpo = _default_data_path("data", "hpo", "hpo_terms.csv")
+        resolved_hpo = default_hpo if default_hpo.exists() else None
+
+    hpo_hitop_map: dict[str, tuple[str, ...]] = {}
+    hpo_rdoc_map: dict[str, tuple[str, ...]] = {}
+    if resolved_hpo and resolved_hpo.exists():
+        hpo_hitop_map, hpo_rdoc_map = _load_hpo_framework_maps(
+            resolved_hpo, HITOP_RULES, RDOC_RULES
+        )
 
     raw_node_type = nx.get_node_attributes(G, "node_type")
     node_type = {n: _norm(raw_node_type.get(n, "")) for n in G.nodes}
@@ -274,19 +563,72 @@ def infer_framework_labels_tailored(
     disease_nodes = [n for n, t in node_type.items() if t in DISEASE_TYPES]
     phenotype_nodes = [n for n, t in node_type.items() if t in PHENOTYPE_TYPES]
 
-    hitop, rdoc = {}, {}
+    hitop: dict[str, str] = {}
+    rdoc: dict[str, str] = {}
 
-    # 1) direct labels from disease/phenotype names
+    hpo_nodes = {
+        n for n, data in G.nodes(data=True) if _norm(data.get("ontology", "")) == "hpo"
+    }
+
+    def majority_label(votes: list[str]) -> str | None:
+        if not votes:
+            return None
+        return Counter(votes).most_common(1)[0][0]
+
+    # 1) Use ontology (HPO) mappings where available
+    node_hitop_votes: defaultdict[str, list[str]] = defaultdict(list)
+    node_rdoc_votes: defaultdict[str, list[str]] = defaultdict(list)
+
+    for hpo_node in hpo_nodes:
+        hpo_id = G.nodes[hpo_node].get("ontology_id") or hpo_node
+        h_labels = list(hpo_hitop_map.get(hpo_id, ()))
+        if h_labels:
+            hitop[hpo_node] = majority_label(h_labels) or h_labels[0]
+        r_labels = list(hpo_rdoc_map.get(hpo_id, ()))
+        if r_labels:
+            rdoc[hpo_node] = majority_label(r_labels) or r_labels[0]
+
+    if hpo_hitop_map or hpo_rdoc_map:
+        for u, v, data in G.edges(data=True):
+            if data.get("relation") != "maps_to_hpo":
+                continue
+            if u in hpo_nodes and v in hpo_nodes:
+                continue
+            if u in hpo_nodes:
+                hpo_node, entity = u, v
+            elif v in hpo_nodes:
+                hpo_node, entity = v, u
+            else:
+                continue
+            hpo_id = G.nodes[hpo_node].get("ontology_id") or hpo_node
+            node_hitop_votes[entity].extend(hpo_hitop_map.get(hpo_id, ()))
+            node_rdoc_votes[entity].extend(hpo_rdoc_map.get(hpo_id, ()))
+
+    for node, votes in node_hitop_votes.items():
+        label = majority_label(votes)
+        if label:
+            hitop.setdefault(node, label)
+    for node, votes in node_rdoc_votes.items():
+        label = majority_label(votes)
+        if label:
+            rdoc.setdefault(node, label)
+
+    # 2) fallback to lexical heuristics using node metadata
     for n in disease_nodes + phenotype_nodes:
-        nm = node_name.get(n, n)
-        lab = map_by_rules(nm, HITOP_RULES)
-        if lab:
-            hitop[n] = lab
-        rlab = map_by_rules(nm, RDOC_RULES)
-        if rlab:
-            rdoc[n] = rlab
+        texts = _node_text_candidates(G, n)
+        nm = node_name.get(n)
+        if nm:
+            texts.insert(0, str(nm))
+        if n not in hitop:
+            lab = first_label_from_texts(texts, HITOP_RULES)
+            if lab:
+                hitop[n] = lab
+        if n not in rdoc:
+            rlab = first_label_from_texts(texts, RDOC_RULES)
+            if rlab:
+                rdoc[n] = rlab
 
-    # 2) build adjacency by relation
+    # 3) build adjacency by relation (for downstream propagation)
     disease_to_phen = defaultdict(list)
     disease_to_gene = defaultdict(list)
     disease_to_drug = defaultdict(list)
@@ -318,7 +660,7 @@ def infer_framework_labels_tailored(
                 continue
             disease_to_drug[d].append(dr)
 
-    # 3) RDoC propagation (depth >=1)
+    # 4) RDoC propagation (depth >=1)
     if prop_depth >= 1:
         # disease from phenotype votes
         for d in disease_nodes:
@@ -341,7 +683,7 @@ def infer_framework_labels_tailored(
             if labs:
                 rdoc[dr] = Counter(labs).most_common(1)[0][0]
 
-    # 4) optional 2-hop
+    # 5) optional 2-hop
     if prop_depth >= 2:
         next_votes = defaultdict(list)
         for g, lab in list(rdoc.items()):
@@ -356,7 +698,7 @@ def infer_framework_labels_tailored(
             if labs:
                 rdoc[n] = Counter(labs).most_common(1)[0][0]
 
-    # 5) defaults
+    # 6) defaults for unlabeled clinical nodes
     for n in disease_nodes + phenotype_nodes:
         if n not in hitop:
             hitop[n] = "Unspecified Clinical"
