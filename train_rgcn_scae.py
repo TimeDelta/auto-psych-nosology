@@ -34,6 +34,7 @@ from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph
 
 from nosology_filters import should_drop_nosology_node
+from remove_stranded_nodes import remove_stranded_nodes
 from self_compressing_auto_encoders import (
     NodeAttributeDeepSetEncoder,
     OnlineTrainer,
@@ -255,7 +256,28 @@ def _parse_graphml(
 
 
 def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
-    nodes, edges = _parse_graphml(graphml_path)
+    graphml_path = graphml_path.expanduser()
+    cleaned_path = graphml_path
+    try:
+        _, removed_nodes, _ = remove_stranded_nodes(
+            graphml_path,
+            output_path=None,
+            keep_original=True,
+        )
+        stripped_path = graphml_path.with_suffix(".stripped.graphml")
+        if stripped_path.exists():
+            cleaned_path = stripped_path
+        if removed_nodes:
+            print(
+                f"[train_rgcn_scae] remove_stranded_nodes pruned {removed_nodes} isolated nodes."
+            )
+    except Exception as exc:
+        print(
+            f"[train_rgcn_scae] Warning: remove_stranded_nodes failed ({exc}); proceeding with original graph."
+        )
+        cleaned_path = graphml_path
+
+    nodes, edges = _parse_graphml(cleaned_path)
 
     node_types: List[str] = []
     node_type_index: Dict[str, int] = {}
@@ -1619,7 +1641,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=50,
         help="Minimum number of epochs before the stability criterion can stop training (must be <= --max-epochs).",
     )
-    parser.add_argument("--clusters", type=int, default=None)
+    parser.add_argument(
+        "--clusters",
+        type=int,
+        default=None,
+        help="Override the auto-selected latent cluster capacity (default heuristically scales with graph size).",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
         "--calibration-epochs",
@@ -1681,7 +1708,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--neg-edge-chunk",
         type=int,
-        default=4096,
+        default=16384,
         help="Maximum negative edges decoded per chunk (<=0 disables chunking).",
     )
     parser.add_argument(
@@ -1712,7 +1739,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-negatives",
         type=int,
-        default=20000,
+        default=0,
         help="Maximum negatives per graph (0 lets ratio decide)",
     )
     parser.add_argument("--device", type=str, default=None)
