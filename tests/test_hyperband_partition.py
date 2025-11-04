@@ -16,6 +16,7 @@ from hyperband_partition import (
     EvaluationResult,
     HyperbandSearch,
     SearchSpace,
+    SearchSpaceError,
     Trial,
     _parse_train_overrides,
     compute_fitness,
@@ -217,3 +218,8 @@ def test_parse_train_overrides_accepts_json(tmp_path):
     assert overrides["pos_edge_chunk"] == 256
     assert overrides["flag"] is True
     assert overrides["lr"] == 0.001
+
+
+def test_search_space_rejects_nonpositive_loguniform():
+    with pytest.raises(SearchSpaceError):
+        SearchSpace({"tol": {"distribution": "loguniform", "min": 0.0, "max": 1.0}})

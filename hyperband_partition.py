@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 import numpy as np
 import pandas as pd
+import torch
 
 import align_partitions as align
 from train_rgcn_scae import load_multiplex_graph, save_partition, train_scae_on_graph
@@ -52,9 +53,18 @@ class SearchSpace:
                         raise SearchSpaceError(
                             f"Parameter '{name}' missing '{bound_key}' for distribution."
                         )
-                if float(spec["min"]) >= float(spec["max"]):
+                min_val = float(spec["min"])
+                max_val = float(spec["max"])
+                if min_val >= max_val:
                     raise SearchSpaceError(
                         f"Parameter '{name}' requires min < max for distribution sampling."
+                    )
+                if spec["distribution"] == "loguniform" and (
+                    min_val <= 0 or max_val <= 0
+                ):
+                    raise SearchSpaceError(
+                        f"Parameter '{name}' uses loguniform but has non-positive bounds;"
+                        " use a positive min/max or switch to 'uniform'."
                     )
             else:
                 raise SearchSpaceError(
@@ -461,6 +471,16 @@ class PartitionTrainerEvaluator:
         train_kwargs.setdefault("grad_accum_steps", 1)
         train_kwargs.setdefault("cache_node_attributes", True)
         train_kwargs.setdefault("mixed_precision", False)
+
+        if "cluster_stability_tol" in train_kwargs:
+            train_kwargs.setdefault(
+                "cluster_stability_tolerance", train_kwargs.pop("cluster_stability_tol")
+            )
+        if "cluster_stability_rel_tol" in train_kwargs:
+            train_kwargs.setdefault(
+                "cluster_stability_relative_tolerance",
+                train_kwargs.pop("cluster_stability_rel_tol"),
+            )
 
         min_epochs_override = int(train_kwargs.pop("min_epochs", self.base_min_epochs))
         calibration_override = int(
