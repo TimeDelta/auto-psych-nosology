@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import logging
 import math
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -17,11 +19,20 @@ import pandas as pd
 import torch
 
 import align_partitions as align
-from train_rgcn_scae import load_multiplex_graph, save_partition, train_scae_on_graph
+from train_rgcn_scae import (
+    _mlflow_run,
+    _parse_mlflow_tags,
+    load_multiplex_graph,
+    save_partition,
+    train_scae_on_graph,
+)
 
 # ---------------------------------------------------------------------------
 # Search-space handling
 # ---------------------------------------------------------------------------
+
+
+LOGGER = logging.getLogger("hyperband")
 
 
 class SearchSpaceError(ValueError):
@@ -368,6 +379,13 @@ class HyperbandSearch:
             r = int(self.max_resource * (self.eta ** (-s)))
             r = max(r, self.min_resource)
 
+            LOGGER.info(
+                "[Hyperband] Bracket %d: scheduling %d trial(s) with initial resource %d",
+                s,
+                n,
+                r,
+            )
+
             trials: List[Trial] = []
             for _ in range(n):
                 trials.append(self.sample_trial(trial_counter))
@@ -391,6 +409,14 @@ class HyperbandSearch:
                 r_i = int(r * (self.eta**i))
                 r_i = max(r_i, self.min_resource)
 
+                LOGGER.info(
+                    "[Hyperband] Bracket %d rung %d: evaluating %d trial(s) at resource %d",
+                    s,
+                    i,
+                    len(current_trials),
+                    r_i,
+                )
+
                 rung_results: List[EvaluationResult] = []
                 for trial in current_trials:
                     if (
@@ -406,12 +432,37 @@ class HyperbandSearch:
                     results.append(result)
                     eval_count += 1
 
+                    LOGGER.info(
+                        "[Hyperband] Trial %d (bracket %d rung %d resource %d) finished status=%s fitness=%s duration=%.1fs",
+                        trial.id,
+                        s,
+                        i,
+                        r_i,
+                        result.status,
+                        f"{result.fitness:.4f}"
+                        if math.isfinite(result.fitness)
+                        else "nan",
+                        duration,
+                    )
+                    if result.error:
+                        LOGGER.error(
+                            "[Hyperband] Trial %d error: %s",
+                            trial.id,
+                            result.error,
+                        )
+
                 rung_results.sort(key=lambda res: res.fitness, reverse=True)
 
                 if i < s:
                     next_n = int(math.floor(n * (self.eta ** (-(i + 1)))))
                     next_n = max(1, min(next_n, len(rung_results)))
                     trials = [res.trial for res in rung_results[:next_n]]
+                    LOGGER.info(
+                        "[Hyperband] Bracket %d rung %d: advancing %d trial(s)",
+                        s,
+                        i,
+                        len(trials),
+                    )
 
         return results
 
@@ -482,6 +533,12 @@ class PartitionTrainerEvaluator:
                 train_kwargs.pop("cluster_stability_rel_tol"),
             )
 
+        mlflow_enabled = bool(train_kwargs.pop("mlflow", False))
+        mlflow_tracking_uri = train_kwargs.pop("mlflow_tracking_uri", None)
+        mlflow_experiment = train_kwargs.pop("mlflow_experiment", None)
+        mlflow_run_name = train_kwargs.pop("mlflow_run_name", None)
+        mlflow_tags_raw = train_kwargs.pop("mlflow_tags", None)
+
         min_epochs_override = int(train_kwargs.pop("min_epochs", self.base_min_epochs))
         calibration_override = int(
             train_kwargs.pop("calibration_epochs", self.base_calibration_epochs)
@@ -500,63 +557,99 @@ class PartitionTrainerEvaluator:
             "calibration_epochs": calibration_epochs,
         }
 
+        tags_dict: Dict[str, str] = {}
+        if mlflow_enabled:
+            if _mlflow_run is None or _parse_mlflow_tags is None:
+                raise RuntimeError(
+                    "MLflow overrides supplied but train_rgcn_scae lacks MLflow integration."
+                )
+            if isinstance(mlflow_tags_raw, Mapping):
+                tag_strings = [f"{k}={v}" for k, v in mlflow_tags_raw.items()]
+            elif isinstance(mlflow_tags_raw, (list, tuple, set)):
+                tag_strings = [str(item) for item in mlflow_tags_raw]
+            elif mlflow_tags_raw is not None:
+                tag_strings = [str(mlflow_tags_raw)]
+            else:
+                tag_strings = []
+            tags_dict = _parse_mlflow_tags(tag_strings)
+            mlflow_context = _mlflow_run(
+                enabled=True,
+                tracking_uri=mlflow_tracking_uri,
+                experiment_name=mlflow_experiment,
+                run_name=mlflow_run_name,
+                tags=tags_dict,
+                existing_run_id=train_kwargs.get("mlflow_run_id"),
+            )
+        else:
+            mlflow_context = nullcontext(None)
+
         start_time = time.time()
         try:
-            model, partition, history, summary = train_scae_on_graph(
-                self.multiplex_graph,
-                max_epochs=int(resource),
-                min_epochs=int(effective_min_epochs),
-                calibration_epochs=int(calibration_epochs),
-                **train_kwargs,
-            )
-            del model
+            with mlflow_context as mlflow_client:
+                if (
+                    mlflow_enabled
+                    and mlflow_client is not None
+                    and train_kwargs.get("mlflow_run_id") is None
+                ):
+                    active_run = mlflow_client.active_run()
+                    if active_run is not None:
+                        train_kwargs["mlflow_run_id"] = active_run.info.run_id
 
-            node_ids = self.multiplex_graph.node_ids
-            assignments = partition.node_to_cluster.cpu().tolist()
-            node_to_cluster = {
-                node_ids[i]: int(assignments[i]) for i in range(len(node_ids))
-            }
-
-            outcome = self.alignment_evaluator.evaluate(node_to_cluster)
-            fitness = compute_fitness(outcome, self.fitness_metric)
-
-            info.update(
-                {
-                    "training_summary": summary,
-                    "history_tail": history[-1] if history else {},
-                    "history_length": len(history),
-                }
-            )
-
-            if (
-                isinstance(fitness, float) and math.isnan(fitness)
-            ) or not math.isfinite(fitness):
-                status = "invalid"
-                error = "Fitness resolved to a non-finite value."
-                fitness = float("-inf")
-
-            if (
-                outcome is not None
-                and status == "ok"
-                and math.isfinite(fitness)
-                and (self.best_result is None or fitness > self.best_result.fitness)
-            ):
-                if self.best_partition_path is not None:
-                    save_partition(
-                        partition, self.best_partition_path, self.multiplex_graph
-                    )
-                self.best_result = EvaluationResult(
-                    trial=trial,
-                    bracket=bracket,
-                    rung=rung,
-                    resource=resource,
-                    fitness=fitness,
-                    outcome=outcome,
-                    duration=time.time() - start_time,
-                    status=status,
-                    error=error,
-                    info=info,
+                model, partition, history, summary = train_scae_on_graph(
+                    self.multiplex_graph,
+                    max_epochs=int(resource),
+                    min_epochs=int(effective_min_epochs),
+                    calibration_epochs=int(calibration_epochs),
+                    **train_kwargs,
                 )
+                del model
+
+                node_ids = self.multiplex_graph.node_ids
+                assignments = partition.node_to_cluster.cpu().tolist()
+                node_to_cluster = {
+                    node_ids[i]: int(assignments[i]) for i in range(len(node_ids))
+                }
+
+                outcome = self.alignment_evaluator.evaluate(node_to_cluster)
+                fitness = compute_fitness(outcome, self.fitness_metric)
+
+                info.update(
+                    {
+                        "training_summary": summary,
+                        "history_tail": history[-1] if history else {},
+                        "history_length": len(history),
+                    }
+                )
+
+                if (
+                    isinstance(fitness, float) and math.isnan(fitness)
+                ) or not math.isfinite(fitness):
+                    status = "invalid"
+                    error = "Fitness resolved to a non-finite value."
+                    fitness = float("-inf")
+
+                if (
+                    outcome is not None
+                    and status == "ok"
+                    and math.isfinite(fitness)
+                    and (self.best_result is None or fitness > self.best_result.fitness)
+                ):
+                    if self.best_partition_path is not None:
+                        save_partition(
+                            partition, self.best_partition_path, self.multiplex_graph
+                        )
+                    self.best_result = EvaluationResult(
+                        trial=trial,
+                        bracket=bracket,
+                        rung=rung,
+                        resource=resource,
+                        fitness=fitness,
+                        outcome=outcome,
+                        duration=time.time() - start_time,
+                        status=status,
+                        error=error,
+                        info=info,
+                    )
 
         except Exception as exc:  # pragma: no cover - exercised in failure paths
             status = "error"
@@ -726,12 +819,23 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Path to write the best partition JSON (defaults to outdir/best_partition.json)",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level for Hyperband progress reporting (DEBUG, INFO, WARNING, ERROR)",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = _build_argparser()
     args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
 
     rng = random.Random(args.seed)
 
