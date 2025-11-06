@@ -1568,6 +1568,39 @@ def train_scae_on_graph(
     return model, partition, history, training_summary
 
 
+def save_model_artifact(
+    model: torch.nn.Module,
+    output_path: Path,
+    training_summary: Mapping[str, Any],
+) -> Path:
+    state_dict = model.state_dict()
+    state_dict_type = state_dict.__class__
+    cpu_state = state_dict_type(
+        (
+            key,
+            value.detach().cpu() if torch.is_tensor(value) else copy.deepcopy(value),
+        )
+        for key, value in state_dict.items()
+    )
+
+    payload = {
+        "version": 1,
+        "model_class": type(model).__name__,
+        "state_dict": cpu_state,
+        "training_summary": copy.deepcopy(training_summary),
+        "saved_at": time.time(),
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.suffix:
+        tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    else:
+        tmp_path = output_path.with_name(output_path.name + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(output_path)
+    return output_path
+
+
 def save_partition(
     partition: PartitionResult, output_path: Path, graph: MultiplexGraph
 ) -> None:
@@ -1633,6 +1666,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("partition.json"),
         help="Where to store the resulting partition JSON",
+    )
+    parser.add_argument(
+        "--model-out",
+        type=Path,
+        default=None,
+        help="Optional path for the trained model weights (defaults to <out> with a .pt suffix)",
     )
     parser.add_argument("--max-epochs", type=int, default=200)
     parser.add_argument(
@@ -1919,6 +1958,9 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--max-negatives must be non-negative")
     if args.max_negatives == 0:
         args.max_negatives = None
+
+    if args.model_out is None:
+        args.model_out = args.out.with_suffix(".pt")
     if args.ego_min_radius < 1:
         parser.error("--ego-min-radius must be at least 1")
     if args.ego_max_radius < args.ego_min_radius:
@@ -2029,6 +2071,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 {
                     "graph_path": str(args.graphml),
                     "output_path": str(args.out),
+                    "model_output_path": str(args.model_out),
                     "max_epochs": args.max_epochs,
                     "min_epochs": args.min_epochs,
                     "device": args.device or "auto",
@@ -2170,6 +2213,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             calibration_epochs=args.calibration_epochs,
         )
 
+        training_summary["model_path"] = str(args.model_out)
+        model_artifact_path = save_model_artifact(
+            model, args.model_out, training_summary
+        )
+
         epochs_completed_this_run = int(
             training_summary.get("epochs_trained", len(history))
         )
@@ -2282,8 +2330,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "checkpoint_path", training_summary["checkpoint_path"]
                 )
 
+        print(f"[INFO] Saved trained model weights to {args.model_out}")
         save_partition(partition, args.out, graph)
         if mlflow_client is not None:
+            mlflow_client.log_artifact(str(model_artifact_path))
             mlflow_client.log_artifact(str(args.out))
             mlflow_client.log_metric(
                 "partition_active_clusters", len(partition.active_clusters)
