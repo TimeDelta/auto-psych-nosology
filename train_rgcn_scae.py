@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import random
@@ -48,6 +49,8 @@ GRAPHML_NS = "{http://graphml.graphdrawing.org/xmlns}"
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]{2,}")
 _TEXT_TOKEN_LIMIT_PER_FIELD = 32
 _TEXT_TOKEN_LIMIT_TOTAL = 128
+_NAME_TEXT_EMBED_ATTR = "name_text_embedding"
+_TEXT_EMBED_CACHE_VERSION = 1
 
 
 def _checkpoint_tracker_path(base: Path) -> Path:
@@ -161,6 +164,98 @@ def _parse_bool(value: Optional[str]) -> Optional[bool]:
     return None
 
 
+def _compute_text_fingerprint(node_ids: Sequence[str], texts: Sequence[str]) -> str:
+    hasher = hashlib.sha256()
+    count = min(len(node_ids), len(texts))
+    hasher.update(count.to_bytes(8, "little", signed=False))
+    for node_id, text in zip(node_ids, texts):
+        node_bytes = (node_id or "").encode("utf-8", "surrogatepass")
+        text_bytes = (text or "").encode("utf-8", "surrogatepass")
+        hasher.update(len(node_bytes).to_bytes(4, "little", signed=False))
+        hasher.update(node_bytes)
+        hasher.update(len(text_bytes).to_bytes(4, "little", signed=False))
+        hasher.update(text_bytes)
+    return hasher.hexdigest()
+
+
+def _sanitize_for_filename(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "")
+    sanitized = sanitized.strip("._")
+    if not sanitized:
+        sanitized = "model"
+    return sanitized[:128]
+
+
+def _default_text_embedding_cache_path(
+    graphml_path: Path,
+    model_name: str,
+    normalize: bool,
+    projection_dim: Optional[int],
+) -> Path:
+    safe_model = _sanitize_for_filename(model_name)
+    norm_suffix = "norm" if normalize else "raw"
+    proj_suffix = f"proj{int(projection_dim)}" if projection_dim else "proj0"
+    suffix = (
+        f".{safe_model}.v{_TEXT_EMBED_CACHE_VERSION}.{norm_suffix}.{proj_suffix}.npz"
+    )
+    return graphml_path.with_suffix(suffix)
+
+
+def _project_embeddings_random(
+    embeddings: np.ndarray, output_dim: Optional[int], fingerprint: str
+) -> np.ndarray:
+    if output_dim is None or output_dim <= 0:
+        return embeddings
+    if embeddings.ndim != 2:
+        return embeddings
+    input_dim = embeddings.shape[1]
+    if input_dim == 0 or output_dim >= input_dim:
+        return embeddings
+    seed_bytes = hashlib.sha256(
+        f"{fingerprint}|{input_dim}|{output_dim}".encode("utf-8", "surrogatepass")
+    ).digest()
+    seed_int = int.from_bytes(seed_bytes[:8], "little", signed=False)
+    rng = np.random.default_rng(seed_int)
+    projection = rng.standard_normal((input_dim, output_dim)).astype(np.float32)
+    projection /= math.sqrt(max(output_dim, 1))
+    projected = embeddings @ projection
+    return projected.astype(np.float32, copy=False)
+
+
+def _encode_sentence_embeddings(
+    texts: Sequence[str],
+    model_name: str,
+    device: Optional[str] = None,
+    batch_size: int = 128,
+    normalize: bool = False,
+) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:  # pragma: no cover - import guard
+        raise RuntimeError(
+            "sentence-transformers must be installed to encode node text labels"
+        ) from exc
+
+    resolved_device = device
+    if resolved_device is None or resolved_device.strip().lower() in {"", "auto"}:
+        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = SentenceTransformer(model_name, device=resolved_device)
+    embeddings = model.encode(
+        list(texts),
+        batch_size=max(1, batch_size),
+        convert_to_numpy=True,
+        normalize_embeddings=normalize,
+        show_progress_bar=False,
+    )
+    if embeddings.ndim == 1:
+        embeddings = embeddings.reshape(1, -1)
+    return embeddings.astype(np.float32, copy=False)
+
+
 _NOSOLOGY_NODE_TYPES = {"disease", "disorder", "diagnosis"}
 _NOSOLOGY_NAME_KEYWORDS = {
     "disorder",
@@ -255,8 +350,36 @@ def _parse_graphml(
     return nodes, edges
 
 
-def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
+def load_multiplex_graph(
+    graphml_path: Path,
+    *,
+    text_encoder_model: Optional[str] = "pritamdeka/BioSimCSE-BioBERT-base-clinical",
+    text_encoder_device: Optional[str] = None,
+    text_encoder_batch_size: int = 128,
+    text_encoder_normalize: bool = False,
+    text_embedding_cache: Optional[Path] = None,
+    enable_text_embedding_cache: bool = True,
+    text_encoder_projection_dim: Optional[int] = 128,
+) -> MultiplexGraph:
+    raw_text_encoder_model = text_encoder_model
+    text_encoder_model = None
+    if raw_text_encoder_model:
+        normalized_encoder = raw_text_encoder_model.strip().lower()
+        if normalized_encoder not in {"none", "", "disable", "disabled", "off"}:
+            text_encoder_model = raw_text_encoder_model
+
     graphml_path = graphml_path.expanduser()
+    cache_path: Optional[Path] = None
+    if text_encoder_model and enable_text_embedding_cache:
+        if text_embedding_cache is not None:
+            cache_path = text_embedding_cache.expanduser()
+        else:
+            cache_path = _default_text_embedding_cache_path(
+                graphml_path,
+                text_encoder_model,
+                text_encoder_normalize,
+                text_encoder_projection_dim,
+            )
     cleaned_path = graphml_path
     try:
         _, removed_nodes, _ = remove_stranded_nodes(
@@ -285,6 +408,7 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
     node_attribute_dicts: List[Dict[str, Any]] = []
     node_labels: List[str] = []
     node_ids_ordered: List[str] = []
+    node_texts: List[str] = []
 
     metadata_fields = (
         "disease_metadata",
@@ -312,14 +436,9 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
         if source:
             attr_dict[f"source::{source.lower()}"] = 1.0
 
-        name_value = attrs.get("name")
-        if name_value:
-            name_tokens = _unique_tokens(
-                _tokenize_text(name_value), min(8, token_budget)
-            )
-            for token in name_tokens:
-                attr_dict[f"name_token::{token}"] = 1.0
-            token_budget -= len(name_tokens)
+        raw_name = attrs.get("name")
+        cleaned_name = raw_name.strip() if isinstance(raw_name, str) else ""
+        label_for_node = cleaned_name if cleaned_name else node_id
 
         psy_score = _parse_float(attrs.get("psy_score"))
         if psy_score is not None:
@@ -368,11 +487,115 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
             token_budget -= len(tokens)
 
         node_attribute_dicts.append(attr_dict)
-        node_labels.append(name_value if name_value else node_id)
+        node_labels.append(label_for_node)
         node_ids_ordered.append(node_id)
+        node_texts.append(label_for_node)
 
     if not node_ids_ordered:
         raise ValueError("No nodes remain after filtering nosology-aligned entries.")
+
+    text_embeddings_np: Optional[np.ndarray] = None
+    if text_encoder_model and node_attribute_dicts:
+        target_projection_dim = (
+            text_encoder_projection_dim
+            if text_encoder_projection_dim is not None
+            and text_encoder_projection_dim > 0
+            else None
+        )
+        text_fingerprint = _compute_text_fingerprint(node_ids_ordered, node_texts)
+        cache_loaded = False
+        if cache_path is not None and cache_path.exists():
+            try:
+                with np.load(cache_path, allow_pickle=False) as cached:
+                    cached_version = int(cached["version"][0])
+                    cached_model = str(cached["model_name"][0])
+                    cached_normalize = bool(int(cached["normalize"][0]))
+                    cached_fingerprint = str(cached["fingerprint"][0])
+                    cached_project_dim = int(
+                        cached["project_dim"][0] if "project_dim" in cached else 0
+                    )
+                    cached_embeddings = cached["embeddings"]
+                if (
+                    cached_version == _TEXT_EMBED_CACHE_VERSION
+                    and cached_model == text_encoder_model
+                    and cached_normalize == bool(text_encoder_normalize)
+                    and cached_embeddings.shape[0] == len(node_attribute_dicts)
+                    and cached_fingerprint == text_fingerprint
+                    and cached_project_dim == int(target_projection_dim or 0)
+                ):
+                    text_embeddings_np = cached_embeddings.astype(
+                        np.float32, copy=False
+                    )
+                    cache_loaded = True
+                    print(
+                        f"[train_rgcn_scae] Loaded {text_embeddings_np.shape[0]} node text embeddings from cache '{cache_path}'."
+                    )
+                else:
+                    print(
+                        "[train_rgcn_scae] Text embedding cache metadata mismatch; recomputing."
+                    )
+            except Exception as cache_exc:
+                print(
+                    f"[train_rgcn_scae] Failed to load text embedding cache '{cache_path}': {cache_exc}"
+                )
+
+        if not cache_loaded:
+            try:
+                text_embeddings_np = _encode_sentence_embeddings(
+                    node_texts,
+                    text_encoder_model,
+                    device=text_encoder_device,
+                    batch_size=text_encoder_batch_size,
+                    normalize=text_encoder_normalize,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to encode node text with SentenceTransformer '{text_encoder_model}': {exc}"
+                ) from exc
+
+            text_embeddings_np = text_embeddings_np.astype(np.float32, copy=False)
+
+            if text_embeddings_np.shape[0] != len(node_attribute_dicts):
+                raise RuntimeError(
+                    "Text embedding count does not match node attribute count."
+                )
+
+            if target_projection_dim is not None:
+                text_embeddings_np = _project_embeddings_random(
+                    text_embeddings_np, target_projection_dim, text_fingerprint
+                )
+
+            if cache_path is not None:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                try:
+                    np.savez_compressed(
+                        cache_path,
+                        embeddings=text_embeddings_np.astype(np.float32, copy=False),
+                        version=np.array([_TEXT_EMBED_CACHE_VERSION], dtype=np.int64),
+                        model_name=np.array([text_encoder_model]),
+                        normalize=np.array(
+                            [1 if text_encoder_normalize else 0], dtype=np.int8
+                        ),
+                        fingerprint=np.array([text_fingerprint]),
+                        project_dim=np.array(
+                            [int(target_projection_dim or 0)], dtype=np.int64
+                        ),
+                    )
+                    print(
+                        f"[train_rgcn_scae] Cached {text_embeddings_np.shape[0]} node text embeddings to '{cache_path}'."
+                    )
+                except Exception as cache_exc:
+                    print(
+                        f"[train_rgcn_scae] Failed to write text embedding cache '{cache_path}': {cache_exc}"
+                    )
+
+        if text_embeddings_np is not None:
+            for idx, attr_dict in enumerate(node_attribute_dicts):
+                embedding_tensor = torch.from_numpy(text_embeddings_np[idx]).clone()
+                attr_dict[_NAME_TEXT_EMBED_ATTR] = embedding_tensor
 
     relation_index: Dict[str, int] = {}
     edge_pairs: List[Tuple[int, int]] = []
@@ -405,6 +628,8 @@ def load_multiplex_graph(graphml_path: Path) -> MultiplexGraph:
         if edge_type_ids
         else torch.empty((0,), dtype=torch.long),
     )
+    if text_embeddings_np is not None and text_embeddings_np.size > 0:
+        data.name_text_embedding_dim = int(text_embeddings_np.shape[1])
     data.node_names = list(node_labels)
     data.node_ids = list(node_ids_ordered)
     data.node_type_names = list(node_type_index.keys())
@@ -1054,8 +1279,18 @@ def train_scae_on_graph(
     else:
         mlflow_last_logged_step = int(mlflow_last_logged_step)
 
+    vocab_embedding_dim = attr_encoder_dims[0]
+    if getattr(graph.data, "node_attributes", None):
+        max_tensor_dim = 0
+        for attribute_dict in graph.data.node_attributes:
+            for value in attribute_dict.values():
+                if isinstance(value, torch.Tensor):
+                    max_tensor_dim = max(max_tensor_dim, int(value.numel()))
+        if max_tensor_dim > 0:
+            vocab_embedding_dim = max(vocab_embedding_dim, max_tensor_dim)
+
     shared_vocab = SharedAttributeVocab(
-        initial_names=[], embedding_dim=attr_encoder_dims[0]
+        initial_names=[], embedding_dim=vocab_embedding_dim
     )
     vocab_start = time.perf_counter()
     _populate_shared_vocab(shared_vocab, getattr(graph.data, "node_attributes", None))
@@ -1064,6 +1299,7 @@ def train_scae_on_graph(
         print(
             "[TIMING] shared vocab populated",
             f"entries={len(shared_vocab.name_to_index)}",
+            f"embedding_dim={shared_vocab.embedding.embedding_dim}",
             f"duration={vocab_duration:.3f}s",
         )
 
@@ -1782,6 +2018,44 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Maximum negatives per graph (0 lets ratio decide)",
     )
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--text-encoder-model",
+        type=str,
+        default="pritamdeka/S-Scibert-snli-multinli-stsb",
+        help="SentenceTransformers model used to embed node text labels ('none' disables).",
+    )
+    parser.add_argument(
+        "--text-encoder-device",
+        type=str,
+        default=None,
+        help="Device for the text encoder (defaults to CUDA if available).",
+    )
+    parser.add_argument(
+        "--text-encoder-batch-size",
+        type=int,
+        default=128,
+        help="Batch size for node text embedding inference.",
+    )
+    parser.add_argument(
+        "--text-encoder-normalize",
+        action="store_true",
+        help="L2-normalize text embeddings returned by the SentenceTransformer.",
+    )
+    parser.add_argument(
+        "--text-encoder-projection-dim",
+        type=int,
+        default=128,
+        help="Random projection dimension applied to text embeddings (<=0 keeps original size)",
+    )
+    parser.add_argument(
+        "--text-embedding-cache",
+        type=str,
+        default="auto",
+        help=(
+            "Path to cache node text embeddings ("
+            "'auto' derives from the GraphML path; 'none' disables caching)."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--entropy-weight",
@@ -1988,7 +2262,47 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     pos_edge_chunk = args.pos_edge_chunk if args.pos_edge_chunk > 0 else None
     neg_edge_chunk = args.neg_edge_chunk if args.neg_edge_chunk > 0 else None
 
-    graph = load_multiplex_graph(args.graphml)
+    text_encoder_model = args.text_encoder_model
+    if text_encoder_model is not None:
+        normalized_name = text_encoder_model.strip().lower()
+        if normalized_name in {"", "none", "disable", "disabled", "off"}:
+            text_encoder_model = None
+
+    text_encoder_projection_dim = args.text_encoder_projection_dim
+    if text_encoder_projection_dim is not None and text_encoder_projection_dim <= 0:
+        text_encoder_projection_dim = None
+
+    text_embedding_cache_arg = args.text_embedding_cache
+    enable_text_embedding_cache = True
+    text_embedding_cache_path: Optional[Path] = None
+    if text_embedding_cache_arg is not None:
+        cache_arg_stripped = text_embedding_cache_arg.strip()
+        cache_arg_lower = cache_arg_stripped.lower()
+        if cache_arg_lower in {"", "auto"}:
+            text_embedding_cache_path = None
+        elif cache_arg_lower in {"none", "disable", "disabled", "off"}:
+            enable_text_embedding_cache = False
+            text_embedding_cache_path = None
+        else:
+            text_embedding_cache_path = Path(text_embedding_cache_arg).expanduser()
+
+    if not enable_text_embedding_cache:
+        text_embedding_cache_param_value = "disabled"
+    elif text_embedding_cache_path is not None:
+        text_embedding_cache_param_value = str(text_embedding_cache_path)
+    else:
+        text_embedding_cache_param_value = "auto"
+
+    graph = load_multiplex_graph(
+        args.graphml,
+        text_encoder_model=text_encoder_model,
+        text_encoder_device=args.text_encoder_device,
+        text_encoder_batch_size=args.text_encoder_batch_size,
+        text_encoder_normalize=args.text_encoder_normalize,
+        text_embedding_cache=text_embedding_cache_path,
+        enable_text_embedding_cache=enable_text_embedding_cache,
+        text_encoder_projection_dim=text_encoder_projection_dim,
+    )
     num_nodes_after = int(graph.data.node_types.numel())
     num_edges_after = int(graph.data.edge_index.size(1))
     print(
@@ -2004,7 +2318,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     mlflow_tracker_path: Optional[Path] = None
     if args.checkpoint_path is not None:
         mlflow_tracker_path = _checkpoint_tracker_path(args.checkpoint_path)
-        if mlflow_tracker_path.exists():
+        if args.resume_from_checkpoint and mlflow_tracker_path.exists():
             try:
                 tracker_blob = json.loads(
                     mlflow_tracker_path.read_text(encoding="utf-8")
@@ -2133,6 +2447,16 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "hidden_dims": hidden_dims_param,
                     "effective_num_clusters": effective_num_clusters,
                     "dirichlet_alpha_arg": dirichlet_alpha_param or "auto",
+                    "text_encoder_model": text_encoder_model or "none",
+                    "text_encoder_device": args.text_encoder_device
+                    if args.text_encoder_device is not None
+                    else "auto",
+                    "text_encoder_batch_size": args.text_encoder_batch_size,
+                    "text_encoder_normalize": args.text_encoder_normalize,
+                    "text_encoder_projection_dim": text_encoder_projection_dim
+                    if text_encoder_projection_dim is not None
+                    else 0,
+                    "text_embedding_cache": text_embedding_cache_param_value,
                 }
             )
             mlflow_client.log_params(
