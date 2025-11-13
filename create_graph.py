@@ -755,7 +755,11 @@ class EntityRelationExtractor:
         struct_expr = pl.struct([pl.col(col) for col in nodes_df.columns]).map_elements(
             lambda row: not should_drop_nosology_node(row), return_dtype=pl.Boolean
         )
-        return nodes_df.filter(struct_expr)
+        filtered = nodes_df.filter(struct_expr)
+        removed = nodes_df.height - filtered.height
+        if removed:
+            logger.debug("Nosology filter removed %d nodes", removed)
+        return filtered
 
     def _relation_allowed(
         self, relation: str | None, src_type: str | None, dst_type: str | None
