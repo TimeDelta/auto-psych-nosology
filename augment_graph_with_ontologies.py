@@ -217,8 +217,64 @@ def load_ontology_bundle(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_keywords(raw: Sequence[str]) -> set[str]:
+    return {kw.strip().lower() for kw in raw if kw and kw.strip()}
+
+
+def _parse_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes"}:
+        return True
+    if lowered in {"0", "false", "no"}:
+        return False
+    return False
+
+
+def _parse_float(value: object) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+DEFAULT_PSYCH_KEYWORDS = _normalise_keywords(
+    [
+        "psych",
+        "psychi",
+        "mental",
+        "mood",
+        "depress",
+        "anxiety",
+        "schiz",
+        "bipolar",
+        "autism",
+        "adhd",
+        "neurodevelopment",
+        "posttraumatic",
+        "obsessive",
+        "compulsive",
+        "suicid",
+        "psychosis",
+        "psychotic",
+    ]
+)
+
+
 class GraphAugmenter:
-    def __init__(self, graph: nx.Graph) -> None:
+    def __init__(
+        self,
+        graph: nx.Graph,
+        *,
+        psych_keywords: Sequence[str],
+        psy_score_threshold: float,
+        allow_non_psy_entities: bool,
+    ) -> None:
         self.graph = graph
         self.node_index: Dict[str, str] = {}
         for node, data in graph.nodes(data=True):
@@ -228,12 +284,37 @@ class GraphAugmenter:
                 value = data.get(key)
                 if isinstance(value, str) and value:
                     self.node_index.setdefault(_norm(value), node_id)
+        self.psych_keywords = _normalise_keywords(psych_keywords)
+        self.psy_score_threshold = psy_score_threshold
+        self.allow_non_psy_entities = allow_non_psy_entities
+
+    def _term_is_psych(self, text_candidates: Sequence[str]) -> bool:
+        if not self.psych_keywords:
+            return True
+        for text in text_candidates:
+            lowered = text.lower()
+            if any(keyword in lowered for keyword in self.psych_keywords):
+                return True
+        return False
+
+    def _entity_is_psych(self, node_id: str) -> bool:
+        if self.allow_non_psy_entities:
+            return True
+        attrs = self.graph.nodes.get(node_id, {})
+        if _parse_bool(attrs.get("is_psychiatric")):
+            return True
+        score = _parse_float(attrs.get("psy_score"))
+        if score is not None and score >= self.psy_score_threshold:
+            return True
+        return False
 
     def add_ontology_terms(
         self, bundle: OntologyBundle, node_type_label: Optional[str]
     ) -> Dict[str, str]:
         added = {}
         for term_id, name, synonyms in bundle.iter_terms():
+            if not self._term_is_psych([name, *synonyms, term_id]):
+                continue
             key = _norm(term_id)
             if term_id in self.graph:
                 added[term_id] = term_id
@@ -286,6 +367,8 @@ class GraphAugmenter:
             if entity_node is None:
                 entity_node = self.node_index.get(_norm(entity))
             if entity_node is None or entity_node not in self.graph:
+                continue
+            if not self._entity_is_psych(entity_node):
                 continue
             entity_to_terms[entity_node].append(term_node)
         for entity_node, term_nodes in entity_to_terms.items():
@@ -424,6 +507,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="shared_ontology_term",
         help="Relation label for entity-entity similarity edges",
     )
+    parser.add_argument(
+        "--psych-keywords",
+        nargs="*",
+        default=sorted(DEFAULT_PSYCH_KEYWORDS),
+        help=(
+            "Lowercase substrings that must appear in ontology term names/synonyms "
+            "to be added. Provide an empty list to disable filtering."
+        ),
+    )
+    parser.add_argument(
+        "--psy-score-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum psy_score required for an entity to gain ontology edges when "
+            "is_psychiatric is False."
+        ),
+    )
+    parser.add_argument(
+        "--allow-non-psy-entities",
+        action="store_true",
+        help="Allow ontology edges to attach to entities lacking psychiatric flags/scores.",
+    )
     return parser
 
 
@@ -454,7 +560,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     anno_term_override = dict_from_pairs(args.annotation_term_column)
 
     graph = _load_base_graph(args.graph)
-    augmenter = GraphAugmenter(graph)
+    augmenter = GraphAugmenter(
+        graph,
+        psych_keywords=args.psych_keywords,
+        psy_score_threshold=args.psy_score_threshold,
+        allow_non_psy_entities=args.allow_non_psy_entities,
+    )
 
     total_added_nodes = 0
     total_hierarchy_edges = 0

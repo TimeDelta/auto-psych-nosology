@@ -14,6 +14,11 @@ from xml.etree.ElementTree import Element, ElementTree, SubElement
 import networkx as nx
 import polars as pl
 
+from augment_graph_with_ontologies import (
+    DEFAULT_PSYCH_KEYWORDS as AUGMENT_DEFAULT_PSYCH_KEYWORDS,
+    GraphAugmenter,
+    load_ontology_bundle,
+)
 from psychiatry_scoring import (
     PsychiatricRelevanceScorer,
     PsychiatricScoringConfig,
@@ -137,6 +142,29 @@ def _truncate_text(expr: pl.Expr, limit: int, *, alias: str) -> pl.Expr:
 def _ensure_file(path: Path, description: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"{description} not found at {path}")
+
+
+def _parse_name_value_arg(pair: str) -> tuple[str, str]:
+    if "=" not in pair:
+        raise argparse.ArgumentTypeError(
+            f"Expected NAME=VALUE format, received '{pair}'."
+        )
+    key, value = pair.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key or not value:
+        raise argparse.ArgumentTypeError(
+            f"Both name and value must be non-empty for '{pair}'."
+        )
+    return key, value
+
+
+def _pairs_to_path_dict(pairs: Sequence[tuple[str, str]]) -> Dict[str, Path]:
+    return {name: Path(path_value).expanduser() for name, path_value in pairs}
+
+
+def _pairs_to_str_dict(pairs: Sequence[tuple[str, str]]) -> Dict[str, str]:
+    return {name: value for name, value in pairs}
 
 
 @dataclass
@@ -827,6 +855,22 @@ class PipelineConfig:
     neighbor_hops: int = 1
     include_reverse_edges: bool = False
     relation_priors: Mapping[str, float] | None = None
+    ontology_terms: Dict[str, Path] = field(default_factory=dict)
+    ontology_annotations: Dict[str, Path] = field(default_factory=dict)
+    ontology_term_id_columns: Dict[str, str] = field(default_factory=dict)
+    ontology_term_name_columns: Dict[str, str] = field(default_factory=dict)
+    ontology_parent_columns: Dict[str, str] = field(default_factory=dict)
+    ontology_synonym_columns: Dict[str, str] = field(default_factory=dict)
+    ontology_annotation_entity_columns: Dict[str, str] = field(default_factory=dict)
+    ontology_annotation_term_columns: Dict[str, str] = field(default_factory=dict)
+    ontology_node_type: Optional[str] = "ontology"
+    ontology_similarity_relation: str = "shared_ontology_term"
+    ontology_entity_id_column: Optional[str] = None
+    ontology_psych_keywords: Sequence[str] | None = None
+    ontology_psy_score_threshold: float = 0.0
+    ontology_allow_non_psy_entities: bool = False
+    ontology_output_suffix: Optional[str] = ".augmented.graphml"
+    ontology_weighted_suffix: Optional[str] = ".augmented.weighted.graphml"
 
     def to_extraction_config(self) -> ExtractionConfig:
         patterns = (
@@ -847,6 +891,9 @@ class PipelineConfig:
     @property
     def resolved_output_prefix(self) -> Path:
         return self.output_dir / self.output_prefix
+
+    def wants_ontology_augmentation(self) -> bool:
+        return bool(self.ontology_terms)
 
 
 def _graphml_attr_type(value) -> str:
@@ -969,7 +1016,14 @@ class KnowledgeGraphPipeline:
             **{k.lower(): float(v) for k, v in (config.relation_priors or {}).items()},
         }
         weighted = self._build_weighted_projection(graph, relation_priors)
-        self._write_outputs(config, nodes_df, edges_df, graph, weighted)
+        self._write_outputs(
+            config,
+            nodes_df,
+            edges_df,
+            graph,
+            weighted,
+            relation_priors,
+        )
         return summary
 
     @staticmethod
@@ -1005,6 +1059,7 @@ class KnowledgeGraphPipeline:
         edges_df: pl.DataFrame,
         graph: nx.MultiDiGraph,
         weighted: nx.Graph,
+        relation_priors: Mapping[str, float],
     ) -> None:
         output_prefix = config.resolved_output_prefix
         output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -1023,6 +1078,99 @@ class KnowledgeGraphPipeline:
             edges_df.height,
             output_prefix,
         )
+        if config.wants_ontology_augmentation():
+            self._write_ontology_outputs(
+                config,
+                graph,
+                relation_priors,
+                output_prefix,
+            )
+
+    def _write_ontology_outputs(
+        self,
+        config: PipelineConfig,
+        base_graph: nx.MultiDiGraph,
+        relation_priors: Mapping[str, float],
+        output_prefix: Path,
+    ) -> None:
+        augmented_graph = base_graph.copy()
+        stats = self._augment_graph_with_ontologies(augmented_graph, config)
+        suffix = config.ontology_output_suffix or ""
+        if suffix:
+            augmented_path = output_prefix.with_suffix(suffix)
+            write_graphml(augmented_graph, augmented_path)
+            logger.info(
+                "Ontology augmentation wrote %s (added %d nodes / %d hierarchy / %d entity / %d similarity edges)",
+                augmented_path,
+                stats["nodes"],
+                stats["hierarchy_edges"],
+                stats["entity_edges"],
+                stats["similarity_edges"],
+            )
+        if config.ontology_weighted_suffix:
+            augmented_weighted = self._build_weighted_projection(
+                augmented_graph, relation_priors
+            )
+            weighted_path = output_prefix.with_suffix(config.ontology_weighted_suffix)
+            write_graphml(augmented_weighted, weighted_path)
+            logger.info("Ontology-weighted projection wrote %s", weighted_path)
+
+    def _augment_graph_with_ontologies(
+        self, graph: nx.MultiDiGraph, config: PipelineConfig
+    ) -> Dict[str, int]:
+        psych_keywords = (
+            [kw.strip().lower() for kw in config.ontology_psych_keywords if kw.strip()]
+            if config.ontology_psych_keywords is not None
+            else sorted(AUGMENT_DEFAULT_PSYCH_KEYWORDS)
+        )
+        augmenter = GraphAugmenter(
+            graph,
+            psych_keywords=psych_keywords,
+            psy_score_threshold=config.ontology_psy_score_threshold,
+            allow_non_psy_entities=config.ontology_allow_non_psy_entities,
+        )
+        stats = {
+            "nodes": 0,
+            "hierarchy_edges": 0,
+            "entity_edges": 0,
+            "similarity_edges": 0,
+        }
+        for name, terms_path in config.ontology_terms.items():
+            annotations_path = config.ontology_annotations.get(name)
+            if annotations_path is None:
+                logger.warning(
+                    "Skipping ontology '%s' because annotations were not provided",
+                    name,
+                )
+                continue
+            bundle = load_ontology_bundle(
+                name,
+                terms_path,
+                annotations_path,
+                config.ontology_term_id_columns.get(name, "id"),
+                config.ontology_term_name_columns.get(name, "name"),
+                config.ontology_parent_columns.get(name) or None,
+                config.ontology_synonym_columns.get(name) or None,
+                config.ontology_annotation_entity_columns.get(name, "entity"),
+                config.ontology_annotation_term_columns.get(name, "term"),
+            )
+            added_terms = augmenter.add_ontology_terms(
+                bundle, config.ontology_node_type
+            )
+            stats["nodes"] += len(added_terms)
+            stats["hierarchy_edges"] += augmenter.connect_hierarchy(
+                bundle.iter_parent_edges(), relation=f"{name}_is_a"
+            )
+            entity_to_terms = augmenter.map_entities(
+                bundle,
+                added_terms,
+                entity_id_col=config.ontology_entity_id_column,
+            )
+            stats["entity_edges"] += sum(len(v) for v in entity_to_terms.values())
+            stats["similarity_edges"] += augmenter.add_similarity_edges(
+                entity_to_terms, relation=config.ontology_similarity_relation
+            )
+        return stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -1066,11 +1214,152 @@ def parse_args() -> argparse.Namespace:
         help="Also add reverse edges to the directed graph",
     )
     parser.add_argument(
+        "--ontology-terms",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=PATH",
+        help="Optional ontology term tables (CSV/TSV) to ingest (NAME=PATH)",
+    )
+    parser.add_argument(
+        "--ontology-annotations",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=PATH",
+        help="Annotation files matching --ontology-terms (NAME=PATH)",
+    )
+    parser.add_argument(
+        "--ontology-term-id-column",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=COL",
+        help="Override the term ID column for a specific ontology",
+    )
+    parser.add_argument(
+        "--ontology-term-name-column",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=COL",
+        help="Override the term name column for a specific ontology",
+    )
+    parser.add_argument(
+        "--ontology-parent-column",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=COL",
+        help="Optional parent column for ontology hierarchies",
+    )
+    parser.add_argument(
+        "--ontology-synonym-column",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=COL",
+        help="Optional synonym column used for text matching",
+    )
+    parser.add_argument(
+        "--ontology-annotation-entity-column",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=COL",
+        help="Override the entity ID column in the annotation table",
+    )
+    parser.add_argument(
+        "--ontology-annotation-term-column",
+        type=_parse_name_value_arg,
+        nargs="*",
+        default=[],
+        metavar="NAME=COL",
+        help="Override the term ID column in the annotation table",
+    )
+    parser.add_argument(
+        "--ontology-node-type",
+        default="ontology",
+        help="node_type assigned to ingested ontology hubs (default: ontology)",
+    )
+    parser.add_argument(
+        "--ontology-similarity-relation",
+        default="shared_ontology_term",
+        help="Relation label for entity-entity edges induced by shared ontology terms",
+    )
+    parser.add_argument(
+        "--ontology-entity-id-column",
+        default=None,
+        help="If provided, entity annotations will attempt exact node ID matches",
+    )
+    parser.add_argument(
+        "--ontology-psych-keyword",
+        action="append",
+        dest="ontology_psych_keywords",
+        help="Substring filter applied to ontology term names; repeat to add multiple keywords",
+    )
+    parser.add_argument(
+        "--ontology-psy-score-threshold",
+        type=float,
+        default=0.0,
+        help="Minimum psy_score for non-flagged entities to receive ontology edges",
+    )
+    parser.add_argument(
+        "--ontology-allow-non-psy-entities",
+        action="store_true",
+        help="Allow ontology edges to attach even if entities lack psychiatric evidence",
+    )
+    parser.add_argument(
+        "--ontology-output-suffix",
+        default=".augmented.graphml",
+        help="Suffix for augmented GraphML (set to empty string to skip writing)",
+    )
+    parser.add_argument(
+        "--ontology-weighted-suffix",
+        default=".augmented.weighted.graphml",
+        help="Suffix for augmented weighted GraphML (set to empty string to skip)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Logging level (default: INFO)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    term_map = _pairs_to_path_dict(args.ontology_terms)
+    annotation_map = _pairs_to_path_dict(args.ontology_annotations)
+    if term_map and set(term_map) != set(annotation_map):
+        missing = set(term_map) ^ set(annotation_map)
+        parser.error(
+            "Ontology terms/annotations mismatch; provide both for names: "
+            + ", ".join(sorted(missing))
+        )
+    args.ontology_terms = term_map
+    args.ontology_annotations = annotation_map
+    args.ontology_term_id_column = _pairs_to_str_dict(args.ontology_term_id_column)
+    args.ontology_term_name_column = _pairs_to_str_dict(args.ontology_term_name_column)
+    args.ontology_parent_column = _pairs_to_str_dict(args.ontology_parent_column)
+    args.ontology_synonym_column = _pairs_to_str_dict(args.ontology_synonym_column)
+    args.ontology_annotation_entity_column = _pairs_to_str_dict(
+        args.ontology_annotation_entity_column
+    )
+    args.ontology_annotation_term_column = _pairs_to_str_dict(
+        args.ontology_annotation_term_column
+    )
+    if args.ontology_psych_keywords:
+        cleaned_keywords = [
+            keyword.strip().lower()
+            for keyword in args.ontology_psych_keywords
+            if keyword and keyword.strip()
+        ]
+        args.ontology_psych_keywords = cleaned_keywords or None
+    else:
+        args.ontology_psych_keywords = None
+    if args.ontology_output_suffix == "":
+        args.ontology_output_suffix = None
+    if args.ontology_weighted_suffix == "":
+        args.ontology_weighted_suffix = None
+    return args
 
 
 if __name__ == "__main__":
@@ -1086,5 +1375,21 @@ if __name__ == "__main__":
         psychiatric_patterns=args.psychiatric_patterns,
         include_reverse_edges=args.include_reverse,
         metadata_truncate=args.metadata_truncate,
+        ontology_terms=args.ontology_terms,
+        ontology_annotations=args.ontology_annotations,
+        ontology_term_id_columns=args.ontology_term_id_column,
+        ontology_term_name_columns=args.ontology_term_name_column,
+        ontology_parent_columns=args.ontology_parent_column,
+        ontology_synonym_columns=args.ontology_synonym_column,
+        ontology_annotation_entity_columns=args.ontology_annotation_entity_column,
+        ontology_annotation_term_columns=args.ontology_annotation_term_column,
+        ontology_node_type=args.ontology_node_type,
+        ontology_similarity_relation=args.ontology_similarity_relation,
+        ontology_entity_id_column=args.ontology_entity_id_column,
+        ontology_psych_keywords=args.ontology_psych_keywords,
+        ontology_psy_score_threshold=args.ontology_psy_score_threshold,
+        ontology_allow_non_psy_entities=args.ontology_allow_non_psy_entities,
+        ontology_output_suffix=args.ontology_output_suffix,
+        ontology_weighted_suffix=args.ontology_weighted_suffix,
     )
     pipeline.run(config)

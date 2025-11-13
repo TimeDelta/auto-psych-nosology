@@ -11,11 +11,39 @@ __all__ = [
     "should_drop_nosology_node",
     "NOSOLOGY_NODE_TYPES",
     "NOSOLOGY_NAME_KEYWORDS",
+    "NOSOLOGY_SOURCE_KEYWORDS",
 ]
 
-NOSOLOGY_NODE_TYPES = _normalise_keywords(["disease", "disorder", "diagnosis"])
+NOSOLOGY_NODE_TYPES = _normalise_keywords(
+    [
+        "nosology",
+        "nosology_category",
+        "diagnostic_category",
+        "diagnostic_domain",
+    ]
+)
 NOSOLOGY_NAME_KEYWORDS = _normalise_keywords(
-    ["disorder", "disease", "syndrome", "diagnosis", "illness"]
+    [
+        "hitop",
+        "rdoc",
+        "internalizing spectrum",
+        "externalizing spectrum",
+        "detachment",
+        "anankastia",
+        "negative affectivity",
+        "psychoticism",
+        "somatoform spectrum",
+        "thought disorder spectrum",
+    ]
+)
+NOSOLOGY_SOURCE_KEYWORDS = _normalise_keywords(
+    ["hitop", "rdoc", "icd", "dsm", "psychiatric_nosology"]
+)
+_NOSOLOGY_FLAG_FIELDS = (
+    "nosology_flag",
+    "taxonomy_flag",
+    "alignment_flag",
+    "is_nosology",
 )
 
 
@@ -36,12 +64,19 @@ def should_drop_nosology_node(attrs: Mapping[str, Any]) -> bool:
     node_type = str(attrs.get("node_type", "")).strip().lower()
     if node_type in NOSOLOGY_NODE_TYPES:
         return True
-    for flag in ("ontology_flag", "group_flag"):
+
+    source = str(attrs.get("source", "")).strip().lower()
+    if source and any(keyword in source for keyword in NOSOLOGY_SOURCE_KEYWORDS):
+        return True
+
+    for flag in _NOSOLOGY_FLAG_FIELDS:
         if _parse_bool(attrs.get(flag)):
             return True
-    name = str(attrs.get("name", "")).lower()
+
+    name = str(attrs.get("name", "")).strip().lower()
     if name and any(keyword in name for keyword in NOSOLOGY_NAME_KEYWORDS):
         return True
+
     return False
 
 
