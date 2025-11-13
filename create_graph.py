@@ -24,6 +24,7 @@ from psychiatry_scoring import (
     PsychiatricScoringConfig,
     build_default_scoring_config,
 )
+from remove_stranded_nodes import remove_stranded_nodes
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -1011,6 +1012,7 @@ class KnowledgeGraphPipeline:
             return summary
 
         graph = extractor.to_networkx(nodes_df, edges_df)
+
         relation_priors = {
             **RELATION_PRIOR_DEFAULT,
             **{k.lower(): float(v) for k, v in (config.relation_priors or {}).items()},
@@ -1071,7 +1073,9 @@ class KnowledgeGraphPipeline:
         nodes_df.write_parquet(nodes_path)
         edges_df.write_parquet(edges_path)
         write_graphml(graph, graph_path)
+        self._prune_graphml_file(graph_path)
         write_graphml(weighted, weighted_path)
+        self._prune_graphml_file(weighted_path)
         logger.info(
             "Wrote %d nodes, %d edges to %s",
             nodes_df.height,
@@ -1099,6 +1103,7 @@ class KnowledgeGraphPipeline:
         if suffix:
             augmented_path = output_prefix.with_suffix(suffix)
             write_graphml(augmented_graph, augmented_path)
+            self._prune_graphml_file(augmented_path)
             logger.info(
                 "Ontology augmentation wrote %s (added %d nodes / %d hierarchy / %d entity / %d similarity edges)",
                 augmented_path,
@@ -1113,6 +1118,7 @@ class KnowledgeGraphPipeline:
             )
             weighted_path = output_prefix.with_suffix(config.ontology_weighted_suffix)
             write_graphml(augmented_weighted, weighted_path)
+            self._prune_graphml_file(weighted_path)
             logger.info("Ontology-weighted projection wrote %s", weighted_path)
 
     def _augment_graph_with_ontologies(
@@ -1171,6 +1177,24 @@ class KnowledgeGraphPipeline:
                 entity_to_terms, relation=config.ontology_similarity_relation
             )
         return stats
+
+    @staticmethod
+    def _prune_graphml_file(path: Path) -> None:
+        if not path.exists():
+            return
+        try:
+            original, removed, remaining = remove_stranded_nodes(
+                path, output_path=path, keep_original=False
+            )
+            if removed:
+                logger.info(
+                    "Pruned %d stranded nodes from %s (now %d)",
+                    removed,
+                    path,
+                    remaining,
+                )
+        except Exception as exc:
+            logger.warning("Failed to prune stranded nodes in %s (%s)", path, exc)
 
 
 def parse_args() -> argparse.Namespace:
