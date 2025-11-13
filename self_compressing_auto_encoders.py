@@ -1074,7 +1074,7 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
         memory_bank_max_size: int = 50000,
         use_virtual_node: bool = False,
         virtual_node_weight: float = 0.1,
-        sparsity_warmup_steps: int = 400,
+        sparsity_warmup_steps: int = 100,
         gate_temperature_start: Optional[float] = None,
         gate_temperature_end: Optional[float] = None,
         gate_temperature_anneal_steps: int = 400,
