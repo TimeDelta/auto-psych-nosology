@@ -31,6 +31,7 @@ from typing import (
 import networkx as nx
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph
 
@@ -51,6 +52,13 @@ _TEXT_TOKEN_LIMIT_PER_FIELD = 32
 _TEXT_TOKEN_LIMIT_TOTAL = 128
 _NAME_TEXT_EMBED_ATTR = "name_text_embedding"
 _TEXT_EMBED_CACHE_VERSION = 1
+
+
+def _default_npz_export_path(base: Path) -> Path:
+    base = base.expanduser()
+    if base.suffix:
+        return base.with_suffix(base.suffix + ".npz")
+    return base.with_suffix(".npz")
 
 
 def _checkpoint_tracker_path(base: Path) -> Path:
@@ -1890,6 +1898,89 @@ def save_partition(
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def export_cluster_npz(
+    model,
+    graph,
+    npz_path,
+    device="cpu",
+    metadata: Optional[Mapping[str, Any]] = None,
+):
+    model.eval()
+    with torch.no_grad():
+        npz_path = Path(npz_path)
+        npz_path.parent.mkdir(parents=True, exist_ok=True)
+        data = graph.data
+        device_obj = torch.device(device)
+        node_types = data.node_types.to(device_obj)
+        edge_index = data.edge_index.to(device_obj)
+        edge_type = getattr(data, "edge_type", None)
+        if isinstance(edge_type, torch.Tensor):
+            edge_type = edge_type.to(device_obj)
+        positional_encodings = getattr(data, "positional_encodings", None)
+        if isinstance(positional_encodings, torch.Tensor):
+            positional_encodings = positional_encodings.to(device_obj)
+        edge_weight = getattr(data, "edge_weight", None)
+        if isinstance(edge_weight, torch.Tensor):
+            edge_weight = edge_weight.to(device_obj)
+        batch_vec = getattr(data, "batch", None)
+        if isinstance(batch_vec, torch.Tensor):
+            batch_vec = batch_vec.to(device_obj)
+        node_attr_embedding = getattr(data, "node_attr_embedding", None)
+        if isinstance(node_attr_embedding, torch.Tensor):
+            node_attr_embedding = node_attr_embedding.to(device_obj)
+
+        node_attributes = getattr(data, "node_attributes", None)
+        if not node_attributes:
+            node_attributes = getattr(graph, "node_attributes", None)
+
+        H, _ = model.encoder(
+            node_types=node_types,
+            edge_index=edge_index,
+            batch=batch_vec,
+            node_attributes=node_attributes,
+            precomputed_attr=node_attr_embedding,
+            edge_type=edge_type,
+            positional_encodings=positional_encodings,
+            edge_weight=edge_weight,
+        )
+
+        prototypes = getattr(model, "prototype_bank", None)
+        if prototypes is not None:
+            logits = F.normalize(H, dim=-1) @ F.normalize(prototypes, dim=-1).t()
+        else:
+            logits = H.new_zeros(H.size(0), getattr(model, "num_clusters", 0))
+
+        gates = getattr(model, "cluster_gate", None)
+        gate_values = None
+        if gates is not None:
+            gate_values = gates(training=False).detach().cpu().numpy()
+
+        recon_loss = getattr(model, "last_recon_loss", None)
+        node_ids = getattr(graph, "node_ids", None)
+        if node_ids is None:
+            node_ids = getattr(data, "node_ids", None)
+        if isinstance(node_ids, torch.Tensor):
+            node_ids_payload = node_ids.detach().cpu().numpy()
+        elif isinstance(node_ids, (list, tuple)):
+            node_ids_payload = np.asarray(node_ids)
+        else:
+            node_ids_payload = np.arange(H.shape[0])
+
+        payload: Dict[str, Any] = {
+            "Z": logits.detach().cpu().numpy(),
+            "gates": gate_values,
+            "H": H.detach().cpu().numpy(),
+            "recon_loss": float(recon_loss) if recon_loss is not None else None,
+            "node_ids": node_ids_payload,
+        }
+        if metadata:
+            payload["metadata_json"] = np.array(
+                json.dumps(metadata, default=str), dtype=object
+            )
+        np.savez_compressed(npz_path, **payload)
+        print(f"[NPZ EXPORT] Saved {npz_path}")
+
+
 def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train rGCN-SCAE on a multiplex GraphML file"
@@ -2202,12 +2293,37 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Additional MLflow tag(s) as KEY=VALUE. May be supplied multiple times.",
     )
+    parser.add_argument(
+        "--npz-out",
+        type=Path,
+        default=None,
+        help="Path to export cluster logits, gates, embeddings, and recon loss as NPZ (defaults to <out>.npz).",
+    )
+    parser.add_argument(
+        "--no-npz-export",
+        action="store_true",
+        help="Skip NPZ export entirely (otherwise defaults to <out>.npz when --npz-out is omitted).",
+    )
     return parser
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     parser = _build_argparser()
     args = parser.parse_args(argv)
+
+    mlflow_auto_reasons: List[str] = []
+    mlflow_tracking_uri_default = parser.get_default("mlflow_tracking_uri")
+    if args.mlflow_experiment:
+        mlflow_auto_reasons.append("--mlflow-experiment")
+    if args.mlflow_run_name:
+        mlflow_auto_reasons.append("--mlflow-run-name")
+    if args.mlflow_tags:
+        mlflow_auto_reasons.append("--mlflow-tag")
+    if (
+        args.mlflow_tracking_uri
+        and args.mlflow_tracking_uri != mlflow_tracking_uri_default
+    ):
+        mlflow_auto_reasons.append("--mlflow-tracking-uri")
 
     if args.min_epochs > args.max_epochs:
         parser.error("--min-epochs must be less than or equal to --max-epochs")
@@ -2235,6 +2351,14 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     if args.model_out is None:
         args.model_out = args.out.with_suffix(".pt")
+
+    if args.no_npz_export:
+        args.npz_out = None
+    elif args.npz_out is None:
+        default_npz = _default_npz_export_path(args.out)
+        args.npz_out = default_npz
+        if not args.quiet:
+            print(f"[INFO] NPZ export path not provided; defaulting to {default_npz}")
     if args.ego_min_radius < 1:
         parser.error("--ego-min-radius must be at least 1")
     if args.ego_max_radius < args.ego_min_radius:
@@ -2361,6 +2485,18 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     candidate_logged_step, (int, float)
                 ):
                     mlflow_last_logged_step = int(candidate_logged_step)
+
+    if resume_mlflow_run_id is not None:
+        mlflow_auto_reasons.append("resume-from-checkpoint")
+
+    if not args.mlflow and mlflow_auto_reasons:
+        args.mlflow = True
+        if not args.quiet:
+            reason_text = ", ".join(dict.fromkeys(mlflow_auto_reasons))
+            print(
+                "[INFO] Auto-enabled MLflow tracking because "
+                f"{reason_text} was provided. Omit those flags to skip MLflow."
+            )
 
     tags = _parse_mlflow_tags(args.mlflow_tags)
     with _mlflow_run(
@@ -2656,6 +2792,25 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
         print(f"[INFO] Saved trained model weights to {args.model_out}")
         save_partition(partition, args.out, graph)
+        npz_metadata = {
+            "graph_path": str(args.graphml),
+            "partition_path": str(args.out),
+            "model_path": str(args.model_out),
+            "gate_threshold": float(
+                training_summary.get("gate_threshold", args.gate_threshold)
+            ),
+            "num_clusters": int(getattr(model, "num_clusters", 0)),
+            "num_nodes": int(graph.data.node_types.numel()),
+            "num_relations": len(graph.relation_index),
+            "timestamp": time.time(),
+        }
+        if args.npz_out:
+            export_cluster_npz(
+                model,
+                graph,
+                args.npz_out,
+                metadata=npz_metadata,
+            )
         if mlflow_client is not None:
             mlflow_client.log_artifact(str(model_artifact_path))
             mlflow_client.log_artifact(str(args.out))
