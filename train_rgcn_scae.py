@@ -608,6 +608,7 @@ def load_multiplex_graph(
     relation_index: Dict[str, int] = {}
     edge_pairs: List[Tuple[int, int]] = []
     edge_type_ids: List[int] = []
+    edge_weights: List[float] = []
     node_index: Dict[str, int] = {
         node_id: idx for idx, node_id in enumerate(node_ids_ordered)
     }
@@ -620,6 +621,14 @@ def load_multiplex_graph(
             relation_index[predicate] = len(relation_index)
         edge_pairs.append((node_index[src], node_index[dst]))
         edge_type_ids.append(relation_index[predicate])
+        weight_value = attrs.get("weight")
+        if weight_value in (None, ""):
+            edge_weights.append(1.0)
+        else:
+            try:
+                edge_weights.append(float(weight_value))
+            except (TypeError, ValueError):
+                edge_weights.append(1.0)
 
     if not relation_index:
         relation_index["rel"] = 0
@@ -636,6 +645,8 @@ def load_multiplex_graph(
         if edge_type_ids
         else torch.empty((0,), dtype=torch.long),
     )
+    if edge_weights:
+        data.edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
     if text_embeddings_np is not None and text_embeddings_np.size > 0:
         data.name_text_embedding_dim = int(text_embeddings_np.shape[1])
     data.node_names = list(node_labels)
