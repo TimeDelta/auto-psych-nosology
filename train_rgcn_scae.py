@@ -35,8 +35,6 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph
 
-from nosology_filters import should_drop_nosology_node
-from remove_stranded_nodes import remove_stranded_nodes
 from self_compressing_auto_encoders import (
     NodeAttributeDeepSetEncoder,
     OnlineTrainer,
@@ -264,38 +262,6 @@ def _encode_sentence_embeddings(
     return embeddings.astype(np.float32, copy=False)
 
 
-_NOSOLOGY_NODE_TYPES = {"disease", "disorder", "diagnosis"}
-_NOSOLOGY_NAME_KEYWORDS = {
-    "disorder",
-    "disease",
-    "syndrome",
-    "diagnosis",
-    "illness",
-}
-
-
-def _should_drop_nosology_node(attrs: Mapping[str, Any]) -> bool:
-    node_type = (attrs.get("node_type") or "").strip().lower()
-    if node_type in _NOSOLOGY_NODE_TYPES:
-        return True
-    # Flags indicating the node comes from an external taxonomy
-    for flag_attr in ("ontology_flag", "group_flag", "is_psychiatric"):
-        flag_val = attrs.get(flag_attr)
-        if isinstance(flag_val, bool):
-            if flag_val:
-                return True
-        else:
-            parsed = _parse_bool(flag_val)
-            if parsed:
-                return True
-
-    name = (attrs.get("name") or "").lower()
-    if name and any(keyword in name for keyword in _NOSOLOGY_NAME_KEYWORDS):
-        return True
-
-    return False
-
-
 @dataclass
 class MultiplexGraph:
     """In-memory representation of a multiplex knowledge graph."""
@@ -388,27 +354,7 @@ def load_multiplex_graph(
                 text_encoder_normalize,
                 text_encoder_projection_dim,
             )
-    cleaned_path = graphml_path
-    try:
-        _, removed_nodes, _ = remove_stranded_nodes(
-            graphml_path,
-            output_path=None,
-            keep_original=True,
-        )
-        stripped_path = graphml_path.with_suffix(".stripped.graphml")
-        if stripped_path.exists():
-            cleaned_path = stripped_path
-        if removed_nodes:
-            print(
-                f"[train_rgcn_scae] remove_stranded_nodes pruned {removed_nodes} isolated nodes."
-            )
-    except Exception as exc:
-        print(
-            f"[train_rgcn_scae] Warning: remove_stranded_nodes failed ({exc}); proceeding with original graph."
-        )
-        cleaned_path = graphml_path
-
-    nodes, edges = _parse_graphml(cleaned_path)
+    nodes, edges = _parse_graphml(graphml_path)
 
     node_types: List[str] = []
     node_type_index: Dict[str, int] = {}
@@ -426,8 +372,6 @@ def load_multiplex_graph(
     )
 
     for node_id, attrs in nodes:
-        if should_drop_nosology_node(attrs):
-            continue
         node_type = attrs.get("node_type", "Unknown")
         if node_type not in node_type_index:
             node_type_index[node_type] = len(node_type_index)

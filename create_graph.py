@@ -19,6 +19,7 @@ from augment_graph_with_ontologies import (
     GraphAugmenter,
     load_ontology_bundle,
 )
+from nosology_filters import should_drop_nosology_node
 from psychiatry_scoring import (
     PsychiatricRelevanceScorer,
     PsychiatricScoringConfig,
@@ -298,11 +299,19 @@ class EntityRelationExtractor:
             | (pl.col("text_score") > 0.25)
         )
         psych_indices = candidate_frame.select("node_index").to_series().to_list()
+        logger.debug(
+            "Hybrid scoring produced %d candidate diseases (total diseases: %d)",
+            len(psych_indices),
+            disease_features.height,
+        )
         if not psych_indices:
             logger.warning("No psychiatric disease nodes passed hybrid scoring.")
             return self._empty_nodes(), self._empty_edges()
 
         edges_df = self._collect_relevant_edges(psych_indices)
+        logger.debug(
+            "Collected %d edges incident to psychiatric seeds", edges_df.height
+        )
         if edges_df.is_empty():
             logger.warning(
                 "No edges incident to psychiatric nodes were found in the KG."
@@ -325,6 +334,12 @@ class EntityRelationExtractor:
             protein_features,
             dna_features,
         )
+        logger.debug(
+            "Built node table with %d nodes prior to nosology filtering",
+            nodes_df.height,
+        )
+        nodes_df = self._filter_nosology_nodes(nodes_df)
+        logger.debug("Nodes after nosology filter: %d", nodes_df.height)
         return nodes_df, edges_df
 
     def to_networkx(
@@ -733,6 +748,14 @@ class EntityRelationExtractor:
                     nodes = nodes.with_columns(pl.col(column).fill_null(False))
 
         return nodes.sort("node_index")
+
+    def _filter_nosology_nodes(self, nodes_df: pl.DataFrame) -> pl.DataFrame:
+        if nodes_df.is_empty():
+            return nodes_df
+        struct_expr = pl.struct([pl.col(col) for col in nodes_df.columns]).map_elements(
+            lambda row: not should_drop_nosology_node(row), return_dtype=pl.Boolean
+        )
+        return nodes_df.filter(struct_expr)
 
     def _relation_allowed(
         self, relation: str | None, src_type: str | None, dst_type: str | None
