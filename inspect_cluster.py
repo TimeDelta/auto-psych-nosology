@@ -411,7 +411,9 @@ if __name__ == "__main__":
     ap.add_argument("--partition", type=Path, required=True)
     ap.add_argument("--cluster", type=int, required=True)
     ap.add_argument("--field", type=str, default="name")
-    ap.add_argument("--embed-model", type=str, default="all-MiniLM-L6-v2")
+    ap.add_argument(
+        "--embed-model", type=str, default="pritamdeka/S-Scibert-snli-multinli-stsb"
+    )
     ap.add_argument("--embed-cache", type=str, default="emb_cache.npz")
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--neighbors-k", type=int, default=10)
