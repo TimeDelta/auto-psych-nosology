@@ -32,6 +32,23 @@ curl -L -o data/hpo/genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hp
 python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
 ```
 to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
+- Run
+```
+python3.10 create_graph.py \
+    --kg-path data/primekg_kg.csv \
+    --output-dir data \
+    --data-dir data/ \
+    --log-level DEBUG \
+    --output-prefix prebuilt-kg \
+    --ontology-terms hpo=data/hpo/hpo_terms.csv \
+    --ontology-annotations hpo=data/hpo/hpo_annotations.csv \
+    --ontology-term-id-column hpo=id \
+    --ontology-term-name-column hpo=name \
+    --ontology-parent-column hpo=parents \
+    --ontology-annotation-entity-column hpo=entity \
+    --ontology-annotation-term-column hpo=term
+```
+to create the final graph used for training.
 - MLflow is used for optional experiment tracking.
     - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
     - Metric explanations:
