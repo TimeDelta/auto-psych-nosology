@@ -434,7 +434,7 @@ class EntityRelationExtractor:
 
         metadata_struct = pl.struct([pl.col(col) for col in available_text_cols])
         grouped = grouped.with_columns(
-            metadata_struct.apply(
+            metadata_struct.map_elements(
                 lambda s: json.dumps(
                     {k: v for k, v in s.items() if v not in (None, "")},
                     ensure_ascii=False,
@@ -487,7 +487,7 @@ class EntityRelationExtractor:
         grouped = grouped.with_columns(truncated_cols)
         metadata_struct = pl.struct([pl.col(col) for col in textual_columns])
         grouped = grouped.with_columns(
-            metadata_struct.apply(
+            metadata_struct.map_elements(
                 lambda s: json.dumps(
                     {k: v for k, v in s.items() if v not in (None, "")},
                     ensure_ascii=False,
@@ -544,7 +544,7 @@ class EntityRelationExtractor:
             ]
         )
         grouped = grouped.with_columns(
-            metadata_struct.apply(
+            metadata_struct.map_elements(
                 lambda s: json.dumps(
                     {k: v for k, v in s.items() if v not in (None, "")},
                     ensure_ascii=False,
@@ -592,15 +592,15 @@ class EntityRelationExtractor:
             value_cols.append("dna_seq_len")
 
         grouped = (
-            df.groupby("node_index").agg(agg_exprs)
+            df.group_by("node_index").agg(agg_exprs)
             if agg_exprs
-            else df.groupby("node_index").agg([])
+            else df.group_by("node_index").agg([])
         )
 
         if value_cols:
             metadata_struct = pl.struct([pl.col(col) for col in value_cols])
             grouped = grouped.with_columns(
-                metadata_struct.apply(
+                metadata_struct.map_elements(
                     lambda s: json.dumps(
                         {k: v for k, v in s.items() if v not in (None, "")},
                         ensure_ascii=False,
