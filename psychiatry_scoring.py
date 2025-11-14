@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,8 +62,32 @@ _DEFAULT_WEIGHTS = {
     "ontology": 0.4,
     "group": 0.25,
     "drug": 0.2,
-    "text": 0.15,
+    "text": 0.1,
+    "name": 0.25,
 }
+
+_PSYCHIATRIC_NAME_KEYWORDS = (
+    "depress",
+    "bipolar",
+    "schizo",
+    "psychosis",
+    "psychotic",
+    "anxiety",
+    "ocd",
+    "obsessive",
+    "compulsive",
+    "adhd",
+    "autism",
+    "suicid",
+    "panic",
+    "trauma",
+    "ptsd",
+    "mania",
+    "eating disorder",
+    "anorexia",
+    "bulimia",
+    "personality disorder",
+)
 
 
 @dataclass
@@ -124,6 +149,9 @@ class PsychiatricRelevanceScorer:
             for keyword in self.config.drug_category_keywords
             if keyword
         }
+        self._name_keywords = tuple(
+            keyword.strip().lower() for keyword in _PSYCHIATRIC_NAME_KEYWORDS if keyword
+        )
 
     def score_diseases(
         self,
@@ -167,6 +195,8 @@ class PsychiatricRelevanceScorer:
                     "mayo_causes",
                     "mayo_risk_factors",
                     "mayo_complications",
+                    "name",
+                    "mondo_name",
                 )
             )
             text_embedding = _build_counter(text_payload)
@@ -180,17 +210,28 @@ class PsychiatricRelevanceScorer:
             if text_score > 0.15:
                 evidence.append(f"text:{text_score:.2f}")
 
+            name_value = str(row.get("name") or "")
+            keyword_flag = self._name_contains_keyword(name_value)
+            if not keyword_flag:
+                mondo_name = str(row.get("mondo_name") or "")
+                keyword_flag = self._name_contains_keyword(mondo_name)
+            if keyword_flag:
+                evidence.append("name_keywords")
+                text_score = max(text_score, 0.8)
+
             score = (
                 self.config.weights.get("ontology", 0.0) * float(ontology_flag)
                 + self.config.weights.get("group", 0.0) * float(group_flag)
                 + self.config.weights.get("drug", 0.0) * float(drug_flag)
                 + self.config.weights.get("text", 0.0) * float(text_score)
+                + self.config.weights.get("name", 0.0) * float(keyword_flag)
             )
             scores.append(score)
             flags.setdefault("ontology", []).append(ontology_flag)
             flags.setdefault("group", []).append(group_flag)
             flags.setdefault("drug", []).append(drug_flag)
             flags.setdefault("text_score", []).append(text_score)
+            flags.setdefault("name_keyword", []).append(keyword_flag)
             evidence_records.append(json.dumps(evidence, ensure_ascii=False))
 
         result = diseases.select("node_index").with_columns(
@@ -200,13 +241,19 @@ class PsychiatricRelevanceScorer:
             pl.Series("group_flag", flags["group"]),
             pl.Series("drug_flag", flags["drug"]),
             pl.Series("text_score", flags["text_score"]),
+            pl.Series("name_keyword_flag", flags["name_keyword"]),
         )
 
         def _final_decision(row: Mapping[str, object]) -> bool:
             score = float(row["psy_score"])
             bool_flags = sum(
                 int(bool(row[column]))
-                for column in ("ontology_flag", "group_flag", "drug_flag")
+                for column in (
+                    "ontology_flag",
+                    "group_flag",
+                    "drug_flag",
+                    "name_keyword_flag",
+                )
             )
             text_hit = float(row["text_score"]) > 0.2
             if score >= self.config.threshold:
@@ -219,6 +266,29 @@ class PsychiatricRelevanceScorer:
 
         decisions = [_final_decision(row) for row in result.iter_rows(named=True)]
         result = result.with_columns(pl.Series("is_psychiatric", decisions))
+
+        if logger.isEnabledFor(logging.DEBUG):
+            total = len(decisions)
+            positive = sum(1 for d in decisions if d)
+            flag_counts = {
+                "ontology": sum(flags["ontology"]),
+                "group": sum(flags["group"]),
+                "drug": sum(flags["drug"]),
+                "name": sum(flags["name_keyword"]),
+            }
+            text_hits = sum(1 for score in flags["text_score"] if score > 0.2)
+            logger.debug(
+                "Psych scoring summary: total=%d positive=%d ontology=%d group=%d "
+                "drug=%d name=%d text_hits=%d threshold=%.3f",
+                total,
+                positive,
+                flag_counts["ontology"],
+                flag_counts["group"],
+                flag_counts["drug"],
+                flag_counts["name"],
+                text_hits,
+                self.config.threshold,
+            )
         return result
 
     def _build_drug_keyword_lookup(
@@ -251,6 +321,15 @@ class PsychiatricRelevanceScorer:
             }
             relevant[node_index] = any(token in keywords for token in tokens)
         return relevant
+
+    def _name_contains_keyword(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        if not lowered:
+            return False
+        for keyword in self._name_keywords:
+            if keyword in lowered:
+                return True
+        return False
 
     def _map_diseases_to_psychiatric_drugs(
         self,
@@ -297,3 +376,6 @@ def build_default_scoring_config(threshold: float) -> PsychiatricScoringConfig:
         weights=_DEFAULT_WEIGHTS,
         threshold=threshold,
     )
+
+
+logger = logging.getLogger(__name__)

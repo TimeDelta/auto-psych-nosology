@@ -735,6 +735,7 @@ class EntityRelationExtractor:
             "group_flag": pl.lit(False),
             "drug_flag": pl.lit(False),
             "text_score": pl.lit(0.0),
+            "name_keyword_flag": pl.lit(False),
         }
         for column, expr in default_columns.items():
             if column not in nodes.columns:
