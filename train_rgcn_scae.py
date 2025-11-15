@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import time
@@ -34,6 +35,8 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import k_hop_subgraph
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from self_compressing_auto_encoders import (
     NodeAttributeDeepSetEncoder,
@@ -324,6 +327,48 @@ def _parse_graphml(
     return nodes, edges
 
 
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (float, int)):
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.detach().cpu().item())
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return bool(value.detach().cpu().item())
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return None
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return None
+
+
 def load_multiplex_graph(
     graphml_path: Path,
     *,
@@ -608,6 +653,135 @@ def load_multiplex_graph(
         node_labels=node_labels,
         node_ids=node_ids_ordered,
     )
+
+
+def _extract_psy_metrics(graph: MultiplexGraph) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_nodes = int(graph.data.node_types.numel())
+    scores = torch.zeros(num_nodes, dtype=torch.float32)
+    flags = torch.zeros(num_nodes, dtype=torch.bool)
+    for idx, attrs in enumerate(graph.node_attributes):
+        score = _coerce_float(attrs.get("psy_score"))
+        if score is not None:
+            scores[idx] = float(score)
+        flag = _coerce_bool(attrs.get("is_psychiatric"))
+        if flag is not None:
+            flags[idx] = flag
+    return scores, flags
+
+
+def _expand_node_mask(
+    mask: torch.Tensor, edge_index: torch.Tensor, hops: int
+) -> torch.Tensor:
+    if hops <= 0 or mask.numel() == 0 or edge_index.numel() == 0:
+        return mask
+    expanded = mask.clone()
+    for _ in range(hops):
+        if not expanded.any():
+            break
+        incident = torch.zeros_like(expanded)
+        src_mask = expanded[edge_index[0]]
+        if src_mask.any():
+            incident_nodes = edge_index[1][src_mask]
+            incident[incident_nodes] = True
+        dst_mask = expanded[edge_index[1]]
+        if dst_mask.any():
+            incident_nodes = edge_index[0][dst_mask]
+            incident[incident_nodes] = True
+        expanded |= incident
+    return expanded
+
+
+def _apply_node_mask(graph: MultiplexGraph, mask: torch.Tensor) -> MultiplexGraph:
+    num_nodes = int(graph.data.node_types.numel())
+    keep_idx = mask.nonzero(as_tuple=False).view(-1)
+    if keep_idx.numel() == num_nodes:
+        return graph
+    mapping = torch.full((num_nodes,), -1, dtype=torch.long)
+    mapping[keep_idx] = torch.arange(keep_idx.size(0), dtype=torch.long)
+
+    edge_index = graph.data.edge_index
+    if edge_index.numel() == 0:
+        new_edge_index = edge_index.clone()
+        edge_mask = torch.zeros(0, dtype=torch.bool)
+    else:
+        edge_mask = mask[edge_index[0]] & mask[edge_index[1]]
+        new_edge_index = mapping[edge_index[:, edge_mask]]
+
+    new_edge_type = graph.data.edge_type
+    if new_edge_type.numel() and edge_mask.numel():
+        new_edge_type = new_edge_type[edge_mask]
+    elif new_edge_type.numel() and edge_mask.numel() == 0:
+        new_edge_type = torch.empty((0,), dtype=new_edge_type.dtype)
+
+    new_edge_weight = getattr(graph.data, "edge_weight", None)
+    if new_edge_weight is not None:
+        if edge_mask.numel():
+            new_edge_weight = new_edge_weight[edge_mask]
+        else:
+            new_edge_weight = torch.empty((0,), dtype=new_edge_weight.dtype)
+
+    keep_list = keep_idx.tolist()
+    new_node_attributes = [graph.node_attributes[i] for i in keep_list]
+    new_node_labels = [graph.node_labels[i] for i in keep_list]
+    new_node_ids = [graph.node_ids[i] for i in keep_list]
+    new_node_index = {node_id: idx for idx, node_id in enumerate(new_node_ids)}
+
+    new_data = Data(
+        node_types=graph.data.node_types[keep_idx],
+        edge_index=new_edge_index.contiguous(),
+        edge_type=new_edge_type.contiguous()
+        if new_edge_type.numel()
+        else torch.empty((0,), dtype=torch.long),
+    )
+    if new_edge_weight is not None:
+        new_data.edge_weight = new_edge_weight
+    if hasattr(graph.data, "name_text_embedding_dim"):
+        new_data.name_text_embedding_dim = graph.data.name_text_embedding_dim
+    new_data.node_names = new_node_labels
+    new_data.node_ids = new_node_ids
+    new_data.node_type_names = graph.data.node_type_names
+    new_data.edge_type_names = graph.data.edge_type_names
+    new_data.node_attributes = new_node_attributes
+
+    return MultiplexGraph(
+        data=new_data,
+        node_index=new_node_index,
+        node_type_index=graph.node_type_index,
+        relation_index=graph.relation_index,
+        node_attributes=new_node_attributes,
+        node_labels=new_node_labels,
+        node_ids=new_node_ids,
+    )
+
+
+def _filter_graph_by_psy_metrics(
+    graph: MultiplexGraph,
+    *,
+    min_psy_score: float,
+    require_psychiatric_flag: bool,
+    neighbor_hops: int,
+) -> Tuple[MultiplexGraph, int, int]:
+    num_nodes = int(graph.data.node_types.numel())
+    if num_nodes == 0:
+        return graph, 0, 0
+    if min_psy_score <= 0 and not require_psychiatric_flag:
+        return graph, 0, 0
+    scores, flags = _extract_psy_metrics(graph)
+    keep_mask = torch.ones(num_nodes, dtype=torch.bool)
+    if min_psy_score > 0:
+        keep_mask &= scores >= float(min_psy_score)
+    if require_psychiatric_flag:
+        keep_mask &= flags
+    if neighbor_hops > 0:
+        keep_mask = _expand_node_mask(keep_mask, graph.data.edge_index, neighbor_hops)
+    if keep_mask.all():
+        return graph, 0, 0
+    pruned_graph = _apply_node_mask(graph, keep_mask)
+    removed_nodes = num_nodes - int(pruned_graph.data.node_types.numel())
+    removed_edges = int(graph.data.edge_index.size(1)) - int(
+        pruned_graph.data.edge_index.size(1)
+    )
+    return pruned_graph, removed_nodes, removed_edges
 
 
 @dataclass(frozen=True)
@@ -2212,6 +2386,40 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Optional cap on edges per ego-net sample (None leaves adaptive radius)",
     )
     parser.add_argument(
+        "--min-psy-score",
+        type=float,
+        default=0.0,
+        help="Drop nodes whose psy_score falls below this threshold before training",
+    )
+    parser.add_argument(
+        "--require-psychiatric",
+        action="store_true",
+        help="Retain only nodes whose is_psychiatric flag is True (after optional score filtering)",
+    )
+    parser.add_argument(
+        "--psy-include-neighbors",
+        type=int,
+        default=0,
+        help="Number of hops of neighbors to retain around nodes that pass the psychiatric filters",
+    )
+    parser.add_argument(
+        "--auto-ego-node-threshold",
+        type=int,
+        default=50000,
+        help="If --ego-samples is 0 and the graph has at least this many nodes, automatically enable ego-net sampling (0 disables auto).",
+    )
+    parser.add_argument(
+        "--auto-ego-samples",
+        type=int,
+        default=64,
+        help="Number of ego-net samples per epoch when auto-enabled",
+    )
+    parser.add_argument(
+        "--force-full-graph",
+        action="store_true",
+        help="Disable automatic ego-net sampling even for very large graphs",
+    )
+    parser.add_argument(
         "--ego-seed",
         type=int,
         default=None,
@@ -2326,6 +2534,14 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--ego-max-nodes must be positive when provided")
     if args.ego_max_edges is not None and args.ego_max_edges < 1:
         parser.error("--ego-max-edges must be positive when provided")
+    if args.min_psy_score < 0:
+        parser.error("--min-psy-score must be non-negative")
+    if args.psy_include_neighbors < 0:
+        parser.error("--psy-include-neighbors must be non-negative")
+    if args.auto_ego_node_threshold < 0:
+        parser.error("--auto-ego-node-threshold must be non-negative")
+    if args.auto_ego_samples < 0:
+        parser.error("--auto-ego-samples must be non-negative")
     if args.pos_edge_chunk is not None and args.pos_edge_chunk < 0:
         parser.error("--pos-edge-chunk must be non-negative")
     if args.neg_edge_chunk is not None and args.neg_edge_chunk < 0:
@@ -2382,11 +2598,35 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         enable_text_embedding_cache=enable_text_embedding_cache,
         text_encoder_projection_dim=text_encoder_projection_dim,
     )
+    graph, removed_nodes, removed_edges = _filter_graph_by_psy_metrics(
+        graph,
+        min_psy_score=args.min_psy_score,
+        require_psychiatric_flag=args.require_psychiatric,
+        neighbor_hops=args.psy_include_neighbors,
+    )
+    if (removed_nodes or removed_edges) and not args.quiet:
+        print(
+            f"[INFO] Dropped {removed_nodes} nodes and {removed_edges} edges via psychiatric filters"
+        )
+
     num_nodes_after = int(graph.data.node_types.numel())
     num_edges_after = int(graph.data.edge_index.size(1))
     print(
         f"Graph after nosology filter: {num_nodes_after} nodes, {num_edges_after} edges"
     )
+    if (
+        args.ego_samples == 0
+        and not args.force_full_graph
+        and args.auto_ego_node_threshold > 0
+        and num_nodes_after >= args.auto_ego_node_threshold
+    ):
+        args.ego_samples = max(1, args.auto_ego_samples)
+        if not args.quiet:
+            print(
+                "[INFO] Auto-enabled ego-net sampling due to graph size ("
+                f"{num_nodes_after:,} nodes >= {args.auto_ego_node_threshold:,}); "
+                f"sampling {args.ego_samples} ego-nets per epoch."
+            )
     effective_num_clusters = (
         args.clusters if args.clusters is not None else _default_cluster_capacity(graph)
     )
@@ -2446,8 +2686,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     if not args.mlflow and mlflow_auto_reasons:
         args.mlflow = True
-        if not args.quiet:
-            reason_text = ", ".join(dict.fromkeys(mlflow_auto_reasons))
+        reason_text = ", ".join(dict.fromkeys(mlflow_auto_reasons))
+        user_requested = any(reason.startswith("--") for reason in mlflow_auto_reasons)
+        should_notify = not user_requested
+        if should_notify and not args.quiet:
             print(
                 "[INFO] Auto-enabled MLflow tracking because "
                 f"{reason_text} was provided. Omit those flags to skip MLflow."

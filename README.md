@@ -32,23 +32,7 @@ curl -L -o data/hpo/genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hp
 python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
 ```
 to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
-- Run
-```
-python3.10 create_graph.py \
-    --kg-path data/primekg_kg.csv \
-    --output-dir data \
-    --data-dir data/ \
-    --log-level DEBUG \
-    --output-prefix prebuilt-kg \
-    --ontology-terms hpo=data/hpo/hpo_terms.csv \
-    --ontology-annotations hpo=data/hpo/hpo_annotations.csv \
-    --ontology-term-id-column hpo=id \
-    --ontology-term-name-column hpo=name \
-    --ontology-parent-column hpo=parents \
-    --ontology-annotation-entity-column hpo=entity \
-    --ontology-annotation-term-column hpo=term
-```
-to create the final graph used for training.
+- Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the final graph used for training.
 - MLflow is used for optional experiment tracking.
     - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
     - Metric explanations:
@@ -68,6 +52,7 @@ to create the final graph used for training.
         - **num_negatives** counts sampled negative edges that survived the per-graph cap.
         - **timing_sample_neg** and **timing_neg_logits** capture the wall-clock time (in seconds) spent sampling negatives and scoring them.
 - The RGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
+- Use `python3.10 check_node_precision_recall.py --graph data/ikgraph.graphml --subset psychiatric --min-psy-score 0.33 --psy-include-neighbors 0` to report HiTOP/RDoC precision/recall over the exact node universe that survives the psychiatric filters. Add `--per-label-csv out/per_label_precision_recall.csv` if you need per-domain tables for manuscripts or diagnostics.
 - Partition training supports resumable checkpoints via `train_rgcn_scae.py`.
     - Pass `--checkpoint-path PATH.pt` to atomically persist model weights, optimizer state, history, and run metadata at the end of training (and optionally every `--checkpoint-every N` epochs).
     - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
