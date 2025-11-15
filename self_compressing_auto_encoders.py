@@ -575,6 +575,7 @@ class RGCNClusterEncoder(nn.Module):
                         tensor, conv, norm
                     ),
                     x,
+                    use_reentrant=False,
                 )
             else:
                 x = _apply_layer(x, conv, norm)
