@@ -1,10 +1,4 @@
-"""
-See T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership
-stochastic blockmodels for multiple networks and experimental interventions,”
-in Handbook of Mixed Membership Models and Their Applications, E. Airoldi,
-D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman &
-Hall/CRC Press, 2014, pp. 463–488.
-"""
+"""Vanilla SBM partitions via Louvain/greedy modularity heuristics."""
 
 from __future__ import annotations
 
@@ -12,7 +6,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import networkx as nx
 
@@ -102,158 +96,38 @@ def _detect_communities(
     return _order_communities(communities)
 
 
-class _ClusterNode:
-    """Internal representation of a cluster in the hierarchy."""
+def _build_node_name_map(graph: nx.Graph) -> Dict[str, str]:
+    """Map node identifiers to human-friendly names when available."""
 
-    __slots__ = ("members", "children", "modularity")
+    preferred_attrs = ("name", "label", "title")
+    node_name_map: Dict[str, str] = {}
 
-    def __init__(self, members: Sequence[str]) -> None:
-        self.members: List[str] = sorted(str(node) for node in members)
-        self.children: List["_ClusterNode"] = []
-        self.modularity: float | None = None
+    for node, data in graph.nodes(data=True):
+        node_id = str(node)
+        label = None
+        for attr in preferred_attrs:
+            value = data.get(attr)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    label = text
+                    break
+        node_name_map[node_id] = label if label is not None else node_id
 
-
-def _split_cluster(
-    graph: nx.Graph,
-    node: _ClusterNode,
-    *,
-    depth: int,
-    max_depth: int,
-    weight_key: str | None,
-    min_cluster_size: int,
-    min_modularity_gain: float,
-    resolution: float,
-    seed: int,
-) -> None:
-    """Recursively split a cluster using modularity optimisation."""
-
-    if depth >= max_depth:
-        return
-
-    if len(node.members) < max(2, min_cluster_size):
-        return
-
-    subgraph = graph.subgraph(node.members).copy()
-    if subgraph.number_of_edges() == 0:
-        return
-
-    communities = _detect_communities(
-        subgraph,
-        weight=weight_key,
-        resolution=resolution,
-        seed=seed + depth,
-    )
-
-    if len(communities) <= 1:
-        return
-
-    community_sets = [set(group) for group in communities]
-    sub_modularity = modularity(
-        subgraph,
-        community_sets,
-        weight=weight_key,
-    )
-
-    if sub_modularity < min_modularity_gain:
-        return
-
-    node.modularity = sub_modularity
-
-    for group in communities:
-        child = _ClusterNode(group)
-        node.children.append(child)
-        if len(child.members) >= min_cluster_size:
-            _split_cluster(
-                graph,
-                child,
-                depth=depth + 1,
-                max_depth=max_depth,
-                weight_key=weight_key,
-                min_cluster_size=min_cluster_size,
-                min_modularity_gain=min_modularity_gain,
-                resolution=resolution,
-                seed=seed,
-            )
+    return node_name_map
 
 
-def _collect_levels(
-    graph: nx.Graph,
-    root: _ClusterNode,
-    *,
-    weight_key: str | None,
-) -> Tuple[List[Dict[str, Any]], float]:
-    """Convert the cluster tree into per-level assignments and metrics."""
-
-    levels: List[Dict[str, Any]] = []
-    total_negative_modularity = 0.0
-
-    current_level: List[_ClusterNode] = [root]
-    level_index = 0
-
-    while current_level:
-        next_level: List[_ClusterNode] = []
-        clusters: List[_ClusterNode] = []
-
-        for cluster in current_level:
-            if cluster.children:
-                clusters.extend(cluster.children)
-                next_level.extend(cluster.children)
-
-        if not clusters:
-            break
-
-        assignments: Dict[str, int] = {}
-        for idx, cluster in enumerate(clusters):
-            for node in cluster.members:
-                assignments[node] = idx
-
-        union_nodes = set(assignments.keys())
-        level_graph = graph.subgraph(union_nodes).copy()
-        level_partition = [set(cluster.members) for cluster in clusters]
-        level_modularity = modularity(level_graph, level_partition, weight=weight_key)
-        total_negative_modularity += -level_modularity
-
-        levels.append(
-            {
-                "level": level_index,
-                "n_blocks": len(clusters),
-                "assignments": assignments,
-                "modularity": level_modularity,
-            }
-        )
-
-        current_level = next_level
-        level_index += 1
-
-    if not levels:
-        # No splits occurred; treat entire graph as single block at level 0.
-        all_nodes = sorted(str(node) for node in root.members)
-        levels.append(
-            {
-                "level": 0,
-                "n_blocks": 1,
-                "assignments": {node: 0 for node in all_nodes},
-                "modularity": 0.0,
-            }
-        )
-
-    return levels, total_negative_modularity
-
-
-def _hierarchical_partition(
+def _flat_partition(
     graph: nx.Graph,
     *,
     weight_attr: str = "weight",
-    max_levels: int = 5,
-    min_cluster_size: int = 5,
-    min_modularity_gain: float = 5e-3,
     resolution: float = 1.0,
     seed: int = 13,
 ) -> Dict[str, Any]:
-    """Produce a hierarchical clustering via recursive modularity optimisation."""
+    """Produce a single-level SBM-style partition via modularity optimisation."""
 
     if graph.number_of_nodes() == 0:
-        raise ValueError("Cannot compute hierarchy on an empty graph.")
+        raise ValueError("Cannot compute partition on an empty graph.")
 
     weight_key = (
         weight_attr
@@ -261,55 +135,63 @@ def _hierarchical_partition(
         else None
     )
 
-    root = _ClusterNode(list(graph.nodes()))
-    _split_cluster(
+    communities = _detect_communities(
         graph,
-        root,
-        depth=0,
-        max_depth=max_levels,
-        weight_key=weight_key,
-        min_cluster_size=min_cluster_size,
-        min_modularity_gain=min_modularity_gain,
+        weight=weight_key,
         resolution=resolution,
         seed=seed,
     )
+    if not communities:
+        communities = [sorted(str(node) for node in graph.nodes())]
 
-    levels, total_negative_modularity = _collect_levels(
-        graph,
-        root,
-        weight_key=weight_key,
-    )
+    node_to_cluster: Dict[str, int] = {}
+    cluster_member_ids: Dict[str, List[str]] = {}
+    for cluster_idx, members in enumerate(communities):
+        cluster_key = str(cluster_idx)
+        clean_members = sorted(str(node) for node in members)
+        cluster_member_ids[cluster_key] = clean_members
+        for node in clean_members:
+            node_to_cluster[node] = cluster_idx
+
+    level_partition = [set(members) for members in cluster_member_ids.values()]
+    level_modularity = modularity(graph, level_partition, weight=weight_key)
+
+    levels = [
+        {
+            "level": 0,
+            "n_blocks": len(cluster_member_ids),
+            "assignments": dict(node_to_cluster),
+            "modularity": level_modularity,
+        }
+    ]
 
     return {
         "levels": levels,
-        "description_length": total_negative_modularity,
+        "description_length": -level_modularity,
         "deg_corr": True,
         "algorithm": "louvain"
         if louvain_communities is not None
         else "greedy_modularity",
+        "node_to_cluster": node_to_cluster,
+        "cluster_member_ids": cluster_member_ids,
         "parameters": {
-            "max_levels": max_levels,
-            "min_cluster_size": min_cluster_size,
-            "min_modularity_gain": min_modularity_gain,
             "resolution": resolution,
             "seed": seed,
+            "weight_attr": weight_attr,
         },
     }
 
 
-def run_hsbm(
+def run_sbm(
     graph_path: Path,
     state_path: Path | None = None,
     deg_corr: bool = True,
     ignore_node_types: set[str] | None = None,
     *,
-    max_levels: int = 5,
-    min_cluster_size: int = 5,
-    min_modularity_gain: float = 5e-3,
     resolution: float = 1.0,
     seed: int = 13,
 ) -> Dict[str, Any]:
-    """Run hierarchical partitioning without relying on graph-tool."""
+    """Run a vanilla SBM-style partition without relying on graph-tool."""
 
     if not deg_corr:
         LOGGER.warning(
@@ -337,15 +219,20 @@ def run_hsbm(
                 "Relax the ignore_node_types setting."
             )
 
-    hierarchy = _hierarchical_partition(
+    hierarchy = _flat_partition(
         nx_graph,
         weight_attr="weight",
-        max_levels=max_levels,
-        min_cluster_size=min_cluster_size,
-        min_modularity_gain=min_modularity_gain,
         resolution=resolution,
         seed=seed,
     )
+
+    node_name_map = _build_node_name_map(nx_graph)
+    hierarchy["node_name_map"] = node_name_map
+    cluster_member_ids: Dict[str, List[str]] = hierarchy.get("cluster_member_ids", {})
+    hierarchy["cluster_members"] = {
+        cluster_id: [node_name_map.get(node_id, node_id) for node_id in members]
+        for cluster_id, members in cluster_member_ids.items()
+    }
 
     if state_path is not None:
         LOGGER.info(
@@ -357,8 +244,15 @@ def run_hsbm(
     return hierarchy
 
 
+def run_hsbm(*args, **kwargs):  # pragma: no cover - backwards compatibility shim
+    LOGGER.warning(
+        "run_hsbm() is deprecated; falling back to vanilla SBM (flat) partitioning."
+    )
+    return run_sbm(*args, **kwargs)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Hierarchical SBM partition generator")
+    parser = argparse.ArgumentParser(description="Vanilla SBM partition generator")
     parser.add_argument(
         "graph", type=Path, help="Input GraphML file produced by create_graph.py"
     )
@@ -385,27 +279,6 @@ if __name__ == "__main__":
         help="Python logging level (default: INFO)",
     )
     parser.add_argument(
-        "--max-levels",
-        type=int,
-        default=5,
-        help="Maximum number of hierarchical levels to explore (default: 5)",
-    )
-    parser.add_argument(
-        "--min-cluster-size",
-        type=int,
-        default=5,
-        help="Minimum community size eligible for further splitting (default: 5)",
-    )
-    parser.add_argument(
-        "--min-modularity-gain",
-        type=float,
-        default=5e-3,
-        help=(
-            "Minimum modularity improvement required to accept a split "
-            "within a community (default: 5e-3)"
-        ),
-    )
-    parser.add_argument(
         "--resolution",
         type=float,
         default=1.0,
@@ -427,22 +300,17 @@ if __name__ == "__main__":
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
 
     LOGGER.info(
-        "Running modularity-based hierarchical clustering on %s (max_levels=%d, min_cluster_size=%d)",
+        "Running vanilla SBM (flat) clustering on %s",
         args.graph,
-        args.max_levels,
-        args.min_cluster_size,
     )
     ignore_types = set()
     if not args.keep_diagnoses:
         ignore_types.add("Diagnosis")
-    result = run_hsbm(
+    result = run_sbm(
         args.graph,
         args.state_path,
         deg_corr=not args.no_deg_corr,
         ignore_node_types=ignore_types or None,
-        max_levels=args.max_levels,
-        min_cluster_size=args.min_cluster_size,
-        min_modularity_gain=args.min_modularity_gain,
         resolution=args.resolution,
         seed=args.seed,
     )

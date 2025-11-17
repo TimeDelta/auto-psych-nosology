@@ -17,13 +17,15 @@
         - [Preventing Trivial / Degenerate Solutions](#preventing-trivial--degenerate-solutions)
         - [Adaptive Subgraph Sampling to Mitigate Overfitting](#adaptive-subgraph-sampling-to-mitigate-overfitting)
         - [Comparison](#comparison)
+- [Results](#results)
+- [Discussion](#discussion)
 - [Abbreviations](#abbreviations)
 - [References](#references)
 
 ## Code Notes
 - Install project requirements via `pip3.10 install -r requirements.txt`.
 - Run `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data` to download the main data for the knowledge graph.
-- Run
+- If you want to include ontology augmentation, run
 ```
 mkdir -p data/hpo
 curl -L -o data/hpo/hp.obo https://purl.obolibrary.org/obo/hp.obo
@@ -32,6 +34,16 @@ curl -L -o data/hpo/genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hp
 python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
 ```
 to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
+and include the following CLI params in the below create_graph command:
+```
+--ontology-terms hpo=data/hpo/hpo_terms.csv \
+--ontology-annotations hpo=data/hpo/hpo_annotations.csv \
+--ontology-term-id-column hpo=id \
+--ontology-term-name-column hpo=name \
+--ontology-parent-column hpo=parents \
+--ontology-annotation-entity-column hpo=entity \
+--ontology-annotation-term-column hpo=term
+```
 - Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the final graph used for training.
 - MLflow is used for optional experiment tracking.
     - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
@@ -58,7 +70,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
     - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
     - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
 - Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
-- To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_hSBM_partitions.py](./create_hSBM_partitions.py).
+- To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_sbm_partitions.py](./create_sbm_partitions.py).
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
 
 ## Background / Literature Review
@@ -192,8 +204,8 @@ Only after the final partitioning is complete will alignment metrics such as nor
 This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
 
 ### Partitioning
-Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a hierarchical stochastic block model (hSBM) [21], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
-This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits hSBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
+Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a stochastic block model (SBM) [21], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
+This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits SBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
 The other model architecture tested was a **Relational Graph Convolutional Network Self-Compressing Autoencoder (RGCN-SCAE)**.
 This model was trained exclusively on the full graph to derive a single global partitioning that captures the complete relational structure.
@@ -235,6 +247,25 @@ Entropy-aware reweighting of negatives, inverse-frequency scaling, and chunked e
 The relation-specific logits follow $\ell_{ijr} = a_i^{\top} W_r a_j + b_r,$ with assignment vectors $a_i = Q_{i\cdot}$ and low-rank weight matrices $W_r = \sigma(F_r B) \odot G_r$, where $F_r \in \mathbb{R}^{C\times d}$, $B \in \mathbb{R}^{d\times C}$, and $G_r$ is the current hard-concrete gate sample.
 
 #### Training
+##### Command
+For the main experiment results, the exact command ran was:
+```
+python3.10 train_rgcn_scae.py data/ikgraph.graphml \
+  --require-psychiatric --min-psy-score 0.33 --psy-include-neighbors 0 \
+  --force-full-graph \
+  --negative-sampling 1.0 \
+  --gradient-checkpointing \
+  --pos-edge-chunk 512 --neg-edge-chunk 512 \
+  --gate-threshold 0.35 \
+  --min-epochs 100 --max-epochs 250 \
+  --checkpoint-path bimodality-test.pt --checkpoint-every 10 \
+  --calibration-epochs 50 \
+  --cluster-stability-window 10 \
+  --text-encoder-model pritamdeka/S-Scibert-snli-multinli-stsb --text-encoder-normalize --text-embedding-cache auto \
+  --mlflow --mlflow-experiment exploration --mlflow-run-name ikraph \
+  --npz-out ikraph-training.npz
+```
+
 ##### Mitigating Cluster Collapse and Runaway Imbalance
 Cluster gates can collapse into a handful of latent units unless they are continually encouraged to share responsibility for the data.
 Each mini-batch is therefore projected into a near doubly-stochastic assignment matrix via a Sinkhorn normalization, and the prototypes that receive that mass are updated with an exponential moving average that discourages any single cluster from monopolizing the representation.
@@ -460,25 +491,31 @@ The final partitioning is derived from running the full knowledge graph through 
 This procedure reframes training as an information-theoretic compression task applied repeatedly to partially overlapping realizations of the same knowledge manifold, allowing estimation of replication reliability and consensus structure while reducing overfitting to any single instantiation.
 
 #### Comparison
-Together, hSBM offers a likelihood-grounded categorical perspective, while RGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
+Together, SBM offers a likelihood-grounded categorical perspective, while RGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
 The two approaches are treated as triangulating evidence: concordant structure across them increases confidence in emergent transdiagnostic clusters, whereas divergences highlight fronts for qualitative review.
 
-| Aspect                        | Recurrent Graph Convoplutional Network Self-Compressing Autoencoder (RGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (hSBM)                                                                                  |
+| Aspect                        | Recurrent Graph Convoplutional Network Self-Compressing Autoencoder (RGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (SBM)                                                                                  |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | **Representation**            | Learns *continuous latent embeddings* for nodes and relations; nonlinear, differentiable, expressive.                                        | Assigns *discrete cluster memberships* via probabilistic inference on connectivity patterns.                              |
 | **Objective**                 | Minimizes reconstruction loss → learns information-optimal embeddings that compress the multiplex graph while preserving semantic structure. | Maximizes likelihood under a generative model → partitions graph to best explain edge densities between groups.             |
 | **Adaptivity**                | Learns directly from heterogeneous, weighted, typed edges and can incorporate node attributes, features, and higher-order dependencies.      | Operates purely on adjacency structure (and possibly metadata) assuming a fixed parametric form (block interaction matrix). |
-| **Scalability & Flexibility** | Scales gracefully to large multiplex graphs via minibatch training and GPU acceleration; can integrate multiple modalities in future.                  | Computationally expensive for deep hierarchies; inference is typically O(N²), with N = #nodes in graph, and difficult to extend across modalities.     |
+| **Scalability & Flexibility** | Much higher computationial cost for training; can integrate multiple modalities in future.                  | Inference is typically O(N²), with N = #nodes in graph, and difficult to extend across modalities.     |
 | **Output**                    | Produces a *latent manifold* where distances encode both structural and semantic similarity — enabling *continuous transdiagnostic spectra*. | Produces discrete, possibly hierarchical clusters — enforcing categorical partitions reminiscent of DSM-like divisions.     |
+
+## Results
+
+
+## Discussion
+
 
 ## Abbreviations
 - ARI = adjusted Rand index
 - DSM = Diagnostic and Statistical Manual of Mental Disorders
 - HiTOP = Hierarchical Taxonomy of Psychopathology
-- hSBM = Hierarchical Stochastic Block Model
 - ICD = International Classification of Diseases
 - RDoC = Research Domain Criteria
 - RGCN = Relational Graph Convolutional Network
+- SBM = Stochastic Block Model
 - SCAE = Self-Compressing Auto-Encoder
 
 ## References
