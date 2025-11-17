@@ -217,6 +217,14 @@ The encoder couples a Deep Sets attribute encoder [22] with a stacked RGCN layer
 Each node is first encoded by a DeepSets-style node attribute encoder, implementing the Zaheer et al. $\rho$/$\phi$ formulation, that is permutation-invariant.
 This component integrates arbitrarily structured metadata—text learned embeddings, biomarkers and ontology terms.
 It can expand its vocabulary online, allowing new attributes to be assimilated without retraining existing embeddings.
+Each node label is first embedded with the `pritamdeka/S-Scibert-snli-multinli-stsb` SentenceTransformer, producing a 768-dimensional biomedical vector that already reflects domain-specific semantic organization.
+To prevent these high-capacity descriptors from overwhelming the other DeepSet inputs, they are contracted with a Johnson–Lindenstrauss projection to dimension $d_p$ (default 128, configurable via `--text-encoder-projection-dim`, or disabled by setting that flag to 0).
+For every unique combination of graph, model, and projection width, the projection matrix is generated exactly once: we hash the ordered `(node_id, node_text)` pairs with SHA-256, treat the digest as the seed of a standard-normal random number generator, and sample the matrix in a single pass.
+Because the seed depends solely on data and hyperparameters, the projection is deterministic across runs and introduces no learnable weights that the downstream network could co-opt.
+The projected vectors are optionally $L_2$-normalized and cached under `_NAME_TEXT_EMBED_ATTR`, ensuring that the DeepSet encoder consumes a compact text representation alongside boolean indicators, bucketized counts, and other scalar attributes.
+This procedure behaves like a classical JL embedding [24] that preserves pairwise geometry while capping the influence of text semantics.
+Cached `.npz` blobs store the sentence encoder identifier, normalization flag, fingerprint, and projection dimensionality, so subsequent executions reload the identical tensors unless either the graph text or the relevant hyperparameters are modified.
+
 The resulting descriptor is concatenated with:
 A learned node-type embedding, encoding categorical identity in a compact, regularized form and graph-positional encodings derived from standardized Laplacian eigenvectors, normalized per subgraph to maintain numerical stability when batch sizes or graph orders vary, both of which are only relevant during stability check.
 The fused vectors are processed through a relation-aware additive message-passing stack of graph convolutional layers using basis decomposition (a parameter sharing technique) across relation types.
@@ -542,3 +550,4 @@ The two approaches are treated as triangulating evidence: concordant structure a
 1. T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership stochastic blockmodels for multiple networks and experimental interventions,” in Handbook of Mixed Membership Models and Their Applications, E. Airoldi, D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman & Hall/CRC Press, 2014, pp. 463–488.
 1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
 1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
+1. W. B. Johnson, J. Lindenstrauss, and G. Schechtman, “Extensions of Lipschitz maps into Banach spaces,” Israel Journal of Mathematics, vol. 54, no. 2, pp. 129–138, May 1986.
