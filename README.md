@@ -340,16 +340,17 @@ The objective is a minimization of a composite loss function that couples recons
 The training loop minimizes
 
 $$
-\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{recon}}
-+ \lambda_{L0}^{\text{enc}}\,\mathcal{L}_{\text{cluster-L0}}
-+ \lambda_{L0}^{\text{dec}}\,\mathcal{L}_{\text{inter-L0}}
-+ \lambda_{H}\,\mathcal{L}_{\text{entropy}}
-+ \lambda_{\text{Dir}}\,\mathrm{KL}(u\,\|\,u_{\text{prior}})
-+ \lambda_{\text{emb}}\,\mathcal{L}_{\text{emb-norm}} \\
-+ \lambda_{\text{KLD}}\,\mathcal{L}_{\text{graph-KLD}}
-+ \lambda_{\text{cons}}\,\mathcal{L}_{\text{consistency}}
-+ \lambda_{\text{gate}}\,\mathcal{L}_{\text{gate-entropy}}
-+ \lambda_{\text{deg}}\,\mathcal{L}_{\text{degree}},
+\mathcal{L}_{\text{total}} = \begin{align*}\mathcal{L}_{\text{recon}} +
+    \lambda_{L0}^{\text{enc}}\,\mathcal{L}_{\text{cluster-L0}} +
+    \lambda_{L0}^{\text{dec}}\,\mathcal{L}_{\text{inter-L0}} +
+    \lambda_{H}\,\mathcal{L}_{\text{entropy}} +
+    \lambda_{\text{Dir}}\,\mathrm{KL}(u\,\|\,u_{\text{prior}}) +
+    \lambda_{\text{emb}}\,\mathcal{L}_{\text{emb-norm}} +
+    \lambda_{\text{KLD}}\,\mathcal{L}_{\text{graph-KLD}} +
+    \lambda_{\text{cons}}\,\mathcal{L}_{\text{consistency}} +
+    \lambda_{\text{gate}}\,\mathcal{L}_{\text{gate-entropy}} +
+    \lambda_{\text{deg}}\,\mathcal{L}_{\text{degree}},
+\end{align*}
 $$
 
 | Term | Meaning | Purpose |
