@@ -24,8 +24,8 @@
 
 ## Code Notes
 - Install project requirements via `pip3.10 install -r requirements.txt`.
-- Run `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data` to download the main data for the knowledge graph.
-- If you want to include ontology augmentation, run
+- Download the main data for the knowledge graph from https://zenodo.org/records/14851275/files/iKraph_full.tar.gz?download=1.
+- If you want to include ontology augmentation (not used in final experiment), run
 ```
 mkdir -p data/hpo
 curl -L -o data/hpo/hp.obo https://purl.obolibrary.org/obo/hp.obo
@@ -33,8 +33,7 @@ curl -L -o data/hpo/phenotype.hpoa https://purl.obolibrary.org/obo/hp/hpoa/pheno
 curl -L -o data/hpo/genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt
 python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
 ```
-to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes.
-and include the following CLI params in the below create_graph command:
+to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes and include the following CLI params in the below create_graph command:
 ```
 --ontology-terms hpo=data/hpo/hpo_terms.csv \
 --ontology-annotations hpo=data/hpo/hpo_annotations.csv \
@@ -44,9 +43,10 @@ and include the following CLI params in the below create_graph command:
 --ontology-annotation-entity-column hpo=entity \
 --ontology-annotation-term-column hpo=term
 ```
-- Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the final graph used for training.
+- Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the graph before psych-relevance filtering.
+- Run `python3.10 psy_filter_snapshot.py data/ikgraph.graphml --graphml-out data/ikgraph.filtered.graphml` to get final graph for training.
 - MLflow is used for optional experiment tracking.
-    - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact.
+    - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact as well as the traind model .pt file.
     - Metric explanations:
         - **total_loss** = weighted sum of reconstruction, sparsity, entropy, Dirichlet, embedding-norm, KL, consistency, gate-entropy, and degree penalties reported below.
         - **recon_loss** averages the BCE losses for positive and sampled negative edges per graph.
@@ -70,8 +70,8 @@ and include the following CLI params in the below create_graph command:
     - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
     - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
 - Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
-- To run the hierarchical stochastic block model baseline you must install [graph tool](https://graph-tool.skewed.de) before calling [create_sbm_partitions.py](./create_sbm_partitions.py).
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
+- To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1`
 
 ## Background / Literature Review
 Psychiatric nosology has long been dominated by categorical systems such as the DSM and the ICD.
@@ -179,8 +179,8 @@ Unlike many ML approaches that risk reproducing existing DSM or RDoC categories 
 Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
 ### Knowledge Graph
-The knowledge graph was created from a subset of the BioMedKG dataset [20], which can be downloaded with: `huggingface-cli download tienda02/BioMedKG --repo-type=dataset --local-dir ./data`.
-This data is then pared down to only the psychiatrically relevant nodes and edges by the [`create_graph.py`](./create_graph.py]) script.
+The knowledge graph was created from a subset of the IKraph dataset [20].
+This data is then pared down to only the psychiatrically relevant nodes and edges using heuristics.
 First, loading of the disease, drug, protein, and DNA modality tables happens and the hybrid `PsychiatricRelevanceScorer` is invoked, which fuses ontology membership, learned group labels, psychiatric drug neighborhoods, and cosine similarity to psychiatric prototype text snippets into a continuous relevance score.
 The high-confidence combinations still pass even if a single dimension underperforms, while low-scoring nodes are excluded.
 
@@ -538,7 +538,7 @@ The two approaches are treated as triangulating evidence: concordant structure a
 1. W. Wei et al., “NetMoST: A network-based machine learning approach for subtyping schizophrenia using polygenic SNP allele biomarkers,” arXiv preprint arXiv:2305.07005, 2023.
 1. D. Drysdale et al., “Resting-state connectivity biomarkers define neurophysiological subtypes of depression,” Nat. Med., vol. 23, pp. 28–38, 2017.
 1. Y. Benjamini and Y. Hochberg, "Controlling the false discovery rate: A practical and powerful approach to multiple testing," J. Roy. Statist. Soc. B (Methodological), vol. 57, no. 1, pp. 289–300, 1995.
-1. S. Gao, K. Yu, Y. Yang, S. Yu, C. Shi, X. Wang, N. Tang, and H. Zhu, “Large language model powered knowledge graph construction for mental health exploration,” Nature Communications, vol. 16, no. 1, Art. no. 7526, 2025, doi: 10.1038/s41467-025-62781-z.
+1. Zhang, Y., Sui, X., Pan, F., Yu, K., Li, K., Tian, S., Erdengasileng, A., Han, Q., Wang, W., Wang, J., Wang, J., Sun, D., Chung, H., Zhou, J., Zhou, E., Lee, B., Zhang, P., Qiu, X., Zhao, T. & Zhang, J. (2025). A comprehensive large-scale biomedical knowledge graph for AI-powered data-driven biomedical research. Nature Machine Intelligence, 7, 602–614.
 1. T. M. Sweet, A. C. Thomas, and B. W. Junker, “Hierarchical mixed membership stochastic blockmodels for multiple networks and experimental interventions,” in Handbook of Mixed Membership Models and Their Applications, E. Airoldi, D. Blei, E. Erosheva, and S. Fienberg, Eds. Boca Raton, FL, USA: Chapman & Hall/CRC Press, 2014, pp. 463–488.
 1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
 1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
