@@ -162,9 +162,11 @@ This preserves semantically coherent nodes (symptoms, biomarkers, treatments, et
 This entity-level masking substantially reduces over-masking and yields more biologically meaningful connectivity patterns versus a simple token-level method.
 Only after the final partitioning is complete will alignment metrics such as normalized mutual information and ARI be computed against HiTOP and RDoC categories.
 This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
+Only 14 nodes out of 59786 that could interfere with this were identified as being left in the final graph during partitioning.
 
 ### Partitioning
-Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph. First, a stochastic block model (SBM) [21], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
+Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph.
+First, a stochastic block model (SBM) [21], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
 This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits SBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
 The other model architecture tested was a **Relational Graph Convolutional Network Self-Compressing Autoencoder (RGCN-SCAE)**.
@@ -265,7 +267,6 @@ Multiplex message passing threatens to over-smooth node representations, especia
 The encoder therefore drops edges at random and in proportion to degree, weakening the dominance of high-degree nodes while preserving the connectivity needed for learning.
 Feature normalization relies on graph-local statistics, which prevents mini-batch composition from distorting the scale of activations.
 Positional encodings derived from Laplacian eigenvectors are standardized within each graph, maintaining comparable variance even when graph sizes differ drastically.
-A virtual-node residual supplies graph-level context that does not depend on the number of vertices, stabilizing deeper stacks of relational convolutions.
 
 ##### Addressing Degree and Hub Bias
 Even after the adjustments above, the latent space can correlate with degree if left unregulated.
@@ -298,7 +299,6 @@ The trainer orchestrates the preceding mechanisms while enforcing practical guar
 Mini-batches are constructed by a budget-aware sampler that limits the number of nodes admitted per step, so even pathological subgraphs remain tractable.
 Gradient accumulation, gradient clipping, and optional mixed precision provide additional numerical headroom.
 Stability-aware stopping criteria monitor sliding windows of the principal metrics—usually the number of active clusters—and halt the run once those metrics stay within prescribed absolute and relative bounds.
-The hierarchical monitor, operating over checkpoints, records the best-performing epoch and can trigger a rollback if later epochs regress.
 Checkpointing is performed atomically alongside optional MLflow logging, enabling deterministic recovery and rigorous experiment tracking.
 
 Collectively, these interventions ensure that the self-compressing RGCN maintains stable dynamics across the multiplex psychopathology graph while remaining verifiable under standard academic reporting conventions.
@@ -462,13 +462,13 @@ This procedure reframes training as an information-theoretic compression task ap
 Together, SBM offers a likelihood-grounded categorical perspective, while RGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
 The two approaches are treated as triangulating evidence: concordant structure across them increases confidence in emergent transdiagnostic clusters, whereas divergences highlight fronts for qualitative review.
 
-| Aspect                        | Recurrent Graph Convoplutional Network Self-Compressing Autoencoder (RGCN-SCAE)                                                                                                | Hierarchical Stochastic Block Model (SBM)                                                                                  |
+| Aspect                        | Relational Graph Convolutional Network Self-Compressing Auto-Encoder (RGCN-SCAE)                                                                                                | Stochastic Block Model (SBM)                                                                                  |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | **Representation**            | Learns *continuous latent embeddings* for nodes and relations; nonlinear, differentiable, expressive.                                        | Assigns *discrete cluster memberships* via probabilistic inference on connectivity patterns.                              |
 | **Objective**                 | Minimizes reconstruction loss → learns information-optimal embeddings that compress the multiplex graph while preserving semantic structure. | Maximizes likelihood under a generative model → partitions graph to best explain edge densities between groups.             |
 | **Adaptivity**                | Learns directly from heterogeneous, weighted, typed edges and can incorporate node attributes, features, and higher-order dependencies.      | Operates purely on adjacency structure (and possibly metadata) assuming a fixed parametric form (block interaction matrix). |
-| **Scalability & Flexibility** | Much higher computationial cost for training; can integrate multiple modalities in future.                  | Inference is typically O(N²), with N = #nodes in graph, and difficult to extend across modalities.     |
-| **Output**                    | Produces a *latent manifold* where distances encode both structural and semantic similarity — enabling *continuous transdiagnostic spectra*. | Produces discrete, possibly hierarchical clusters — enforcing categorical partitions reminiscent of DSM-like divisions.     |
+| **Scalability & Flexibility** | Much higher computational cost for training; can integrate multiple modalities in future.                  | Inference is typically O(N²), with N = #nodes in graph, and difficult to extend across modalities.     |
+| **Output**                    | Produces a *latent manifold* where distances encode both structural and semantic similarity — enabling *continuous transdiagnostic spectra*. | Produces discrete clusters — enforcing categorical partitions reminiscent of DSM-like divisions.     |
 
 ## Results
 
