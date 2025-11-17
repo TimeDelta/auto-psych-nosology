@@ -24,6 +24,15 @@
 - [References](#references)
 - [Code Notes](#code-notes)
 
+## Abstract
+This study introduces a proof-of-concept approach for automated, data-driven psychiatric nosology.
+By mining the scientific literature into a multiplex knowledge graph of symptoms, treatments, biomarkers, and outcomes, it tests whether a dimensional framework can be derived independently of existing diagnostic systems such as the Diagnostic and Statistical Manual of Mental Disorders (DSM-5), International Classification of Diseases (ICD-11), Hierarchical Taxonomy of Psychopathology (HiTOP), and Research Domain Criteria (RDoC).
+Scientific findings were extracted and integrated into a multiplex graph, which was then partitioned using information-theoretic algorithms.
+Quantitative evaluations will assess parsimony (via Minimum Description Length), stability (bootstrapped Variation of Information and Adjusted Rand Index), and alignment (Normalized Mutual Information and Adjusted Rand Index) with established dimensional models.
+Results are pending completion of model training and evaluation.
+Preliminary inspections indicate that unsupervised, information-theoretic partitioning can recover interpretable transdiagnostic structure consistent with major dimensional frameworks if the knowledge graph is high enough quality.
+This work demonstrates the potential for information-theoretic graph methods to yield a scalable, self-updating, and reproducible framework for psychiatric classification that unifies biological and clinical findings without relying on predefined categories.
+
 ## Background / Literature Review
 Psychiatric nosology has long been dominated by categorical systems such as the DSM and the ICD.
 These frameworks define discrete diagnostic entities and draw strict boundaries between normal and pathological states.
