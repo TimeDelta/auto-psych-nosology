@@ -10,6 +10,7 @@
 - [Hypothesis](#hypothesis)
 - [Methods](#methods)
     - [Graph Creation](#graph-creation)
+    - [Knowledge Graph Dataset](#knowledge-graph-dataset)
     - [Preventing Biased Alignment](#preventing-biased-alignment)
     - [Partitioning](#partitioning)
         - [Encoder Architecture](#encoder-architecture)
@@ -21,57 +22,7 @@
 - [Discussion](#discussion)
 - [Abbreviations](#abbreviations)
 - [References](#references)
-
-## Code Notes
-- Install project requirements via `pip3.10 install -r requirements.txt`.
-- Download the main data for the knowledge graph from https://zenodo.org/records/14851275/files/iKraph_full.tar.gz?download=1.
-- If you want to include ontology augmentation (not used in final experiment), run
-```
-mkdir -p data/hpo
-curl -L -o data/hpo/hp.obo https://purl.obolibrary.org/obo/hp.obo
-curl -L -o data/hpo/phenotype.hpoa https://purl.obolibrary.org/obo/hp/hpoa/phenotype.hpoa
-curl -L -o data/hpo/genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt
-python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
-```
-to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes and include the following CLI params in the below create_graph command:
-```
---ontology-terms hpo=data/hpo/hpo_terms.csv \
---ontology-annotations hpo=data/hpo/hpo_annotations.csv \
---ontology-term-id-column hpo=id \
---ontology-term-name-column hpo=name \
---ontology-parent-column hpo=parents \
---ontology-annotation-entity-column hpo=entity \
---ontology-annotation-term-column hpo=term
-```
-- Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the graph before psych-relevance filtering.
-- Run `python3.10 psy_filter_snapshot.py data/ikgraph.graphml --graphml-out data/ikgraph.filtered.graphml` to get final graph for training.
-- MLflow is used for optional experiment tracking.
-    - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact as well as the traind model .pt file.
-    - Metric explanations:
-        - **total_loss** = weighted sum of reconstruction, sparsity, entropy, Dirichlet, embedding-norm, KL, consistency, gate-entropy, and degree penalties reported below.
-        - **recon_loss** averages the BCE losses for positive and sampled negative edges per graph.
-        - **sparsity_loss**, **cluster_l0**, **inter_l0** track the hard-concrete $L_0$ penalties that drive cluster/edge sparsity.
-        - **entropy_loss** encourages per-graph assignment entropy to stay above `--assignment-entropy-floor`.
-        - **dirichlet_loss** is the KL term that keeps mean cluster usage close to the Dirichlet prior.
-        - **embedding_norm_loss** and **kld_loss** regularize latent vectors on a per-graph basis.
-        - **degree_penalty** (with **degree_correlation_sq**) measures the decorrelation between latent norms and node degree.
-        - **consistency_loss** / **consistency_overlap** are the memory-bank temporal consistency terms (0 when disabled).
-        - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
-        - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete $L_0$ expectation.
-        - **realized_active_clusters** runs a full argmax pass and counts clusters that actually win nodes after enforcing `--min-cluster-size`.
-        - **num_active_clusters_stochastic** retains the raw training-mode gate count when needing to debug EMA smoothing or gating noise.
-        - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
-        - **num_negatives** counts sampled negative edges that survived the per-graph cap.
-        - **timing_sample_neg** and **timing_neg_logits** capture the wall-clock time (in seconds) spent sampling negatives and scoring them.
-- The RGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
-- Use `python3.10 check_node_precision_recall.py --graph data/ikgraph.graphml --subset psychiatric --min-psy-score 0.33 --psy-include-neighbors 0` to report HiTOP/RDoC precision/recall over the exact node universe that survives the psychiatric filters. Add `--per-label-csv out/per_label_precision_recall.csv` if you need per-domain tables for manuscripts or diagnostics.
-- Partition training supports resumable checkpoints via `train_rgcn_scae.py`.
-    - Pass `--checkpoint-path PATH.pt` to atomically persist model weights, optimizer state, history, and run metadata at the end of training (and optionally every `--checkpoint-every N` epochs).
-    - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
-    - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
-- Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
-- Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
-- To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1`
+- [Code Notes](#code-notes)
 
 ## Background / Literature Review
 Psychiatric nosology has long been dominated by categorical systems such as the DSM and the ICD.
@@ -178,11 +129,11 @@ By using a knowledge graph that was mined from the scientific literature into a 
 Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction.
 Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
-### Knowledge Graph
+### Knowledge Graph Dataset
 The knowledge graph was created from a subset of the IKraph dataset [20].
-This data is then pared down to only the psychiatrically relevant nodes and edges using heuristics.
+This data is then pared down to only the psychiatrically relevant nodes and edges using heuristics (final stats: 59786 nodes / 69248 edges).
+See [code notes](#code-notes) below for exact filtering command.
 First, loading of the disease, drug, protein, and DNA modality tables happens and the hybrid `PsychiatricRelevanceScorer` is invoked, which fuses ontology membership, learned group labels, psychiatric drug neighborhoods, and cosine similarity to psychiatric prototype text snippets into a continuous relevance score.
-The high-confidence combinations still pass even if a single dimension underperforms, while low-scoring nodes are excluded.
 
 Only disease vertices meeting these criteria become seed indices for the downstream graph walk.
 Any edge whose source or target index appears in the psychiatric seed set is retained, optionally intersected with a whitelist of relation labels.
@@ -193,7 +144,7 @@ Nodes lacking these columns receive neutral defaults to keep the table schema co
 
 The filtered node/edge frames are projected into a multiplex networkx.MultiDiGraph, preserving node metadata and relation labels.
 During weighted projection each undirected edge receives a prior determined by its relation label and is modulated by the mean psychiatric score of its incident nodes, suppressing ties to weakly psychiatric neighbors while never dropping them outright.
-Finally, the pipeline streams the psychiatric slice of PrimeKG into Parquet tables plus directed and weighted GraphML files, yielding artifacts whose every node and edge has survived both the semantic filters and the psychiatric relevance scoring requirements described above.
+Finally, the pipeline streams the psychiatric subgraph into Parquet tables plus undirected, weighted GraphML files, yielding artifacts whose every node and edge has survived both the semantic filters and the psychiatric relevance scoring requirements described above.
 
 ### Preventing Biased Alignment
 Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input graph and the target taxonomies, nodes corresponding to existing nosological systems are explicitly removed from the graph before partitioning.
@@ -551,3 +502,54 @@ The two approaches are treated as triangulating evidence: concordant structure a
 1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
 1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
 1. W. B. Johnson, J. Lindenstrauss, and G. Schechtman, “Extensions of Lipschitz maps into Banach spaces,” Israel Journal of Mathematics, vol. 54, no. 2, pp. 129–138, May 1986.
+
+## Code Notes
+- Install project requirements via `pip3.10 install -r requirements.txt`.
+- Download the main data for the knowledge graph from https://zenodo.org/records/14851275/files/iKraph_full.tar.gz?download=1.
+- If you want to include ontology augmentation (not used in final experiment), run
+```
+mkdir -p data/hpo
+curl -L -o data/hpo/hp.obo https://purl.obolibrary.org/obo/hp.obo
+curl -L -o data/hpo/phenotype.hpoa https://purl.obolibrary.org/obo/hp/hpoa/phenotype.hpoa
+curl -L -o data/hpo/genes_to_phenotype.txt https://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt
+python3.10 prepare_hpo_csv.py data/hpo/hp.obo data/hpo/phenotype.hpoa genes_to_phenotype.txt data/hpo/
+```
+to prepare the data used for augmenting the graph to prevent degeneracy after removing the diagnosis nodes and include the following CLI params in the below create_graph command:
+```
+--ontology-terms hpo=data/hpo/hpo_terms.csv \
+--ontology-annotations hpo=data/hpo/hpo_annotations.csv \
+--ontology-term-id-column hpo=id \
+--ontology-term-name-column hpo=name \
+--ontology-parent-column hpo=parents \
+--ontology-annotation-entity-column hpo=entity \
+--ontology-annotation-term-column hpo=term
+```
+- Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the graph before psych-relevance filtering.
+- Run `python3.10 psy_filter_snapshot.py data/ikgraph.graphml --graphml-out data/ikgraph.filtered.graphml` to get final graph for training.
+- MLflow is used for optional experiment tracking.
+    - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact as well as the traind model .pt file.
+    - Metric explanations:
+        - **total_loss** = weighted sum of reconstruction, sparsity, entropy, Dirichlet, embedding-norm, KL, consistency, gate-entropy, and degree penalties reported below.
+        - **recon_loss** averages the BCE losses for positive and sampled negative edges per graph.
+        - **sparsity_loss**, **cluster_l0**, **inter_l0** track the hard-concrete $L_0$ penalties that drive cluster/edge sparsity.
+        - **entropy_loss** encourages per-graph assignment entropy to stay above `--assignment-entropy-floor`.
+        - **dirichlet_loss** is the KL term that keeps mean cluster usage close to the Dirichlet prior.
+        - **embedding_norm_loss** and **kld_loss** regularize latent vectors on a per-graph basis.
+        - **degree_penalty** (with **degree_correlation_sq**) measures the decorrelation between latent norms and node degree.
+        - **consistency_loss** / **consistency_overlap** are the memory-bank temporal consistency terms (0 when disabled).
+        - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
+        - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete $L_0$ expectation.
+        - **realized_active_clusters** runs a full argmax pass and counts clusters that actually win nodes after enforcing `--min-cluster-size`.
+        - **num_active_clusters_stochastic** retains the raw training-mode gate count when needing to debug EMA smoothing or gating noise.
+        - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
+        - **num_negatives** counts sampled negative edges that survived the per-graph cap.
+        - **timing_sample_neg** and **timing_neg_logits** capture the wall-clock time (in seconds) spent sampling negatives and scoring them.
+- The RGCN-SCAE trainer picks the latent cluster capacity automatically via `_default_cluster_capacity`, which grows sublinearly with node count (√N heuristic with a floor tied to relation count) to balance flexibility and memory usage.
+- Use `python3.10 check_node_precision_recall.py --graph data/ikgraph.graphml --subset psychiatric --min-psy-score 0.33 --psy-include-neighbors 0` to report HiTOP/RDoC precision/recall over the exact node universe that survives the psychiatric filters. Add `--per-label-csv out/per_label_precision_recall.csv` if you need per-domain tables for manuscripts or diagnostics.
+- Partition training supports resumable checkpoints via `train_rgcn_scae.py`.
+    - Pass `--checkpoint-path PATH.pt` to atomically persist model weights, optimizer state, history, and run metadata at the end of training (and optionally every `--checkpoint-every N` epochs).
+    - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
+    - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
+- Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
+- Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
+- To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1`
