@@ -970,6 +970,63 @@ def per_cluster_alignment(
     return pd.DataFrame(rows).sort_values("cluster").reset_index(drop=True)
 
 
+def enrichment_summary(
+    enrich_df: pd.DataFrame,
+    labels_s: pd.Series,
+    q_threshold: float = 0.05,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "q_threshold": q_threshold,
+        "total_clusters": int(enrich_df["cluster"].nunique())
+        if not enrich_df.empty
+        else 0,
+        "significant_clusters": 0,
+        "significant_cluster_fraction": 0.0,
+        "label_coverage_fraction": 0.0,
+        "label_node_coverage_fraction": 0.0,
+        "labels_with_hits": [],
+    }
+    if enrich_df.empty:
+        return summary
+
+    sig = enrich_df[enrich_df.get("fdr_bh", 1.0) < q_threshold]
+    total_clusters = summary["total_clusters"]
+    if total_clusters > 0:
+        sig_clusters = int(sig["cluster"].nunique()) if not sig.empty else 0
+        summary["significant_clusters"] = sig_clusters
+        summary["significant_cluster_fraction"] = sig_clusters / total_clusters
+
+    label_support = labels_s.value_counts()
+    total_labels = int(label_support.size)
+    if total_labels == 0:
+        return summary
+
+    covered_nodes = 0
+    covered_labels: set[str] = set()
+    if not sig.empty and "label" in sig.columns:
+        for _, row in sig.iterrows():
+            label = row["label"]
+            overlap = int(row.get("overlap", 0))
+            if not label:
+                continue
+            covered_labels.add(label)
+            label_size = int(row.get("label_size", label_support.get(label, 0)))
+            label_total = label_support.get(label, label_size)
+            if label_total <= 0:
+                continue
+            covered_nodes += min(overlap, label_total)
+
+    summary["labels_with_hits"] = sorted(covered_labels)
+    summary["label_coverage_fraction"] = (
+        len(covered_labels) / total_labels if total_labels > 0 else 0.0
+    )
+    total_label_nodes = int(label_support.sum())
+    summary["label_node_coverage_fraction"] = (
+        covered_nodes / total_label_nodes if total_label_nodes > 0 else 0.0
+    )
+    return summary
+
+
 def correlate_coherence_alignment(
     coh_df: pd.DataFrame, align_df: pd.DataFrame, framework_name: str, out_dir: Path
 ) -> tuple[pd.DataFrame, Path]:
@@ -1262,6 +1319,10 @@ def run_alignment(
         enrich_path = out_dir / f"enrichment_{name.lower()}.csv"
         enrich_df.to_csv(enrich_path, index=False)
 
+        enrich_summary = enrichment_summary(enrich_df, labels_s)
+        enrich_summary_path = out_dir / f"enrichment_summary_{name.lower()}.json"
+        enrich_summary_path.write_text(json.dumps(enrich_summary, indent=2))
+
         # per-cluster alignment & correlations
         align_df = per_cluster_alignment(part_s, labels_s, enrich_df)
         align_path = out_dir / f"per_cluster_alignment_{name.lower()}.csv"
@@ -1290,8 +1351,8 @@ def run_alignment(
             f"NMI={M['nmi']:.3f}, AMI={M['ami']:.3f}, ARI={M['ari']:.3f}, "
             f"H={M['homogeneity']:.3f}, C={M['completeness']:.3f}, V={M['v_measure']:.3f}. "
             f"Tables: `metrics_{name.lower()}.csv`, `confusion_{name.lower()}.csv`, "
-            f"`enrichment_{name.lower()}.csv`, `per_cluster_alignment_{name.lower()}.csv`, "
-            f"`{corr_path.name}`."
+            f"`enrichment_{name.lower()}.csv`, `enrichment_summary_{name.lower()}.json`, "
+            f"`per_cluster_alignment_{name.lower()}.csv`, `{corr_path.name}`."
         )
 
     # frameworks
