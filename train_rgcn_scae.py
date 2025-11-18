@@ -1079,6 +1079,40 @@ def _build_adaptive_subgraph_dataset(
     rng = random.Random(rng_seed)
     population = list(range(num_nodes))
 
+    edge_index = getattr(data, "edge_index", None)
+    zero_degree_filtered = 0
+    if edge_index is not None and edge_index.numel() > 0:
+        edge_index_cpu = edge_index.to(torch.long)
+        deg_src = torch.bincount(edge_index_cpu[0], minlength=num_nodes)
+        deg_dst = torch.bincount(edge_index_cpu[1], minlength=num_nodes)
+        degrees = (deg_src + deg_dst).cpu()
+        population = [idx for idx, degree in enumerate(degrees.tolist()) if degree > 0]
+        zero_degree_filtered = num_nodes - len(population)
+        if not population:
+            population = list(range(num_nodes))
+
+    failed_seed_indices: set[int] = set()
+
+    def _select_seed() -> int:
+        if not population:
+            return rng.randrange(num_nodes)
+        eligible = len(failed_seed_indices) < len(population)
+        if not eligible:
+            return rng.choice(population)
+        max_checks = min(len(population), 64)
+        for _ in range(max_checks):
+            candidate = rng.choice(population)
+            if candidate not in failed_seed_indices:
+                return candidate
+        remaining = [node for node in population if node not in failed_seed_indices]
+        if remaining:
+            return rng.choice(remaining)
+        return rng.choice(population)
+
+    def _record_failed_seed(seed_value: int) -> int:
+        failed_seed_indices.add(seed_value)
+        return seed_value
+
     node_attrs = getattr(data, "node_attributes", None)
     node_names = getattr(data, "node_names", None)
     node_ids = getattr(data, "node_ids", None)
@@ -1092,7 +1126,7 @@ def _build_adaptive_subgraph_dataset(
     max_attempts = max(num_samples * 5, num_samples + 10)
 
     while len(dataset) < num_samples and sample_attempts < max_attempts:
-        seed = rng.choice(population)
+        seed = _select_seed()
         sample_start = time.perf_counter()
         sample_attempts += 1
         radius = int(max(min_radius, min(max_radius, radii[seed])))
@@ -1152,6 +1186,7 @@ def _build_adaptive_subgraph_dataset(
 
         if edge_count == 0:
             dropped_no_edges += 1
+            failed_seed = _record_failed_seed(seed)
             if verbose:
                 sample_duration = time.perf_counter() - sample_start
                 print(
@@ -1161,6 +1196,7 @@ def _build_adaptive_subgraph_dataset(
                     f"radius={radius_used}",
                     f"nodes={node_count}",
                     "reason=no_edges",
+                    f"failed_seed={failed_seed}",
                     f"duration={sample_duration:.3f}s",
                 )
             continue
@@ -1183,6 +1219,7 @@ def _build_adaptive_subgraph_dataset(
             or (max_edges is not None and edge_count > max_edges)
         ):
             dropped_too_small += 1
+            failed_seed = _record_failed_seed(seed)
             if verbose:
                 sample_duration = time.perf_counter() - sample_start
                 print(
@@ -1193,6 +1230,7 @@ def _build_adaptive_subgraph_dataset(
                     f"nodes={node_count}",
                     f"edges={edge_count}",
                     "reason=too_small",
+                    f"failed_seed={failed_seed}",
                     f"duration={sample_duration:.3f}s",
                 )
             continue
@@ -1236,10 +1274,19 @@ def _build_adaptive_subgraph_dataset(
             f"dropped_too_small={dropped_too_small}",
             f"attempts={sample_attempts}",
             f"fills={fill_count}",
+            f"zero_deg_filtered={zero_degree_filtered}",
+            f"unique_failed_seeds={len(failed_seed_indices)}",
             f"metrics={metrics_duration:.3f}s",
             f"sampling={sampling_duration:.3f}s",
             f"total={total_duration:.3f}s",
         )
+        if failed_seed_indices:
+            preview = list(sorted(failed_seed_indices))[:5]
+            print(
+                "[INFO] failed ego seeds",
+                f"count={len(failed_seed_indices)}",
+                f"examples={preview}",
+            )
 
     return dataset[:num_samples]
 
