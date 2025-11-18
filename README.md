@@ -217,7 +217,7 @@ Entropy-aware reweighting of negatives, inverse-frequency scaling, and chunked e
 The relation-specific logits follow $\ell_{ijr} = a_i^{\top} W_r a_j + b_r,$ with assignment vectors $a_i = Q_{i\cdot}$ and low-rank weight matrices $W_r = \sigma(F_r B) \odot G_r$, where $F_r \in \mathbb{R}^{C\times d}$, $B \in \mathbb{R}^{d\times C}$, and $G_r$ is the current hard-concrete gate sample.
 
 #### Training
-##### Command
+##### Commands
 For the main experiment results, the exact command ran was:
 ```
 python3.10 train_rgcn_scae.py data/ikgraph.graphml \
@@ -234,6 +234,26 @@ python3.10 train_rgcn_scae.py data/ikgraph.graphml \
   --text-encoder-model pritamdeka/S-Scibert-snli-multinli-stsb --text-encoder-normalize --text-embedding-cache auto \
   --mlflow --mlflow-experiment exploration --mlflow-run-name ikraph \
   --npz-out ikraph-training.npz
+```
+
+For the training stability check:
+```
+python3.10 train_rgcn_scae.py data/ikgraph.filtered.graphml \
+  --require-psychiatric --min-psy-score 0.33 --psy-include-neighbors 0 \
+  --negative-sampling 1.0 \
+  --gradient-checkpointing \
+  --pos-edge-chunk 512 --neg-edge-chunk 512 \
+  --gate-threshold 0.35 \
+  --min-epochs 100 --max-epochs 250 \
+  --checkpoint-path ikraph-stability.pt \
+  --checkpoint-every 10 \
+  --calibration-epochs 50 \
+  --cluster-stability-window 10 \
+  --text-encoder-model pritamdeka/S-Scibert-snli-multinli-stsb --text-encoder-normalize --text-embedding-cache auto \
+  --mlflow --mlflow-experiment exploration --mlflow-run-name ikraph-stability \
+  --npz-out ikraph-training-stability.npz \
+  --stability \
+  --ego-samples 512
 ```
 
 ##### Mitigating Cluster Collapse and Runaway Imbalance
@@ -472,6 +492,64 @@ The two approaches are treated as triangulating evidence: concordant structure a
 
 ## Results
 
+### Overall Metrics
+| **Metric Class** | **Metric** | **Description** | **Target / Baseline** | **SCAE Result** | **SBM Result** |
+| ------------ | ----------------------------------------- | --------------------------------------------------------- | ------------------- | ----------- | ---------- |
+| **Parsimony** | Cluster Count Ratio | Structural economy relative to HiTOP/RDoC label | count ≥ 0.9 | HiTOP 11/8 = **1.38×**; RDoC 11/6 = **1.83×** (scae_out/partition_coverage.json) | HiTOP 18,670/8 ≈ **2.33e3×**; RDoC 18,670/6 ≈ **3.11e3×** (sbm_out/partition_coverage.json) |
+|               | Mean semantic coherence | Mean intra-cluster embedding cosine (SentenceTransformer) | ≥ HiTOP/RDoC median | Node-weighted mean = **0.180** | Node-weighted mean = **0.171** |
+|               | Coherence 90 % CI width (bootstrap × 500) | Semantic compactness stability | ≤ 0.15 | Pending | Pending |
+| **Stability** | Adjusted Rand Index (bootstrapped subgraphs) | Resampling-based consistency of partitions | ≥ 0.85 baseline | Pending | Pending |
+|               | Coherence CI width (across replicates) | Semantic stability across subsamples | ≤ 0.15 | Pending | Pending |
+| **Alignment (Global)** | Normalized Mutual Information | Overall correspondence between learned and reference labels | ≥ 0.75 | HiTOP **0.116**, RDoC **0.025** | HiTOP **0.198**, RDoC **0.088** |
+|                        | Adjusted Mutual Information | Chance-corrected variant | ≥ 0.75 | HiTOP **0.115**, RDoC **0.020** | HiTOP **0.048**, RDoC **−0.013** |
+|                        | Homogeneity / Completeness / V-measure | Purity and coverage of label mapping | ≥ 0.75 each | HiTOP H=0.134, C=0.102, V=0.116; RDoC H=0.043, C=0.017, V=0.025 | HiTOP H=0.696, C=0.115, V=0.198; RDoC H=0.659, C=0.047, V=0.088 |
+|                        | Adjusted Rand Index (against HiTOP/RDoC) | Cluster-label agreement | ≥ 0.70 | HiTOP **0.112**, RDoC **0.038** | HiTOP **0.016**, RDoC **−0.0013** |
+| **Alignment (Per-cluster)** | Precision | Fraction of cluster nodes matching label | - | HiTOP μ±σ = **0.623±0.117** (n=8); RDoC μ±σ = **0.622±0.409** (n=8) | HiTOP μ±σ = **0.992±0.062** (n=6,058); RDoC μ±σ = **0.993±0.080** (n=2,647) |
+|                             | Recall | Fraction of label nodes captured | - | HiTOP μ±σ = **0.182±0.199**; RDoC μ±σ = **0.167±0.189** | HiTOP μ±σ = **7.8e-4±4.6e-3**; RDoC μ±σ = **1.66e-3±6.0e-3** |
+|                             | F1 Score | Harmonic mean of precision and recall | - | HiTOP μ±σ = **0.233±0.207**; RDoC μ±σ = **0.169±0.220** | HiTOP μ±σ = **0.00148±0.0077**; RDoC μ±σ = **0.00304±0.0095** |
+|                             | Overlap Rate | Jaccard-like measure of overlap | - | HiTOP μ±σ = **0.149±0.149**; RDoC μ±σ = **0.114±0.176** | HiTOP μ±σ = **7.6e-4±4.2e-3**; RDoC μ±σ = **0.00154±0.0049** |
+| **Statistical Enrichment** | FDR-corrected Hypergeometric p value | Significance of cluster–label overlap | FDR < 0.05 for ≥ 60 % clusters | HiTOP: **62.5%** of clusters have q<0.05; RDoC: **25%** | HiTOP: **0.26%**; RDoC: **0.038%** |
+| **Semantic Correspondence** | Medoid cosine similarity | Mean cosine of cluster medoid vs HiTOP/RDoC descriptor | - | Node-weighted medoid cosine = **0.169** | Node-weighted medoid cosine = **0.149** |
+|                             | Coherence–F1 correlation | Correlation between semantic tightness and alignment | - | HiTOP Spearman **0.881** / Pearson **0.728**; RDoC Spearman **0.786** / Pearson **0.633** | HiTOP Spearman **0.420** / Pearson **0.471**; RDoC Spearman **0.502** / Pearson **0.593** |
+
+### HiTOP Alignment Summary
+| **Cluster ID** | **Label Match (HiTOP Domain)** | **Precision** | **Recall** | **F1 Score** | **q-value (FDR)** | **Medoid Cosine Similarity** |
+| ---------------| ------------------------------ | ------------- | ---------- | ------------ | ----------------- | ---------------------------- |
+| SCAE-0 | Unspecified Clinical | 0.586 | 0.150 | 0.239 | 2.21e-46 | 0.166 |
+| SCAE-3 | Internalizing | 0.629 | 0.637 | 0.633 | 9.87e-227 | 0.157 |
+| SCAE-154 | Unspecified Clinical | 0.761 | 0.028 | 0.054 | 2.08e-21 | 0.092 |
+| SCAE-160 | Unspecified Clinical | 0.801 | 0.320 | 0.457 | 0.00e+00 | 0.123 |
+| SCAE-212 | Unspecified Clinical | 0.558 | 0.140 | 0.224 | 2.02e-34 | 0.109 |
+| SBM-0 | Unspecified Clinical | 0.720 | 0.107 | 0.186 | 9.47e-67 | 0.167 |
+| SBM-1 | Unspecified Clinical | 0.729 | 0.101 | 0.177 | 3.63e-65 | 0.175 |
+| SBM-2 | Unspecified Clinical | 0.708 | 0.072 | 0.131 | 4.68e-41 | 0.161 |
+| SBM-3 | Thought Disorder | 0.531 | 0.078 | 0.137 | 1.94e-41 | 0.168 |
+| SBM-4 | Unspecified Clinical | 0.925 | 0.056 | 0.106 | 5.23e-73 | 0.181 |
+| SBM-5 | Unspecified Clinical | 0.614 | 0.047 | 0.087 | 2.79e-14 | 0.150 |
+| SBM-6 | Thought Disorder | 0.327 | 0.042 | 0.074 | 2.06e-09 | 0.145 |
+| SBM-7 | Unspecified Clinical | 0.526 | 0.046 | 0.085 | 1.54e-05 | 0.153 |
+| Mean (± SD) | - | Precision: SCAE 0.623±0.117, SBM 0.992±0.062 | Recall: SCAE 0.182±0.199, SBM 7.8e-4±4.6e-3 | F1: SCAE 0.233±0.207, SBM 0.00148±0.0077 | q<0.05 coverage: SCAE 62.5%, SBM 0.26% | Medoid cosine: SCAE 0.169, SBM 0.149 |
+
+### RDoC Alignment Summary
+| **Cluster ID** | **Label Match (RDoC Domain)** | **Precision** | **Recall** | **F1 Score** | **q-value (FDR)** | **Medoid Cosine Similarity** |
+| ---------------| ----------------------------- | ------------- | ---------- | ------------ | ----------------- | ---------------------------- |
+| SCAE-3 | Negative Valence | 0.908 | 0.606 | 0.727 | 2.42e-04 | 0.157 |
+| SCAE-160 | Cognitive Systems | 0.147 | 0.259 | 0.188 | 1.93e-11 | 0.123 |
+| SBM-4 | Cognitive Systems | 0.333 | 0.093 | 0.145 | 3.90e-06 | 0.181 |
+| Mean (± SD) | - | Precision: SCAE 0.622±0.409, SBM 0.993±0.080 | Recall: SCAE 0.167±0.189, SBM 0.00166±0.00599 | F1: SCAE 0.169±0.220, SBM 0.00304±0.00946 | q<0.05 coverage: SCAE 25%, SBM 0.038% | Medoid cosine: SCAE 0.169, SBM 0.149 |
+
+### Stability Metrics (Bootstrapped Subgraph and Semantic Consistency)
+| **Framework** | **# Labels (Baseline)** | **# Clusters (Learned)** | **Cluster-Count Ratio** | **Mean Coherence (± 90 % CI)** | **Log-Size Weighted Coherence Interpretation** |
+| ------------- | ----------------------- | ------------------------ | ----------------------- | ------------------------------ | --------------------------------------------- |
+| **HiTOP** | 8 | SCAE 11 / SBM 18,670 | SCAE 1.38× / SBM 2.33e3× | Pending | Pending |
+| **RDoC** | 6 | SCAE 11 / SBM 18,670 | SCAE 1.83× / SBM 3.11e3× | Pending | Pending |
+| **Overall Mean** | - | - | - | Pending | Pending |
+
+| **Metric** | **HiTOP Reference RDoC Reference** | **Target** | **Value (Mean ± SD [90 % CI])** |
+| ---------- | ---------------------------------- | ---------- | ------------------------------- |
+| **Adjusted Rand Index (bootstrap)** | n/a until bootstrap run finishes | ≥ 0.85 baseline | Pending |
+| **Gate Entropy Stability** | n/a | Lower is better | Pending |
+| **Effective Cluster Count Variance** | n/a | Lower is better | Pending |
 
 ## Discussion
 
@@ -561,4 +639,4 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
     - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
 - Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
-- To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1`
+- To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1` and `python3.10 inspect_cluster.py --graph data/ikgraph.filtered.graphml --partition scae_partitions.json --explain --saliency --saliency-top-pair --outdir scae_inspect --cluster <clustere_num>`
