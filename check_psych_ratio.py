@@ -185,7 +185,7 @@ def main() -> None:
     parser.add_argument(
         "--score-threshold",
         type=float,
-        default=0.2,
+        default=0.3,
         help="psy_score threshold used to count high-confidence psychiatric nodes",
     )
     parser.add_argument(
