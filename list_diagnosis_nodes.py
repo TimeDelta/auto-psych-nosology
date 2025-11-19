@@ -14,7 +14,7 @@ import networkx as nx
 from nosology_filters import should_drop_nosology_node
 
 DEFAULT_GRAPH_PATH = Path("data/ikgraph.filtered.graphml")
-DIAGNOSIS_KEYWORDS = ("diagnosis", "diagnoses", "diagnostic")
+DIAGNOSIS_KEYWORDS = ("diagnosis", "diagnoses", "diagnostic", "disease")
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
