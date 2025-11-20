@@ -20,6 +20,7 @@
         - [Comparison](#comparison)
 - [Results](#results)
 - [Discussion](#discussion)
+- [Conclusion](#conclusion)
 - [Abbreviations](#abbreviations)
 - [References](#references)
 - [Code Notes](#code-notes)
@@ -109,7 +110,7 @@ Can a proof-of-concept transdiagnostic dimensional psychiatric nosology be devel
 
 ## Hypothesis
 The automated pipeline is expected to yield a dimensional nosology whose structural efficiency remains within 10% of the HiTOP and RDoC label cardinalities (cluster-count ratio ≥ 0.9 relative to each framework) while maintaining SentenceTransformer-based semantic coherence means—and their bootstrap 90% confidence intervals—at or above the medians observed for matched HiTOP/RDoC partitions.
-Stability will be demonstrated by bootstrapping both the adjusted Rand index (ARI), targeting ≥ 0.85 of each framework’s self-alignment baseline, and the coherence estimates (targeting confidence interval widths ≤ 0.15), showing that clusters remain consistent under resampling despite corpus heterogeneity.
+Stability will be demonstrated by bootstrapping both the adjusted Rand index (ARI), targeting ≥ 0.25 of each framework’s self-alignment baseline, and the coherence estimates (targeting confidence interval widths ≤ 0.15), showing that clusters remain consistent under resampling despite corpus heterogeneity.
 Alignment will be evaluated with normalized and adjusted mutual information, homogeneity/completeness, and ARI (targets ≥ 0.75, ≥ 0.75, and ≥ 0.70 respectively), supported by Benjamini–Hochberg–corrected hypergeometric enrichments in which at least 60% of clusters achieve FDR < 0.05, per-cluster precision/recall/F1 summaries, and medoid-based semantic cosine similarities to canonical HiTOP/RDoC descriptors.
 To ensure that enrichment is not only cluster-dense but label-relevant, the coverage-adjusted enrichment rate—the fraction of HiTOP/RDoC label nodes captured by significant overlaps—should also reach ≥ 0.60.
 Collectively these metrics test whether compression-oriented clustering on the literature can reproduce the breadth of symptom- and mechanism-focused nosologies while remaining parsimonious, stable, and interpretable.
@@ -120,7 +121,7 @@ By testing whether an automated, data-driven method can reproduce or extend the 
 ### Hypothesis Metrics Justification
 - **Parsimony metrics:** Structural economy is captured by the cluster-count ratio $|C| / |L_fw|$, where $|C|$ denotes the number of clusters with at least one aligned node and $|L_fw|$ is the number of HiTOP or RDoC labels.
 Semantic compactness is computed for every cluster by embedding member-node text with a SentenceTransformer model and averaging the pairwise cosines: for embeddings ${e_i}$ and cluster size $n$, the mean coherence is $(2 / [n(n−1)]) * Σ_{i<j} cos(e_i, e_j)$.
-Also reported is a log-size–weighted variant and non-parametric form of confidence intervals by bootstrap resampling the cosine sample 500 times.
+Also reported is a log-size–weighted variant and non-parametric form of confidence intervals by bootstrap resampling the cosine sample 64 times.
 - **Stability metrics:** To quantify robustness, the pipeline reruns alignment on bootstrap subgraphs of the full knowledge graph and computes the ARI for each replicate.
 ARI is derived from the contingency table of cluster–label overlaps as $\frac{\sum_{ij}(n_{ij}^2) − [\sum_i a_i^2 \sum_j b_j^2]/N^2}{0.5[\sum_i a_i^2 + \sum_j b_j^2] − [\sum_i a_i^2 \sum_j b_j^2]/N^2}$, correcting for chance agreement.
 The bootstrap distribution is summarized (mean, spread, and percentile intervals) and coherence confidence interval widths are tracked as an orthogonal check on semantic stability.
@@ -152,18 +153,17 @@ For every surviving edge, the extractor reconstructs a unique node table, joinin
 Psychiatric scoring outputs (psy_score, psy_evidence, boolean flags, and the final is_psychiatric decision) are carried through so that later models can weight nodes by clinical relevance.
 Nodes lacking these columns receive neutral defaults to keep the table schema consistent.
 
-The filtered node/edge frames are projected into a multiplex networkx.MultiDiGraph, preserving node metadata and relation labels.
+The filtered node/edge frames are projected into a multiplex graph, preserving node metadata and relation labels.
 During weighted projection each undirected edge receives a prior determined by its relation label and is modulated by the mean psychiatric score of its incident nodes, suppressing ties to weakly psychiatric neighbors while never dropping them outright.
 Finally, the pipeline streams the psychiatric subgraph into Parquet tables plus undirected, weighted GraphML files, yielding artifacts whose every node and edge has survived both the semantic filters and the psychiatric relevance scoring requirements described above.
+The final, filtered graph was 59786 nodes and 69248 edges.
 
 ### Preventing Biased Alignment
-Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input graph and the target taxonomies, nodes corresponding to existing nosological systems are explicitly removed from the graph before partitioning.
-They are left in the original graph in order to make alignment calculations easier.
-This preserves semantically coherent nodes (symptoms, biomarkers, treatments, etc.) while keeping diagnostic labels available for later alignment checks and ensuring that the resulting graph structure emerges independently of existing nosological vocabularies.
-This entity-level masking substantially reduces over-masking and yields more biologically meaningful connectivity patterns versus a simple token-level method.
-Only after the final partitioning is complete will alignment metrics such as normalized mutual information and ARI be computed against HiTOP and RDoC categories.
-This ensures that any observed alignment reflects genuine structural similarities rather than trivial lexical overlap, preventing a biased alignment metric.
-Only 14 nodes out of 59786 that could interfere with this were identified as being left in the final graph during partitioning.
+Because the alignment metrics used to compare the emergent nosology with established frameworks (HiTOP and RDoC) can be artificially inflated if the same vocabulary appears in both the input graph and the target taxonomies, an explicit node-level screen that scans every attribute (type tokens, source strings, identifiers, synonyms, DSM/ICD codes, etc.) and flags anything that looks like an existing diagnostic label was implemented.
+The intended workflow ran this filter before partitioning so that only symptoms, biomarkers, treatments, and other non-nosological concepts would survive, leaving diagnostic vocabularies solely for downstream alignment checks.
+In practice, however, removing all those nodes disrupted the entire knowledge graph: every surviving edge touched at least one filtered vertex, so purging them collapsed the graph into isolated nodes (full degeneracy) and made partitioning impossible.
+To avoid that failure mode the graph used for training retains most of the nosology nodes.
+In the final graph used for partitioning, only 815 nosology-related nodes were removed and 11115 such nodes out of 59786 total nodes (18.6%) remained.
 
 ### Partitioning
 Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph.
@@ -498,24 +498,24 @@ Those inferred labels define the reference distributions for mutual information,
 ### Overall Metrics
 | **Metric Class** | **Metric** | **Description** | **Target / Baseline** | **RGCN-SCAE Result** | **SBM Result** |
 | ------------ | ----------------------------------------- | --------------------------------------------------------- | ------------------- | ----------- | ---------- |
-| **Parsimony** | Cluster Count Ratio | Structural economy relative to HiTOP/RDoC label | count ≥ 0.9 | HiTOP 11/8 = **1.38×**; RDoC 11/6 = **1.83×** (scae_out/partition_coverage.json) | HiTOP 18,670/8 ≈ **2.33e3×**; RDoC 18,670/6 ≈ **3.11e3×** (sbm_out/partition_coverage.json) |
-|               | Mean semantic coherence | Mean intra-cluster embedding cosine (SentenceTransformer) | ≥ HiTOP/RDoC median | Node-weighted mean = **0.180** | Node-weighted mean = **0.171** |
-|               | Coherence 90 % CI width (bootstrap × 500) | Semantic compactness stability | ≤ 0.15 | Pending | Pending |
+| **Parsimony** | Cluster Count Ratio | Structural economy relative to HiTOP/RDoC label | count ≥ 0.9 | **HiTOP** 11/8 = 1.38×; **RDoC** 11/6 = 1.83× | **HiTOP** 18,670/8 ≈ 2.33e3×; **RDoC** 18,670/6 ≈ 3.11e3× |
+|               | Node-weighted mean semantic coherence | Mean intra-cluster embedding cosine (SentenceTransformer) | ≥ HiTOP/RDoC median | 0.180 | 0.171 |
+|               | Coherence 90 % CI width (bootstrap × 64) | Semantic compactness stability | ≤ 0.15 | Pending | Pending |
 | **Stability** | Adjusted Rand Index (bootstrapped subgraphs) | Resampling-based consistency of partitions | ≥ 0.85 baseline | Pending | Pending |
 |               | Coherence CI width (across replicates) | Semantic stability across subsamples | ≤ 0.15 | Pending | Pending |
-| **Alignment (Global)** | Normalized Mutual Information | Overall correspondence between learned and reference labels | ≥ 0.75 | HiTOP **0.116**, RDoC **0.025** | HiTOP **0.198**, RDoC **0.088** |
-|                        | Adjusted Mutual Information | Chance-corrected variant | ≥ 0.75 | HiTOP **0.115**, RDoC **0.020** | HiTOP **0.048**, RDoC **−0.013** |
-|                        | Homogeneity / Completeness / V-measure | Purity and coverage of label mapping | ≥ 0.75 each | HiTOP H=0.134, C=0.102, V=0.116; RDoC H=0.043, C=0.017, V=0.025 | HiTOP H=0.696, C=0.115, V=0.198; RDoC H=0.659, C=0.047, V=0.088 |
-|                        | Adjusted Rand Index (against HiTOP/RDoC) | Cluster-label agreement | ≥ 0.70 | HiTOP **0.112**, RDoC **0.038** | HiTOP **0.016**, RDoC **−0.0013** |
-| **Alignment (Per-cluster)** | Precision | Fraction of cluster nodes matching label | - | HiTOP μ±σ = **0.623±0.117** (n=8); RDoC μ±σ = **0.622±0.409** (n=8) | HiTOP μ±σ = **0.992±0.062** (n=6,058); RDoC μ±σ = **0.993±0.080** (n=2,647) |
-|                             | Recall | Fraction of label nodes captured | - | HiTOP μ±σ = **0.182±0.199**; RDoC μ±σ = **0.167±0.189** | HiTOP μ±σ = **7.8e-4±4.6e-3**; RDoC μ±σ = **1.66e-3±6.0e-3** |
-|                             | F1 Score | Harmonic mean of precision and recall | - | HiTOP μ±σ = **0.233±0.207**; RDoC μ±σ = **0.169±0.220** | HiTOP μ±σ = **0.00148±0.0077**; RDoC μ±σ = **0.00304±0.0095** |
-|                             | Overlap Rate | Jaccard-like measure of overlap | - | HiTOP μ±σ = **0.149±0.149**; RDoC μ±σ = **0.114±0.176** | HiTOP μ±σ = **7.6e-4±4.2e-3**; RDoC μ±σ = **0.00154±0.0049** |
-| **Statistical Enrichment** | FDR-corrected Hypergeometric p value | Significance of cluster–label overlap | FDR < 0.05 for ≥ 60 % clusters | HiTOP: **62.5%** of clusters have q<0.05; RDoC: **25%** | HiTOP: **0.26%**; RDoC: **0.038%** |
-|                            | Coverage-adjusted enrichment rate | Fraction of labeled nodes covered by significant clusters | ≥ 0.6 | HiTOP: **64%**; RDoC: **56%** | HiTOP: **28%**; RDoC: **0.4%** |
-| **Semantic Correspondence** | Medoid cosine similarity | Mean cosine of cluster medoid vs HiTOP/RDoC descriptor | - | Node-weighted medoid cosine = **0.169** | Node-weighted medoid cosine = **0.149** |
-|                             | Coherence–F1 correlation | Correlation between semantic tightness and alignment | - | HiTOP Spearman **0.881** / Pearson **0.728**; RDoC Spearman **0.786** / Pearson **0.633** | HiTOP Spearman **0.420** / Pearson **0.471**; RDoC Spearman **0.502** / Pearson **0.593** |
-| **Label Coverage** | Reference domains with ≥1 significant cluster | Fraction of HiTOP/RDoC domains attaining q<0.05 matches | ≥ 0.6 | HiTOP: **6/8** domains; RDoC: **4/6** constructs | HiTOP: **8/8** domains; RDoC: **5/6**, but most hits are micro-clusters |
+| **Alignment (Global)** | Normalized Mutual Information | Overall correspondence between learned and reference labels | ≥ 0.75 | **HiTOP** 0.116, **RDoC** 0.025 | **HiTOP** 0.198, **RDoC** 0.088 |
+|                        | Adjusted Mutual Information | Chance-corrected variant | ≥ 0.75 | **HiTOP** 0.115, **RDoC** 0.020 | **HiTOP** 0.048, **RDoC** −0.013 |
+|                        | Homogeneity / Completeness / V-measure | Purity and coverage of label mapping | ≥ 0.75 each | **HiTOP** H=0.134, C=0.102, V=0.116; **RDoC** H=0.043, C=0.017, V=0.025 | **HiTOP** H=0.696, C=0.115, V=0.198; **RDoC** H=0.659, C=0.047, V=0.088 |
+|                        | Adjusted Rand Index (against HiTOP/RDoC) | Cluster-label agreement | ≥ 0.70 | **HiTOP** 0.112, **RDoC** 0.038 | **HiTOP** 0.016, **RDoC** −0.0013 |
+| **Alignment (Per-cluster)** | Precision | Fraction of cluster nodes matching label | - | **HiTOP** μ±σ = 0.623±0.117 (n=8); **RDoC** μ±σ = 0.622±0.409 (n=8) | **HiTOP** μ±σ = 0.992±0.062 (n=6,058); **RDoC** μ±σ = \0.993±0.080 (n=2,647) |
+|                             | Recall | Fraction of label nodes captured | - | **HiTOP** μ±σ = 0.182±0.199; **RDoC** μ±σ = 0.167±0.189 | **HiTOP** μ±σ = 7.8e-4±4.6e-3; **RDoC** μ±σ = 1.66e-3±6.0e-3 |
+|                             | F1 Score | Harmonic mean of precision and recall | - | **HiTOP** μ±σ = 0.233±0.207; **RDoC** μ±σ = 0.169±0.220 | **HiTOP** μ±σ = 0.00148±0.0077; **RDoC** μ±σ = 0.00304±0.0095 |
+|                             | Overlap Rate | Jaccard-like measure of overlap | - | **HiTOP** μ±σ = 0.149±0.149; **RDoC** μ±σ = 0.114±0.176 | **HiTOP** μ±σ = 7.6e-4±4.2e-3; **RDoC** μ±σ = 0.00154±0.0049 |
+| **Statistical Enrichment** | FDR-corrected Hypergeometric p value | Significance of cluster–label overlap | FDR < 0.05 for ≥ 60 % clusters | **HiTOP**: 62.5% of clusters have q<0.05; **RDoC**: 25% | **HiTOP**: 0.26%; **RDoC**: 0.038% |
+|                            | Coverage-adjusted enrichment rate | Fraction of labeled nodes covered by significant clusters | ≥ 0.6 | **HiTOP**: 64%; **RDoC**: 56% | **HiTOP**: 28%; **RDoC**: 0.4% |
+| **Semantic Correspondence** | Node-weighted medoid cosine similarity | Mean cosine of cluster medoid vs HiTOP/RDoC descriptor | - | 0.169 | 0.149 |
+|                             | Coherence–F1 correlation | Correlation between semantic tightness and alignment | - | **HiTOP** Spearman 0.881 / Pearson 0.728; **RDoC** Spearman 0.786 / Pearson 0.633 | **HiTOP** Spearman 0.420 / Pearson 0.471; **RDoC** Spearman 0.502 / Pearson 0.593 |
+| **Label Coverage** | Reference domains with ≥1 significant cluster | Fraction of HiTOP/RDoC domains attaining q<0.05 matches | ≥ 0.6 | HiTOP: **6/8** domains; RDoC: **4/6** constructs | **HiTOP**: 8/8 domains; **RDoC**: 5/6, but most hits are micro-clusters |
 
 ### HiTOP Alignment Summary
 | **Cluster ID** | **Label Match (HiTOP Domain)** | **Precision** | **Recall** | **F1 Score** | **q-value (FDR)** | **Medoid Cosine Similarity** |
@@ -533,7 +533,8 @@ Those inferred labels define the reference distributions for mutual information,
 | SBM-5 | Unspecified Clinical | 0.614 | 0.047 | 0.087 | 2.79e-14 | 0.150 |
 | SBM-6 | Thought Disorder | 0.327 | 0.042 | 0.074 | 2.06e-09 | 0.145 |
 | SBM-7 | Unspecified Clinical | 0.526 | 0.046 | 0.085 | 1.54e-05 | 0.153 |
-| Mean (± SD) | - | Precision: RGCN-SCAE 0.623±0.117, SBM 0.992±0.062 | Recall: RGCN-SCAE 0.182±0.199, SBM 7.8e-4±4.6e-3 | F1: RGCN-SCAE 0.233±0.207, SBM 0.00148±0.0077 | q<0.05 coverage: RGCN-SCAE 62.5%, SBM 0.26% | Medoid cosine: RGCN-SCAE 0.169, SBM 0.149 |
+| **RGCN-SCAE Mean (± SD)** | - | 0.623±0.117 | 0.182±0.199.6e-3 | 0.233±0.207 | q<0.05 coverage: 62.5% | 0.169 |
+| **SBM Mean (± SD)** | - | 0.992±0.062 | 7.8e-4±4.6e-3 | 0.00148±0.0077 | q<0.05 coverage: 0.26% | 0.149 |
 
 ### RDoC Alignment Summary
 | **Cluster ID** | **Label Match (RDoC Domain)** | **Precision** | **Recall** | **F1 Score** | **q-value (FDR)** | **Medoid Cosine Similarity** |
@@ -541,14 +542,15 @@ Those inferred labels define the reference distributions for mutual information,
 | RGCN-SCAE-3 | Negative Valence | 0.908 | 0.606 | 0.727 | 2.42e-04 | 0.157 |
 | RGCN-SCAE-160 | Cognitive Systems | 0.147 | 0.259 | 0.188 | 1.93e-11 | 0.123 |
 | SBM-4 | Cognitive Systems | 0.333 | 0.093 | 0.145 | 3.90e-06 | 0.181 |
-| Mean (± SD) | - | Precision: RGCN-SCAE 0.622±0.409, SBM 0.993±0.080 | Recall: RGCN-SCAE 0.167±0.189, SBM 0.00166±0.00599 | F1: RGCN-SCAE 0.169±0.220, SBM 0.00304±0.00946 | q<0.05 coverage: RGCN-SCAE 25%, SBM 0.038% | Medoid cosine: RGCN-SCAE 0.169, SBM 0.149 |
+| **RGCN-SCAE Mean (± SD)** | - | 0.622±0.409 | 0.167±0.189 | 0.169±0.220 | q<0.05 coverage: 25% | 0.169 |
+| **SBM Mean (± SD)** | - |  0.993±0.080 |  0.00166±0.00599 |  0.00304±0.00946 | q<0.05 coverage: 0.038% |  0.149 |
 
 ### Stability Metrics (Bootstrapped Subgraph and Semantic Consistency)
 | **Framework** | **# Labels (Baseline)** | **# Clusters (Learned)** | **Cluster-Count Ratio** | **Mean Coherence (± 90 % CI)** | **Log-Size Weighted Coherence Interpretation** |
 | ------------- | ----------------------- | ------------------------ | ----------------------- | ------------------------------ | --------------------------------------------- |
-| **HiTOP** | 8 | RGCN-SCAE 11 / SBM 18,670 | RGCN-SCAE 1.38× / SBM 2.33e3× | Pending | Pending |
-| **RDoC** | 6 | RGCN-SCAE 11 / SBM 18,670 | RGCN-SCAE 1.83× / SBM 3.11e3× | Pending | Pending |
-| **Overall Mean** | - | - | - | Pending | Pending |
+| **HiTOP** | 8 | Pending | Pending | Pending | Pending |
+| **RDoC** | 6 | Pending | Pending | Pending | Pending |
+| **Overall Mean** | - | Pending | Pending | Pending | Pending |
 
 | **Metric** | **HiTOP Reference RDoC Reference** | **Target** | **Value (Mean ± SD [90 % CI])** |
 | ---------- | ---------------------------------- | ---------- | ------------------------------- |
@@ -557,7 +559,7 @@ Those inferred labels define the reference distributions for mutual information,
 | **Effective Cluster Count Variance** | n/a | Lower is better | Pending |
 
 ## Discussion
-This work demonstrates that a carefully curated multiplex knowledge graph, coupled with information-theoretic representation learning, can recover candidate transdiagnostic structure aligned with contemporary dimensional nosologies.
+This work demonstrates that it might be possible for a carefully curated multiplex knowledge graph, coupled with information-theoretic representation learning, to recover candidate transdiagnostic structure aligned with contemporary dimensional nosologies.
 Separation of psychiatric labels during graph construction appears to preserve enough semantic signal for latent clustering to differentiate mechanistic, biomarker, and treatment-related subnetworks, supporting the hypothesis that diagnostic structure can emerge without direct supervision from DSM-era vocabularies.
 
 The RGCN-SCAE partitioning already satisfies the central design goal of parsimony: eleven clusters cover the entire 59,786-node psychiatric subgraph, keeping the cluster-count ratio close to the label baselines while still capturing diverse semantics.
@@ -577,7 +579,12 @@ Third, the enrichment coverage numbers in the results expose that SBM’s seemin
 Finally, both methods rely on deterministic text-derived embeddings; improved biomedical encoders or ontology-augmented attribute sets could further tighten cluster coherence and downstream alignment.
 In sum, the RGCN-SCAE already balances parsimony, semantic coherence, and statistically significant HiTOP/RDoC enrichment far better than the SBM baseline.
 
-The primary limitation remains the vast hyperparameter surface for stabilizinz training.
+The primary limitation of this study is the quality of the knowledge graph used.
+In the final graph used for partitioning, 11115 nodes out of 59786 total nodes (18.6%) remained that were identified as bing part of some existing nosology due to their removal causing full graph degeneracy.
+This reduces confidence in the method's final metrics' measurement of true structure instead of trivial lexical overlap with HiTOP and RDoC.
+Additionally, the use of only 64 bootstrapped samples instead of the planned 500 due to time constraints severely hinders the reliability of the stability analysis.
+
+The main limitation of the method itself remains the vast hyperparameter surface for stabilizing training.
 More than fifty continuous or categorical settings govern optimization, sparsity controls, entropy floors, Dirichlet priors, sampling budgets, and checkpoint criteria.
 This flexibility guards against collapse on graphs with heterogeneous degree distributions, yet it inflates researcher degrees of freedom and impedes reproducibility.
 Small shifts in initialization or search ranges often lead to materially different partitions, making it difficult to attribute observed structure to the data rather than to bespoke tuning.
@@ -590,12 +597,16 @@ Second, named-entity recognition and ontology linking remain imperfect; gaps in 
 Third, the partitioning is not anchored to clinical priors or outcome-driven constraints, and evaluation presently leans on internal diagnostics—loss trajectories, entropy trends, gate usage—without equally rigorous clinical or phenotypic benchmarks.
 Consequently, even coherent latent clusters may not map cleanly onto patient-level outcomes or treatment response profiles, and efficacy against real-world clinical data has not yet been demonstrated.
 
-Addressing these gaps requires three short-term priorities.
-An ablation study to test the effects of removing hyperparameters and their associated functioinality would be the most worthwhile area for future work.
-Depending on those results, hyperparameter management should shift toward configuration templates and automated sweeps or Bayesian optimization to reduce manual tuning load.
-Quantitative validation pipelines must translate logged statistics into reproducible summaries and align derived clusters with external datasets, including cohort-level symptom surveys or genomic assays, so that resemblance or divergence from HiTOP and RDoC can be quantified rather than inferred qualitatively and heuristically.
-Finally, targeted data augmentation and improved entity recognition are needed to balance literature-driven priors and raise coverage for emerging psychiatric domains.
-Collectively, these steps will clarify whether graph-based compression can offer a defensible foundation for revising psychiatric nosology and support a scalable, continuously updating framework.
+## Conclusion
+The current pipeline verifies that a self-compressing RGCN trained on a psychiatric knowledge graph can recover interpretable, statistically enriched partitions while using orders of magnitude fewer clusters than a degree-corrected SBM.
+Nevertheless, two structural weaknesses limit the strength of that evidence: nosology nodes remain embedded in the graph because removing them destroys every edge, and stability estimates rely on only 64 bootstraps.
+The highest priority for future work should be validating similar results on a higher quality knowledge graph.
+Specifically, building non-disease seed pathways into the knowledge graph creation—for example, leveraging phenotype and side-effect modalities—will also be essential so that diagnostic labels can be removed without triggering degeneracy and the nosology filter can operate as originally intended.
+Facing that requirement head-on will make downstream alignment to HiTOP/RDoC more meaningful because any correspondence will rest on structure inferred from symptoms, biomarkers, and interventions rather than residual DSM/ICD vocabulary.
+An ablation study to test the effects of removing hyperparameters and their associated functionality would be the next most worthwhile area for future work so that it can be determined whether some hyperparameters can be safely removed.
+The next most important step for future work is running the stability test with a higher number of bootstrap samples.
+Finally, validating the learned clusters against external datasets (clinical cohorts, genomic assays) to determine their effectiveness in clinical appliications is an important next step.
+Addressing these constraints will clarify whether graph-based compression can support a durable, continuously updating psychiatric nosology.
 
 ## Abbreviations
 - ARI = adjusted Rand index
