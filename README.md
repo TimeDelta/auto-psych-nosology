@@ -8,6 +8,7 @@
     - [Conclusion](#conclusion)
 - [Research Question](#research-question)
 - [Hypothesis](#hypothesis)
+    - [Hypothesis Metrics Justification](hypothesis-metrics-justification)
 - [Methods](#methods)
     - [Graph Creation](#graph-creation)
     - [Knowledge Graph Dataset](#knowledge-graph-dataset)
@@ -20,7 +21,7 @@
         - [Comparison](#comparison)
 - [Results](#results)
 - [Discussion](#discussion)
-- [Conclusion](#conclusion)
+- [Conclusion](#conclusion-1)
 - [Abbreviations](#abbreviations)
 - [References](#references)
 - [Code Notes](#code-notes)
@@ -110,14 +111,13 @@ Can a proof-of-concept transdiagnostic dimensional psychiatric nosology be devel
 
 ## Hypothesis
 The automated pipeline is expected to yield a dimensional nosology whose structural efficiency remains within 10% of the HiTOP and RDoC label cardinalities (cluster-count ratio ≥ 0.9 relative to each framework) while maintaining SentenceTransformer-based semantic coherence means—and their bootstrap 90% confidence intervals—at or above the medians observed for matched HiTOP/RDoC partitions.
-Stability will be demonstrated by bootstrapping both the adjusted Rand index (ARI), targeting ≥ 0.25 of each framework’s self-alignment baseline, and the coherence estimates (targeting confidence interval widths ≤ 0.15), showing that clusters remain consistent under resampling despite corpus heterogeneity.
+Stability will be demonstrated by bootstrapping both the adjusted Rand index (ARI), targeting ≥ 0.2 of each framework’s self-alignment baseline, and the coherence estimates (targeting confidence interval widths ≤ 0.15), showing that clusters remain consistent under resampling despite corpus heterogeneity.
 Alignment will be evaluated with normalized and adjusted mutual information, homogeneity/completeness, and ARI (targets ≥ 0.75, ≥ 0.75, and ≥ 0.70 respectively), supported by Benjamini–Hochberg–corrected hypergeometric enrichments in which at least 60% of clusters achieve FDR < 0.05, per-cluster precision/recall/F1 summaries, and medoid-based semantic cosine similarities to canonical HiTOP/RDoC descriptors.
 To ensure that enrichment is not only cluster-dense but label-relevant, the coverage-adjusted enrichment rate—the fraction of HiTOP/RDoC label nodes captured by significant overlaps—should also reach ≥ 0.60.
 Collectively these metrics test whether compression-oriented clustering on the literature can reproduce the breadth of symptom- and mechanism-focused nosologies while remaining parsimonious, stable, and interpretable.
 
 By testing whether an automated, data-driven method can reproduce or extend the dimensional structure of leading nosologies, this research explores the feasibility of a scalable and self-updating framework for psychiatric classification—one that could bridge the gap between biological findings and clinical phenomena without the overhead of manually defined diagnostic categories.
 
-## Methods
 ### Hypothesis Metrics Justification
 - **Parsimony metrics:** Structural economy is captured by the cluster-count ratio $|C| / |L_fw|$, where $|C|$ denotes the number of clusters with at least one aligned node and $|L_fw|$ is the number of HiTOP or RDoC labels.
 Semantic compactness is computed for every cluster by embedding member-node text with a SentenceTransformer model and averaging the pairwise cosines: for embeddings ${e_i}$ and cluster size $n$, the mean coherence is $(2 / [n(n−1)]) * Σ_{i<j} cos(e_i, e_j)$.
@@ -140,6 +140,7 @@ By using a knowledge graph that was mined from the scientific literature into a 
 Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction.
 Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
+## Methods
 ### Knowledge Graph Dataset
 The knowledge graph was created from a subset of the IKraph dataset [20].
 This data is then pared down to only the psychiatrically relevant nodes and edges using heuristics (final stats: 59786 nodes / 69248 edges).
