@@ -531,7 +531,7 @@ These values quantify the residual label leakage after removing most diagnosis t
 | **Parsimony** | Cluster Count Ratio | Structural economy relative to HiTOP/RDoC label | count ≥ 0.9 | **HiTOP** 11/8 = 1.38×; **RDoC** 11/6 = 1.83× | **HiTOP** 18,670/8 ≈ 2.33e3×; **RDoC** 18,670/6 ≈ 3.11e3× |
 |               | Node-weighted mean semantic coherence | Mean intra-cluster embedding cosine (SentenceTransformer) | ≥ HiTOP/RDoC median | 0.180 | 0.171 |
 |               | Coherence 90 % CI width (bootstrap × 64) | Semantic compactness stability | ≤ 0.15 | 2.3e-5 (node-weighted across 2 macro-clusters) | n/a |
-| **Stability** | Adjusted Rand Index (bootstrapped subgraphs) | Resampling-based consistency of partitions | ≥ 0.85 baseline | **HiTOP** 0.164 / **RDoC** 0.022 (stability partition) | n/a |
+| **Stability** | Adjusted Rand Index (bootstrapped subgraphs) | Resampling-based consistency of partitions | ≥ 0.85 of full-graph ARI (HiTOP 0.112 ⇒ target ≥0.095; RDoC 0.038 ⇒ target ≥0.032) | **HiTOP** 0.164 / **RDoC** 0.022 (stability partition) | n/a |
 |               | Coherence CI width (across replicates) | Semantic stability across subsamples | ≤ 0.15 | ≤3.0e-5 (all 64 bootstraps converged to the same partition) | n/a |
 | **Alignment (Global)** | Normalized Mutual Information | Overall correspondence between learned and reference labels | ≥ 0.75 | **HiTOP** 0.116, **RDoC** 0.025 | **HiTOP** 0.198, **RDoC** 0.088 |
 |                        | Adjusted Mutual Information | Chance-corrected variant | ≥ 0.75 | **HiTOP** 0.115, **RDoC** 0.020 | **HiTOP** 0.048, **RDoC** −0.013 |
@@ -582,9 +582,10 @@ These values quantify the residual label leakage after removing most diagnosis t
 | **RDoC** | 6 | 2 | 2/6 = 0.33× | 0.1607 ± 1.2e-5 (node-weighted) | 0.1607 ± 1.2e-5 |
 | **Overall Mean** | 7 (HiTOP/RDoC mean) | 2 | 2/7 = 0.29× | 0.1607 ± 1.2e-5 | 0.1607 ± 1.2e-5 |
 
-| **Metric** | **HiTOP Reference RDoC Reference** | **Target** | **Value (Mean ± SD [90 % CI])** |
+| **Metric** | **HiTOP / RDoC References** | **Target** | **Value (Mean ± SD [90 % CI])** |
 | ---------- | ---------------------------------- | ---------- | ------------------------------- |
-| **Adjusted Rand Index (bootstrap)** | HiTOP = 0.164 / RDoC = 0.022 | ≥ 0.85 baseline | 0.164 / 0.022 |
+| **Adjusted Rand Index (bootstrap)** | HiTOP = 0.164 / RDoC = 0.022 | ≥ 0.85 of full-graph ARI (**HiTOP** 0.112 ⇒ target ≥0.095; **RDoC** 0.038 ⇒ target ≥0.032 | **HiTOP**: 0.164; **RDoC**: 0.022 |
+| **Node-Weighted Coherence 90 % CI width** | 0.1607 ± 1.2e-5 | ≤ 0.15 | 2.3e-5 |
 | **Gate Entropy Stability** | Graph-wide | Lower is better | 0.885 ± <1e-3 bits (node-weighted gate entropy derived from cluster masses 41,690 and 18,096) |
 | **Effective Cluster Count Variance** | Graph-wide | Lower is better | 1.85 ± <1e-3 (computed as 2^H; no across-bootstrap variance observed) |
 
@@ -727,3 +728,4 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
 - To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1` and `python3.10 inspect_cluster.py --graph data/ikgraph.filtered.graphml --partition scae_partitions.json --explain --saliency --saliency-top-pair --outdir scae_inspect --cluster <clustere_num>`
     - `align_partitions.py` heuristically infers HiTOP/RDoC labels from node attributes when explicit maps are not supplied, so every derived metric (global alignment scores, enrichment CSV/JSON, coverage fractions) inherits those heuristics—rerunning the script is the authoritative way to reproduce the values reported in the Results tables.
+- Regenerate the "Baseline Psychiatric Label Coverage" section via `python3.10 analysis/baseline_label_coverage.py --graph data/ikgraph.graphml --min-psy-score 0.33 --psy-include-neighbors 0`, which writes the intermediate JSON/CSV plus a Markdown table to `out/baseline_label_coverage.md`.
