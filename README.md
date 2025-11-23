@@ -38,6 +38,9 @@
     - [HiTOP Alignment Summary](#hitop-alignment-summary)
     - [RDoC Alignment Summary](#rdoc-alignment-summary)
     - [Stability Metrics (Bootstrapped Subgraph and Semantic Consistency)](#stability-metrics--bootstrapped-subgraph-and-semantic-consistency-)
+    - [Training Dynamics](#training-dynamics)
+        - [Calibration and Reconstruction Diagnostics](#calibration-and-reconstruction-diagnostics)
+        - [Regularization Burden](#regularization-burden)
 - [Discussion](#discussion)
 - [Conclusion](#conclusion-1)
 - [Abbreviations](#abbreviations)
@@ -607,13 +610,45 @@ These values quantify the residual label leakage after removing most diagnosis t
 | **Gate Entropy Stability** | Graph-wide | Lower is better | 0.885 ± <1e-3 bits (node-weighted gate entropy derived from cluster masses 41,690 and 18,096) |
 | **Effective Cluster Count Variance** | Graph-wide | Lower is better | 1.85 ± <1e-3 (computed as 2^H; no across-bootstrap variance observed) |
 
+### Training Dynamics
+![Realized active clusters (after argmax assignment) for the main run. The realized cluster count tracks the soft active count but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.](graphs/realized_active_clusters.png "Realized Active Clusters (post-argmax)")
+![Realized clusters during the stability run. The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating. This confirms that the stability setup enforces excessive compression and masks finer structure.](graphs/stabililty_realized_active_clusters.png "Stability Test Realized Active Clusters (post-argmax)")
+![Number of active clusters (clusters receiving non-zero assignment mass) during the main run across epochs. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy.](graphs/num_active_clusters.png "Number Active Clusters")
+![Active cluster count during the stability retraining run. Despite initially exploring 60–70 clusters stochastically, the model collapses to two stable clusters early in training. This demonstrates that the stability-oriented regularization settings over-compress the latent space.](graphs/stability_num_active_clusters.png "Stability Test num Active Clusters")
+![Assignment entropy over training epochs for the main RGCN-SCAE run. Entropy remains high for most of training and gradually sharpens as cluster usage stabilizes. This trajectory indicates that the model maintains diverse cluster assignments early on and only commits to a more structured latent organization near convergence.](graphs/assignment_entropy.png "Assignment Entropy")
+![Assignment entropy during the stability-focused retraining run. Despite entropy remaining high throughout, the model ultimately collapses to a small number of active clusters. This dissociation between high entropy and low realized cluster count highlights over-regularization in the stability configuration and motivates revisiting the bootstrap hyperparameters.](graphs/stability_assignment_entropy.png "Stability Test Assignment Entropy")
+![Gate entropy for the main run, reflecting the diversity of hard-concrete gate activations. Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate—an important safeguard against early latent collapse.](graphs/gate_entropy_bits.png "Gate Entropy Bits")
+![Gate entropy across the stability run. Although gate entropy remains high, the model still converges to a nearly two-cluster solution, demonstrating that gate entropy alone is not a sufficient indicator of latent diversity under strong regularization pressure.](graphs/stability_gate_entropy_bits.png "Stability Test Gate Entropy Bits")
+![Reconstruction loss for the main RGCN-SCAE run, showing steady decline and smooth convergence. The decoder remains well-calibrated, and positive/negative logits track closely, indicating balanced learning of multiplex relations without memorization.](graphs/reconstruction_loss.png "Reconstruction Loss")
+![Reconstruction loss during the stability run. Although this configuration achieves lower reconstruction loss than the main run, it does so by over-compressing the latent space, reflecting a known failure mode where high reconstruction performance coincides with collapsed cluster structure.](graphs/stability_reconstruction_loss.png "Stability Test Reconstruction Loss")
+![Memory-bank consistency loss for the main run. The gradual decline reflects improving coherence of node embeddings across overlapping ego-net samples, indicating that repeated presentations of the same node converge toward stable latent representations.](graphs/consistency_loss.png "Consistency Loss")
+![Consistency loss for the stability run. The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-cluster solution.](graphs/stability_consistency_loss.png "Stability Test Consistency Loss")
+
+The above MLflow traces for the base RGCN-SCAE run and the stability-focused retraining provide an audit trail of the gate trajectories that underlie the preceding stability table.
+The baseline model’s realized active clusters (how many clusters had at least one node assigned to it after the argmax) oscillated between ten and twenty before ending early at eleven clusters by epoch 147 due to the same number of realized active clusters for ten epochs consecutively, and its assignment entropy plateaued near 5.38 bits with gate entropy ≈7.65 bits.
+In contrast, the stability run collapsed to a single realized cluster by epoch 66 even though stochastic sampling continued to touch 68–73 clusters and gate entropy remained ≈7.25 bits.
+Plotting realized active clusters, num active clusters, and assignment entropy over epochs makes this divergence visually explicit and documents that the collapse occurred despite high-entropy gating, implying that the stopping criterion is insufficiently sensitive to emerging macro-clusters.
+
+#### Calibration and Reconstruction Diagnostics
+Calibration statistics show how pretraining choices constrained the stability experiment.
+Decoder behavior mirrors this drift: the baseline model ended with overlapping positive/negative logits (means 0.424/0.423, standard deviations 0.003–0.005) while processing 6,704 negatives per batch, but the stability run pushed logits above 1.0/0.96 with an order-of-magnitude higher variance and only 1,206 negatives.
+These distributions explain why the stability configuration attains a lower reconstruction loss (0.00120 vs. 0.00206) yet produces fewer populated clusters, and they motivate revising the negative-sampling ratio and calibration window when describing future experiments.
+
+#### Regularization Burden
+Loss decompositions clarify which constraints dominate optimization.
+At convergence the stability run reports a consistency penalty of 1.9e-3 and a degree-penalty of 1.2e-3, roughly an order of magnitude larger than the corresponding 4.5e-7 and 1.1e-4 terms in the baseline run.
+Conversely, the encoder/decoder sparsity penalties (`cluster_L0` = 150.1; `inter_L0` = 3.57e4) are substantially lower than the baseline’s 225.1 / 5.51e4, corroborating the qualitative observation that the stability regimen over-compresses the latent space.
+Summarizing these terminal loss components in the paper links the narrative claims about “regularizer dominance” to concrete magnitudes and documents how different safeguards trade off against each other.
+
 ## Discussion
 This work demonstrates that it might be possible for a carefully curated multiplex knowledge graph, coupled with information-theoretic representation learning, to recover candidate transdiagnostic structure aligned with contemporary dimensional nosologies.
 Separation of psychiatric labels during graph construction appears to preserve enough semantic signal for latent clustering to differentiate mechanistic, biomarker, and treatment-related subnetworks, supporting the hypothesis that diagnostic structure can emerge without direct supervision from DSM-era vocabularies.
-Unfortunately, primary limitation of this interpretation is the quality of the knowledge graph used.
+The primary limitation of this interpretation is the quality of the knowledge graph used.
 In the final graph used for partitioning, 11,114 of the 59,785 psychiatric nodes (18.6%) still carry HiTOP supervision and only 3,695 nodes (6.2%) retain RDoC supervision because removing those labels otherwise triggers graph degeneracy.
-This reduces confidence in the method's final metrics' measurement of true structure instead of trivial lexical overlap with HiTOP/RDoC cues, even if recall remains ≥0.59 (HiTOP) and ≥0.69 (RDoC).
-In essence, precision of 0.186 (HiTOP) and 0.062 (RDoC) means most psychiatric nodes contributing to alignment scores are unlabeled; stronger claims will require rebuilding the graph so that dimensional signal arises from phenotype, biomarker, and treatment evidence rather than residual diagnosis tokens.
+This residual supervision introduces the real possibility that alignment metrics partially reflect propagated diagnostic signal rather than entirely independent structural emergence.
+Because 18.6% of psychiatric nodes carry HiTOP labels and 6.2% carry RDoC labels, the resulting clusters cannot be interpreted as fully unsupervised with respect to either taxonomy.
+Consequently, alignment values may be upwardly biased, and the current results should be treated as an initial feasibility demonstration rather than evidence of strong or definitive convergence.
+
 Additionally, the use of only 64 bootstrapped samples instead of the planned 500 due to time constraints severely hinders the reliability of the stability analysis; the observed gate entropy of 0.885 bits (effective cluster count ≈1.85) indicates that the stability procedure converged prematurely to two clusters, so broader resampling is required to test whether richer structure survives.
 The node-weighted coherence of 0.1607 ± 1.2e-5 (identical when weighted by log cluster size) shows that every bootstrap produced essentially the same pair of dense macro-clusters, so the reported stability metrics should be interpreted as a degenerate but highly repeatable solution rather than evidence of multi-cluster convergence.
 
@@ -625,6 +660,11 @@ Alignment metrics show complementary strengths.
 Globally, the SBM achieves higher NMI because its many clusters can overfit to the reference labels, but the RGCN-SCAE delivers substantially better Adjusted Rand Index (0.112 vs. 0.016 for HiTOP) while using only ~0.06 % of the cluster count.
 Per-cluster statistics amplify this divide: RGCN-SCAE maintains μ precision/recall of ~0.62/0.18 across its 8 labeled clusters, whereas the SBM’s ~18k clusters have μ precision near 0.99 but μ recall under 0.002, reflecting thousands of tiny, label-specific partitions.
 Enrichment coverage mirrors this picture—62.5 % of RGCN-SCAE clusters that overlap HiTOP are significant after FDR correction, versus <1 % for the SBM.
+
+The degree-corrected SBM’s expansion to 18,670 clusters is an expected consequence of applying a likelihood-maximizing block model to a sparse, heterogeneous, multiplex graph.
+When edge densities vary dramatically across node types and degrees—as they do in this knowledge graph—the SBM achieves higher likelihood by carving the network into many small, highly specific micro-blocks rather than discovering broader transdiagnostic modules.
+This behavior reflects the model’s parametric bias toward fine-grained partitions under heterogeneous degree distributions rather than meaningful mesoscale structure.
+In contrast, the RGCN-SCAE’s self-compressing latent space forces a parsimonious representation that merges these micro-patterns into coherent, semantically enriched domains, thereby revealing structure that the SBM’s over-fragmentation obscures.
 
 These findings reinforce the motivation for a self-compressing encoder: enforcing a modest latent capacity yields interpretable, semantically cohesive partitions that still recover known psychiatric dimensions.
 They also highlight current limitations.
@@ -651,12 +691,15 @@ Consequently, even coherent latent clusters may not map cleanly onto patient-lev
 ## Conclusion
 The current pipeline verifies that a self-compressing RGCN trained on a psychiatric knowledge graph can recover interpretable, statistically enriched partitions while using orders of magnitude fewer clusters than a degree-corrected SBM.
 Nevertheless, two structural weaknesses limit the strength of that evidence: nosology nodes remain embedded in the graph because removing them destroys every edge, and stability estimates rely on only 64 bootstraps.
-The highest priority for future work should be validating similar results on a higher quality knowledge graph.
-Specifically, building non-disease seed pathways into the knowledge graph creation—for example, leveraging phenotype and side-effect modalities—will also be essential so that diagnostic labels can be removed without triggering degeneracy and the nosology filter can operate as originally intended.
+The highest priority for future work is validating similar results on a higher quality knowledge graph.
+Specifically, incorporating non-disease seed pathways into the knowledge graph creation—for example, leveraging phenotype and side-effect modalities—will also be essential so that diagnostic labels can be removed without triggering degeneracy and the nosology filter can operate as originally intended.
 Facing that requirement head-on will make downstream alignment to HiTOP/RDoC more meaningful because any correspondence will rest on structure inferred from symptoms, biomarkers, and interventions rather than residual DSM/ICD vocabulary.
 An ablation study to test the effects of removing hyperparameters and their associated functionality would be the next most worthwhile area for future work so that it can be determined whether some hyperparameters can be safely removed.
-The next most important step for future work is running the stability test with a higher number of bootstrap samples.
+Running the stability analysis with a larger number of bootstrap samples will also clarify whether the two-cluster collapse reflects over-regularization or genuine consensus structure.
 The final step would be validating the learned clusters against external datasets (clinical cohorts, genomic assays) to determine their effectiveness in clinical applications.
+Another interesting avenue for future work is adding causal or contrastive disentanglement objectives that carve structured latent axes would make clusters actionable rather than merely descriptive.
+Weak supervision or contrastive pairs (for example, patients with the same diagnosis but divergent biomarker profiles) could anchor axes that predict treatment response or biological mechanisms, and diffusion-proximity positives (heat-kernel neighborhoods) paired with spectral-far negatives (similar to the approach outlined in [25]) would keep these constraints robust to degree heterogeneity.
+Framing this as causal disentanglement of latent psychopathology representations from the multiplex graph would clarify which latent directions matter clinically and ensure that downstream interventions target the appropriate factors.
 Addressing these constraints will clarify whether graph-based compression can support a durable, continuously updating psychiatric nosology.
 
 ## Abbreviations
@@ -694,6 +737,7 @@ Addressing these constraints will clarify whether graph-based compression can su
 1. M. Zaheer, S. Kottur, S. Ravanbakhsh, B. Poczos, R. Salakhutdinov, and A. Smola, “Deep Sets,” in Proc. 31st Conf. Neural Inf. Process. Syst. (NeurIPS), 2017, pp. 3391–3401.
 1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
 1. W. B. Johnson, J. Lindenstrauss, and G. Schechtman, “Extensions of Lipschitz maps into Banach spaces,” Israel Journal of Mathematics, vol. 54, no. 2, pp. 129–138, May 1986.
+1. Y. Li, Y. Zhang, and C. Liu, “MDGCL: Graph Contrastive Learning Framework with Multiple Graph Diffusion Methods,” Neural Processing Letters, vol. 56, art. no. 213, 2024. doi: 10.1007/s11063-024-11672-3
 
 ## Code Notes
 - Install project requirements via `pip3.10 install -r requirements.txt`.
