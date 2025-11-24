@@ -611,7 +611,13 @@ These values quantify the residual label leakage after removing most diagnosis t
 | **Effective Cluster Count Variance** | Graph-wide | Lower is better | 1.85 ± <1e-3 (computed as 2^H; no across-bootstrap variance observed) |
 
 ### Training Dynamics
-![Realized active clusters (after argmax assignment) for the main run. The realized cluster count tracks the soft active count but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.](graphs/realized_active_clusters.png "Realized Active Clusters (post-argmax)")
+<p align="center">
+    <i>Realized Active Clusters (post-argmax)</i>
+    <img src="graphs/realized_active_clusters.png">
+</p>
+<p align="center"><em>
+Realized active clusters (after argmax assignment) for the main run. The realized cluster count tracks the soft active count but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.
+</em></p>
 ![Realized clusters during the stability run. The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating. This confirms that the stability setup enforces excessive compression and masks finer structure.](graphs/stability_realized_active_clusters.png "Stability Test Realized Active Clusters (post-argmax)")
 ![Number of active clusters (clusters receiving non-zero assignment mass) during the main run across epochs. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy.](graphs/num_active_clusters.png "Number Active Clusters")
 ![Active cluster count during the stability retraining run. Despite initially exploring 60–70 clusters stochastically, the model collapses to two stable clusters early in training. This demonstrates that the stability-oriented regularization settings over-compress the latent space.](graphs/stability_num_active_clusters.png "Stability Test num Active Clusters")
