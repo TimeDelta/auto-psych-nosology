@@ -619,7 +619,7 @@ These values quantify the residual label leakage after removing most diagnosis t
     <img src="graphs/realized_active_clusters.png">
 </p>
 <p align="center"><em>
-Realized active clusters (after argmax assignment) for the main run. The realized cluster count tracks the soft active count but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.
+Realized active clusters (after argmax assignment) for the main run. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy.
 </em></p>
 <p align="center">
     <b>Stability Test Realized Active Clusters (post-argmax)</b>
@@ -633,7 +633,7 @@ Realized clusters during the stability run. The model collapses to a single real
     <img src="graphs/num_active_clusters.png"/>
 </p>
 <p align="center"><em>
-Number of active clusters (clusters receiving non-zero assignment mass) during the main run across epochs. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy.
+Number of active clusters (clusters receiving non-zero assignment mass pre-argmax) during the main run across epochs. The realized cluster count tracks this but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.
 </em></p>
 <p align="center">
     <b>Stability Test num Active Clusters</b>
