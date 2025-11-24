@@ -45,8 +45,10 @@
 - [Conclusion](#conclusion-1)
 - [Abbreviations](#abbreviations)
 - [References](#references)
-- [Code Notes](#code-notes)
 - [Appendix](#appendix)
+    - [Code Notes](#code-notes)
+    - [Calibration](#calibration)
+    - [Training Graphs](#training-graphs)
 
 ## Abstract
 This study introduces a proof-of-concept approach for automated, data-driven psychiatric nosology.
@@ -854,7 +856,8 @@ Addressing these constraints will clarify whether graph-based compression can su
 1. W. B. Johnson, J. Lindenstrauss, and G. Schechtman, “Extensions of Lipschitz maps into Banach spaces,” Israel Journal of Mathematics, vol. 54, no. 2, pp. 129–138, May 1986.
 1. Y. Li, Y. Zhang, and C. Liu, “MDGCL: Graph Contrastive Learning Framework with Multiple Graph Diffusion Methods,” Neural Processing Letters, vol. 56, art. no. 213, 2024. doi: 10.1007/s11063-024-11672-3
 
-## Code Notes
+## Appendix
+### Code Notes
 - Install project requirements via `pip3.10 install -r requirements.txt`.
 - Download the main data for the knowledge graph from https://zenodo.org/records/14851275/files/iKraph_full.tar.gz?download=1.
 - If you want to include ontology augmentation (not used in final experiment), run
@@ -907,8 +910,8 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
     - `align_partitions.py` heuristically infers HiTOP/RDoC labels from node attributes when explicit maps are not supplied, so every derived metric (global alignment scores, enrichment CSV/JSON, coverage fractions) inherits those heuristics—rerunning the script is the authoritative way to reproduce the values reported in the Results tables.
 - Regenerate the "Baseline Psychiatric Label Coverage" section via `python3.10 analysis/baseline_label_coverage.py --graph data/ikgraph.graphml --min-psy-score 0.33 --psy-include-neighbors 0`, which writes the intermediate JSON/CSV plus a Markdown table to `out/baseline_label_coverage.md`.
 
-## Appendix
-### Calibration (calculated at epoch 50)
+### Calibration
+Everything below is calculated based on performance in the first 50 epochs:
 - calibration_loss_curvature = 0 for both runs
 - calibration_loss_slope = 0 for both runs
 - main run calibration_mean_active_clusters = 245
@@ -917,6 +920,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
 - stability run calibration_rel_var_active_clusters = .9
 - main run calibration_var_active_clusters = 0
 - stability run calibration_var_active_clusters = 12912.636
+
 ### Training Graphs
 - Gate Entropy loss was permanently 0 for both runs.
 <p align="center">
