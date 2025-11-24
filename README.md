@@ -618,17 +618,83 @@ These values quantify the residual label leakage after removing most diagnosis t
 <p align="center"><em>
 Realized active clusters (after argmax assignment) for the main run. The realized cluster count tracks the soft active count but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.
 </em></p>
-![Realized clusters during the stability run. The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating. This confirms that the stability setup enforces excessive compression and masks finer structure.](graphs/stability_realized_active_clusters.png "Stability Test Realized Active Clusters (post-argmax)")
-![Number of active clusters (clusters receiving non-zero assignment mass) during the main run across epochs. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy.](graphs/num_active_clusters.png "Number Active Clusters")
-![Active cluster count during the stability retraining run. Despite initially exploring 60–70 clusters stochastically, the model collapses to two stable clusters early in training. This demonstrates that the stability-oriented regularization settings over-compress the latent space.](graphs/stability_num_active_clusters.png "Stability Test num Active Clusters")
-![Assignment entropy quantifies how spread out each node’s membership distribution is, and the training loop keeps that spread above a target to prevent premature cluster collapse and to maintain capacity for later specialization. Entropy remains high for most of training and gradually sharpens as cluster usage stabilizes. This trajectory indicates that the model maintains diverse cluster assignments early on and only commits to a more structured latent organization near convergence.](graphs/assignment_entropy.png "Assignment Entropy")
-![Assignment entropy during the stability-focused retraining run. Despite entropy remaining high throughout, the model ultimately collapses to a small number of active clusters. This dissociation between high entropy and low realized cluster count highlights over-regularization in the stability configuration and motivates revisiting the bootstrap hyperparameters.](graphs/stability_assignment_entropy.png "Stability Test Assignment Entropy")
-![Gate entropy for the main run, reflecting the diversity of hard-concrete gate activations. Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate—an important safeguard against early latent collapse.](graphs/gate_entropy_bits.png "Gate Entropy Bits")
-![Gate entropy across the stability run. Although gate entropy remains high, the model still converges to a nearly two-cluster solution, demonstrating that gate entropy alone is not a sufficient indicator of latent diversity under strong regularization pressure.](graphs/stability_gate_entropy_bits.png "Stability Test Gate Entropy Bits")
-![Reconstruction loss for the main RGCN-SCAE run, showing steady decline and smooth convergence. The decoder remains well-calibrated, and positive/negative logits track closely, indicating balanced learning of multiplex relations without memorization.](graphs/reconstruction_loss.png "Reconstruction Loss")
-![Reconstruction loss during the stability run. Although this configuration achieves lower reconstruction loss than the main run, it does so by over-compressing the latent space, reflecting a known failure mode where high reconstruction performance coincides with collapsed cluster structure.](graphs/stability_reconstruction_loss.png "Stability Test Reconstruction Loss")
-![Memory-bank consistency loss for the main run. The gradual decline reflects improving coherence of node embeddings across overlapping ego-net samples, indicating that repeated presentations of the same node converge toward stable latent representations.](graphs/consistency_loss.png "Consistency Loss")
-![Consistency loss for the stability run. The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-cluster solution.](graphs/stability_consistency_loss.png "Stability Test Consistency Loss")
+<p align="center">
+    <i>Stability Test Realized Active Clusters (post-argmax)</i>
+    <img src="graphs/stability_realized_active_clusters.png"/>
+</p>
+<p align="center">
+Realized clusters during the stability run. The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating. This confirms that the stability setup enforces excessive compression and masks finer structure
+</p>
+<p align="center">
+    <i>Number Active Clusters</i>
+    <img src="graphs/num_active_clusters.png"/>
+</p>
+<p align="center">
+Number of active clusters (clusters receiving non-zero assignment mass) during the main run across epochs. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy
+</p>
+<p align="center">
+    <i>Stability Test num Active Clusters</i>
+    <img src="graphs/stability_num_active_clusters.png"/>
+</p>
+<p align="center">
+Active cluster count during the stability retraining run. Despite initially exploring 60–70 clusters stochastically, the model collapses to two stable clusters early in training. This demonstrates that the stability-oriented regularization settings over-compress the latent space
+</p>
+<p align="center">
+    <i>Assignment Entropy</i>
+    <img src="graphs/assignment_entropy.png"/>
+</p>
+<p align="center">
+Assignment entropy quantifies how spread out each node’s membership distribution is, and the training loop keeps that spread above a target to prevent premature cluster collapse and to maintain capacity for later specialization. Entropy remains high for most of training and gradually sharpens as cluster usage stabilizes. This trajectory indicates that the model maintains diverse cluster assignments early on and only commits to a more structured latent organization near convergence
+</p>
+<p align="center">
+    <i>Stability Test Assignment Entropy</i>
+    <img src="graphs/stability_assignment_entropy.png"/>
+</p>
+<p align="center">
+Assignment entropy during the stability-focused retraining run. Despite entropy remaining high throughout, the model ultimately collapses to a small number of active clusters. This dissociation between high entropy and low realized cluster count highlights over-regularization in the stability configuration and motivates revisiting the bootstrap hyperparameters
+</p>
+<p align="center">
+    <i>Gate Entropy Bits</i>
+    <img src="graphs/gate_entropy_bits.png"/>
+</p>
+<p align="center">
+Gate entropy for the main run, reflecting the diversity of hard-concrete gate activations. Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate—an important safeguard against early latent collapse
+</p>
+<p align="center">
+    <i>Stability Test Gate Entropy Bits</i>
+    <img src="graphs/stability_gate_entropy_bits.png"/>
+</p>
+<p align="center">
+Gate entropy across the stability run. Although gate entropy remains high, the model still converges to a nearly two-cluster solution, demonstrating that gate entropy alone is not a sufficient indicator of latent diversity under strong regularization pressure
+</p>
+<p align="center">
+    <i>Reconstruction Loss</i>
+    <img src="graphs/reconstruction_loss.png"/>
+</p>
+<p align="center">
+Reconstruction loss for the main RGCN-SCAE run, showing steady decline and smooth convergence. The decoder remains well-calibrated, and positive/negative logits track closely, indicating balanced learning of multiplex relations without memorization
+</p>
+<p align="center">
+    <i>Stability Test Reconstruction Loss</i>
+    <img src="graphs/stability_reconstruction_loss.png"/>
+</p>
+<p align="center">
+Reconstruction loss during the stability run. Although this configuration achieves lower reconstruction loss than the main run, it does so by over-compressing the latent space, reflecting a known failure mode where high reconstruction performance coincides with collapsed cluster structure
+</p>
+<p align="center">
+    <i>Consistency Loss</i>
+    <img src="graphs/consistency_loss.png"/>
+</p>
+<p align="center">
+Memory-bank consistency loss for the main run. The gradual decline reflects improving coherence of node embeddings across overlapping ego-net samples, indicating that repeated presentations of the same node converge toward stable latent representations
+</p>
+<p align="center">
+    <i>Stability Test Consistency Loss</i>
+    <img src="graphs/stability_consistency_loss.png"/>
+</p>
+<p align="center">
+Consistency loss for the stability run. The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-cluster solution
+</p>
 
 The above MLflow traces for the base RGCN-SCAE run and the stability-focused retraining provide an audit trail of the gate trajectories that underlie the preceding stability table.
 The baseline model’s realized active clusters (how many clusters had at least one node assigned to it after the argmax) oscillated between ten and twenty before ending early at eleven clusters by epoch 147 due to the same number of realized active clusters for ten epochs consecutively, and its assignment entropy plateaued near 5.38 bits with gate entropy ≈7.65 bits.
