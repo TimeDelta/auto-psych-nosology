@@ -615,130 +615,130 @@ These values quantify the residual label leakage after removing most diagnosis t
 
 ### Training Dynamics
 <p align="center">
-    <i>Realized Active Clusters (post-argmax)</i>
+    <b>Realized Active Clusters (post-argmax)</b>
     <img src="graphs/realized_active_clusters.png">
 </p>
 <p align="center"><em>
 Realized active clusters (after argmax assignment) for the main run. The realized cluster count tracks the soft active count but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.
 </em></p>
 <p align="center">
-    <i>Stability Test Realized Active Clusters (post-argmax)</i>
+    <b>Stability Test Realized Active Clusters (post-argmax)</b>
     <img src="graphs/stability_realized_active_clusters.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Realized clusters during the stability run. The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating. This confirms that the stability setup enforces excessive compression and masks finer structure.
-</p>
+</em></p>
 <p align="center">
-    <i>Number Active Clusters</i>
+    <b>Number Active Clusters</b>
     <img src="graphs/num_active_clusters.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Number of active clusters (clusters receiving non-zero assignment mass) during the main run across epochs. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy.
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test num Active Clusters</i>
+    <b>Stability Test num Active Clusters</b>
     <img src="graphs/stability_num_active_clusters.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Active cluster count during the stability retraining run. Despite initially exploring 60–70 clusters stochastically, the model collapses to two stable clusters early in training. This demonstrates that the stability-oriented regularization settings over-compress the latent space.
-</p>
+</em></p>
 <p align="center">
-    <i>Assignment Entropy</i>
+    <b>Assignment Entropy</b>
     <img src="graphs/assignment_entropy.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Assignment entropy quantifies how spread out each node’s membership distribution is, and the training loop keeps that spread above a target to prevent premature cluster collapse and to maintain capacity for later specialization. Entropy remains high for most of training and gradually sharpens as cluster usage stabilizes. This trajectory indicates that the model maintains diverse cluster assignments early on and only commits to a more structured latent organization near convergence.
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Assignment Entropy</i>
+    <b>Stability Test Assignment Entropy</b>
     <img src="graphs/stability_assignment_entropy.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Assignment entropy during the stability-focused retraining run. Despite entropy remaining high throughout, the model ultimately collapses to a small number of active clusters. This dissociation between high entropy and low realized cluster count highlights over-regularization in the stability configuration and motivates revisiting the bootstrap hyperparameters.
-</p>
+</em></p>
 <p align="center">
-    <i>Gate Entropy Bits</i>
+    <b>Gate Entropy Bits</b>
     <img src="graphs/gate_entropy_bits.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Gate entropy for the main run, reflecting the diversity of hard-concrete gate activations. Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate—an important safeguard against early latent collapse.
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Gate Entropy Bits</i>
+    <b>Stability Test Gate Entropy Bits</b>
     <img src="graphs/stability_gate_entropy_bits.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Gate entropy across the stability run. Although gate entropy remains high, the model still converges to a nearly two-cluster solution, demonstrating that gate entropy alone is not a sufficient indicator of latent diversity under strong regularization pressure.
-</p>
+</em></p>
 <p align="center">
-    <i>Reconstruction Loss</i>
+    <b>Reconstruction Loss</b>
     <img src="graphs/reconstruction_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Reconstruction loss for the main RGCN-SCAE run, showing steady decline and smooth convergence. The decoder remains well-calibrated, and positive/negative logits track closely, indicating balanced learning of multiplex relations without memorization.
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Reconstruction Loss</i>
+    <b>Stability Test Reconstruction Loss</b>
     <img src="graphs/stability_reconstruction_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Reconstruction loss during the stability run. Although this configuration achieves lower reconstruction loss than the main run, it does so by over-compressing the latent space, reflecting a known failure mode where high reconstruction performance coincides with collapsed cluster structure.
-</p>
+</em></p>
 <p align="center">
-    <i>Consistency Loss</i>
+    <b>Consistency Loss</b>
     <img src="graphs/consistency_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Memory-bank consistency loss for the main run that keeps embeddings aligned for nodes that reappear in multiple ego-net batches. The gradual decline reflects improving coherence of node embeddings across overlapping ego-net samples, indicating that repeated presentations of the same node converge toward stable latent representations.
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Consistency Loss</i>
+    <b>Stability Test Consistency Loss</b>
     <img src="graphs/stability_consistency_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 Consistency loss for the stability run. The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-cluster solution.
-</p>
+</em></p>
 <p align="center">
-    <i>Encoder Clusters</i>
+    <b>Encoder Clusters</b>
     <img src="graphs/cluster_l0.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
     This is the encoder-side sparsity metric computed as the expected L0 norm (i.e., probability mass of “on” gates) across all cluster-gate units in the SCAE encoder. It directly measures how many latent clusters the encoder is actively using at each step.
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Encoder Clusters</i>
+    <b>Stability Test Encoder Clusters</b>
     <img src="graphs/stability_consistency_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Inter-Cluster Density</i>
+    <b>Inter-Cluster Density</b>
     <img src="graphs/cluster_l0.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
     How many pairwise cluster interactions are contributing to reconstruction.
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Inter-Cluster Density</i>
+    <b>Stability Test Inter-Cluster Density</b>
     <img src="graphs/stability_consistency_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 </p>
-<p align="center">
-    <i>Sparsity Warmup Factor</i>
+</em><p align="center">
+    <b>Sparsity Warmup Factor</b>
     <img src="graphs/sparsity_warmup_factor.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Sparsity Warmup Factor</i>
+    <b>Stability Test Sparsity Warmup Factor</b>
     <img src="graphs/stability_sparsity_warmup_factor.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 This is set from the model’s global step, not epochs but the x-axis here is epoch number. Every mini batch increments global step so the warmup happens more quickly compared to epoch number. This was a mistake that was missed and is a source of error in this study.
-</p>
+</em></p>
 
 The above MLflow traces for the base RGCN-SCAE run and the stability-focused retraining provide an audit trail of the gate trajectories that underlie the preceding stability table.
 The baseline model’s realized active clusters (how many clusters had at least one node assigned to it after the argmax) oscillated between ten and twenty before ending early at eleven clusters by epoch 147 due to the same number of realized active clusters for ten epochs consecutively, and its assignment entropy plateaued near 5.38 bits with gate entropy ≈7.65 bits.
@@ -924,254 +924,254 @@ Everything below is calculated based on performance in the first 50 epochs:
 ### Training Graphs
 - Gate Entropy loss was permanently 0 for both runs.
 <p align="center">
-    <i>Consistency Overlap</i>
+    <b>Consistency Overlap</b>
     <img src="graphs/consistency_overlap.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Consistency Overlap</i>
+    <b>Stability Test Consistency Overlap</b>
     <img src="graphs/stability_consistency_overlap.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Degree Correlation Squared</i>
+    <b>Degree Correlation Squared</b>
     <img src="graphs/degree_correlation_sq.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Degree Correlation Squared</i>
+    <b>Stability Test Degree Correlation Squared</b>
     <img src="graphs/stability_degree_correlation_sq.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Degree Penalty</i>
+    <b>Degree Penalty</b>
     <img src="graphs/degree_penalty.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Degree Penalty</i>
+    <b>Stability Test Degree Penalty</b>
     <img src="graphs/stability_degree_penalty.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Dirichlet Loss</i>
+    <b>Dirichlet Loss</b>
     <img src="graphs/dirichlet_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Dirichlet Loss</i>
+    <b>Stability Test Dirichlet Loss</b>
     <img src="graphs/stability_dirichlet_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Embedding Norm Loss</i>
+    <b>Embedding Norm Loss</b>
     <img src="graphs/embedding_norm_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Embedding Norm Loss</i>
+    <b>Stability Test Embedding Norm Loss</b>
     <img src="graphs/stability_embedding_norm_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Entropy Loss</i>
+    <b>Entropy Loss</b>
     <img src="graphs/entropy_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Entropy Loss</i>
+    <b>Stability Test Entropy Loss</b>
     <img src="graphs/stability_entropy_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>KL Divergence Loss</i>
+    <b>KL Divergence Loss</b>
     <img src="graphs/kld_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test KL Divergence Loss</i>
+    <b>Stability Test KL Divergence Loss</b>
     <img src="graphs/stability_kld_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Negative Logit Mean</i>
+    <b>Negative Logit Mean</b>
     <img src="graphs/neg_logit_mean.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Negative Logit Mean</i>
+    <b>Stability Test Negative Logit Mean</b>
     <img src="graphs/stability_neg_logit_mean.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Negative Logit Standard Deviation</i>
+    <b>Negative Logit Standard Deviation</b>
     <img src="graphs/neg_logit_std.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Negative Logit Standard Deviation</i>
+    <b>Stability Test Negative Logit Standard Deviation</b>
     <img src="graphs/stability_neg_logit_std.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Negative Confidence Weight</i>
+    <b>Negative Confidence Weight</b>
     <img src="graphs/negative_confidence_weight.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Negative Confidence Weight</i>
+    <b>Stability Test Negative Confidence Weight</b>
     <img src="graphs/stability_negative_confidence_weight.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Number Active Clusters Stochastic</i>
+    <b>Number Active Clusters Stochastic</b>
     <img src="graphs/num_active_clusters_stochastic.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Number Active Clusters Stochastic</i>
+    <b>Stability Test Number Active Clusters Stochastic</b>
     <img src="graphs/stability_num_active_clusters_stochastic.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Number Negative Edges</i>
+    <b>Number Negative Edges</b>
     <img src="graphs/num_negatives.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Number Negative Edges</i>
+    <b>Stability Test Number Negative Edges</b>
     <img src="graphs/stability_num_negatives.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Positive Logit Mean</i>
+    <b>Positive Logit Mean</b>
     <img src="graphs/pos_logit_mean.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Positive Logit Mean</i>
+    <b>Stability Test Positive Logit Mean</b>
     <img src="graphs/stability_pos_logit_mean.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Positive Logit Standard Deviation</i>
+    <b>Positive Logit Standard Deviation</b>
     <img src="graphs/pos_logit_std.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Positive Logit Standard Deviation</i>
+    <b>Stability Test Positive Logit Standard Deviation</b>
     <img src="graphs/stability_pos_logit_std.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Sparsity Loss</i>
+    <b>Sparsity Loss</b>
     <img src="graphs/sparsity_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Sparsity Loss</i>
+    <b>Stability Test Sparsity Loss</b>
     <img src="graphs/stability_sparsity_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Total Loss</i>
+    <b>Total Loss</b>
     <img src="graphs/total_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Total Loss</i>
+    <b>Stability Test Total Loss</b>
     <img src="graphs/stability_total_loss.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Total Negative Edges</i>
+    <b>Total Negative Edges</b>
     <img src="graphs/total_negative_edges.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Total Negative Edges</i>
+    <b>Stability Test Total Negative Edges</b>
     <img src="graphs/stability_total_negative_edges.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Total Positive Edges</i>
+    <b>Total Positive Edges</b>
     <img src="graphs/total_positive_edges.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
 <p align="center">
-    <i>Stability Test Total Positive Edges</i>
+    <b>Stability Test Total Positive Edges</b>
     <img src="graphs/stability_total_positive_edges.png"/>
 </p>
-<p align="center">
+<p align="center"><em>
 
-</p>
+</em></p>
