@@ -619,118 +619,138 @@ These values quantify the residual label leakage after removing most diagnosis t
     <img src="graphs/realized_active_clusters.png">
 </p>
 <p align="center"><em>
-Realized active clusters (after argmax assignment) for the main run. After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters. This behavior reflects successful compression without degeneracy.
+Realized active clusters (after argmax assignment) for the main run.
+After initial oscillations between ~10–20 clusters, the model stabilizes at 11 active clusters.
+This behavior reflects successful compression without degeneracy.
 </em></p>
 <p align="center">
     <b>Stability Test Realized Active Clusters (post-argmax)</b>
     <img src="graphs/stability_realized_active_clusters.png"/>
 </p>
 <p align="center"><em>
-Realized clusters during the stability run. The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating. This confirms that the stability setup enforces excessive compression and masks finer structure.
+Realized clusters during the stability run.
+The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating.
+This confirms that the stability setup enforces excessive compression and masks finer structure.
 </em></p>
 <p align="center">
     <b>Number Active Clusters</b>
     <img src="graphs/num_active_clusters.png"/>
 </p>
 <p align="center"><em>
-Number of active clusters (clusters receiving non-zero assignment mass pre-argmax) during the main run across epochs. The realized cluster count tracks this but shows a sharper convergence to 11 interpretable clusters. This provides evidence that hard assignments remain consistent with the soft assignment dynamics.
+Number of active clusters (clusters receiving non-zero assignment mass pre-argmax) during the main run across epochs.
+The realized cluster count tracks this but shows a sharper convergence to 11 interpretable clusters.
+This provides evidence that hard assignments remain consistent with the soft assignment dynamics.
 </em></p>
 <p align="center">
     <b>Stability Test num Active Clusters</b>
     <img src="graphs/stability_num_active_clusters.png"/>
 </p>
 <p align="center"><em>
-Active cluster count during the stability retraining run. Despite initially exploring 60–70 clusters stochastically, the model collapses to two stable clusters early in training. This demonstrates that the stability-oriented regularization settings over-compress the latent space.
+Active cluster count during the stability retraining run.
+Despite initially exploring 60–70 clusters stochastically, the model collapses to two stable clusters early in training.
+This demonstrates that the stability-oriented regularization settings over-compress the latent space.
 </em></p>
 <p align="center">
     <b>Assignment Entropy</b>
     <img src="graphs/assignment_entropy.png"/>
 </p>
 <p align="center"><em>
-Assignment entropy quantifies how spread out each node’s membership distribution is, and the training loop keeps that spread above a target to prevent premature cluster collapse and to maintain capacity for later specialization. Entropy remains high for most of training and gradually sharpens as cluster usage stabilizes. This trajectory indicates that the model maintains diverse cluster assignments early on and only commits to a more structured latent organization near convergence.
+Assignment entropy quantifies how spread out each node’s membership distribution is, and the training loop keeps that spread above a target to prevent premature cluster collapse and to maintain capacity for later specialization.
+Entropy remains high for most of training and gradually sharpens as cluster usage stabilizes.
+This trajectory indicates that the model maintains diverse cluster assignments early on and only commits to a more structured latent organization near convergence.
 </em></p>
 <p align="center">
     <b>Stability Test Assignment Entropy</b>
     <img src="graphs/stability_assignment_entropy.png"/>
 </p>
 <p align="center"><em>
-Assignment entropy during the stability-focused retraining run. Despite entropy remaining high throughout, the model ultimately collapses to a small number of active clusters. This dissociation between high entropy and low realized cluster count highlights over-regularization in the stability configuration and motivates revisiting the bootstrap hyperparameters.
+Assignment entropy during the stability-focused retraining run.
+Despite entropy remaining high throughout, the model ultimately collapses to a small number of active clusters.
+This dissociation between high entropy and low realized cluster count highlights over-regularization in the stability configuration and motivates revisiting the bootstrap hyperparameters.
 </em></p>
 <p align="center">
     <b>Gate Entropy Bits</b>
     <img src="graphs/gate_entropy_bits.png"/>
 </p>
 <p align="center"><em>
-Gate entropy for the main run, reflecting the diversity of hard-concrete gate activations. Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate—an important safeguard against early latent collapse.
+Gate entropy for the main run, reflecting the diversity of hard-concrete gate activations.
+Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate—an important safeguard against early latent collapse.
 </em></p>
 <p align="center">
     <b>Stability Test Gate Entropy Bits</b>
     <img src="graphs/stability_gate_entropy_bits.png"/>
 </p>
 <p align="center"><em>
-Gate entropy across the stability run. Although gate entropy remains high, the model still converges to a nearly two-cluster solution, demonstrating that gate entropy alone is not a sufficient indicator of latent diversity under strong regularization pressure.
+Gate entropy across the stability run.
+Although gate entropy remains high, the model still converges to a nearly two-cluster solution, demonstrating that gate entropy alone is not a sufficient indicator of latent diversity under strong regularization pressure.
 </em></p>
 <p align="center">
     <b>Reconstruction Loss</b>
     <img src="graphs/reconstruction_loss.png"/>
 </p>
 <p align="center"><em>
-Reconstruction loss for the main RGCN-SCAE run, showing steady decline and smooth convergence. The decoder remains well-calibrated, and positive/negative logits track closely, indicating balanced learning of multiplex relations without memorization.
+Reconstruction loss for the main RGCN-SCAE run, showing steady decline and smooth convergence.
+The decoder remains well-calibrated, and positive/negative logits track closely, indicating balanced learning of multiplex relations without memorization.
 </em></p>
 <p align="center">
     <b>Stability Test Reconstruction Loss</b>
     <img src="graphs/stability_reconstruction_loss.png"/>
 </p>
 <p align="center"><em>
-Reconstruction loss during the stability run. Although this configuration achieves lower reconstruction loss than the main run, it does so by over-compressing the latent space, reflecting a known failure mode where high reconstruction performance coincides with collapsed cluster structure.
+Reconstruction loss during the stability run.
+Although this configuration achieves lower reconstruction loss than the main run, it does so by over-compressing the latent space, reflecting a known failure mode where high reconstruction performance coincides with collapsed cluster structure.
 </em></p>
 <p align="center">
     <b>Consistency Loss</b>
     <img src="graphs/consistency_loss.png"/>
 </p>
 <p align="center"><em>
-Memory-bank consistency loss for the main run that keeps embeddings aligned for nodes that reappear in multiple ego-net batches. The gradual decline reflects improving coherence of node embeddings across overlapping ego-net samples, indicating that repeated presentations of the same node converge toward stable latent representations.
+Memory-bank consistency loss for the main run that keeps embeddings aligned for nodes that reappear in multiple ego-net batches.
+The gradual decline reflects improving coherence of node embeddings across overlapping ego-net samples, indicating that repeated presentations of the same node converge toward stable latent representations.
 </em></p>
 <p align="center">
     <b>Stability Test Consistency Loss</b>
     <img src="graphs/stability_consistency_loss.png"/>
 </p>
 <p align="center"><em>
-Consistency loss for the stability run. The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-cluster solution.
+Consistency loss for the stability run.
+The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-cluster solution.
 </em></p>
 <p align="center">
     <b>Encoder Clusters</b>
     <img src="graphs/cluster_l0.png"/>
 </p>
 <p align="center"><em>
-    This is the encoder-side sparsity metric computed as the expected L0 norm (i.e., probability mass of “on” gates) across all cluster-gate units in the SCAE encoder. It directly measures how many latent clusters the encoder is actively using at each step.
+This is the encoder-side sparsity metric computed as the expected L0 norm (i.e., probability mass of “on” gates) across all cluster-gate units in the SCAE encoder.
+It directly measures how many latent clusters the encoder is actively using at each step.
 </em></p>
 <p align="center">
     <b>Stability Test Encoder Clusters</b>
-    <img src="graphs/stability_consistency_loss.png"/>
+    <img src="graphs/stability_cluster_l0.png"/>
 </p>
 <p align="center"><em>
-
+Hard Concrete L0 expectation plunges to roughly 150 active gates within the first few dozen epochs and then flatlines, evidencing the over-pruning introduced by the stability configuration.
 </em></p>
 <p align="center">
     <b>Inter-Cluster Density</b>
-    <img src="graphs/cluster_l0.png"/>
+    <img src="graphs/inter_l0.png"/>
 </p>
 <p align="center"><em>
     How many pairwise cluster interactions are contributing to reconstruction.
 </em></p>
 <p align="center">
     <b>Stability Test Inter-Cluster Density</b>
-    <img src="graphs/stability_consistency_loss.png"/>
+    <img src="graphs/stability_inter_l0.png"/>
 </p>
 <p align="center"><em>
+
 </p>
 </em><p align="center">
     <b>Sparsity Warmup Factor</b>
     <img src="graphs/sparsity_warmup_factor.png"/>
 </p>
 <p align="center"><em>
-
+The linear ramp reaches 1.0 at the expected 100th epoch.
 </em></p>
 <p align="center">
     <b>Stability Test Sparsity Warmup Factor</b>
@@ -749,12 +769,12 @@ For full transparency, the remaining MLflow graphs are included in the appendix.
 #### Calibration and Reconstruction Diagnostics
 Calibration statistics show how pretraining choices constrained the stability experiment.
 Decoder behavior mirrors this drift: the baseline model ended with overlapping positive/negative logits (means 0.424/0.423, standard deviations 0.003–0.005) while processing 6,704 negatives per batch, but the stability run pushed logits above 1.0/0.96 with an order-of-magnitude higher variance and only 1,206 negatives.
-These distributions explain why the stability configuration attains a lower reconstruction loss (0.00120 vs. 0.00206) yet produces fewer populated clusters, and they motivate revising the negative-sampling ratio and calibration window when describing future experiments.
+These distributions explain why the stability configuration attains a lower reconstruction loss (0.00120 vs. 0.00206) yet produces fewer populated clusters.
 
 #### Regularization Burden
 Loss decompositions clarify which constraints dominate optimization.
 At convergence the stability run reports a consistency penalty of 1.9e-3 and a degree-penalty of 1.2e-3, roughly an order of magnitude larger than the corresponding 4.5e-7 and 1.1e-4 terms in the baseline run.
-Conversely, the encoder/decoder sparsity penalties (`cluster_L0` = 150.1; `inter_L0` = 3.57e4) are substantially lower than the baseline’s 225.1 / 5.51e4, corroborating the qualitative observation that the stability regimen over-compresses the latent space.
+Conversely, the encoder/decoder sparsity penalties (encoder clusters = 150.1; inter-cluster density = 3.57e4) are substantially lower than the baseline’s 225.1 / 5.51e4, corroborating the qualitative observation that the stability regimen over-compresses the latent space.
 
 ## Discussion
 This work demonstrates that it might be possible for a carefully curated multiplex knowledge graph, coupled with information-theoretic representation learning, to recover candidate transdiagnostic structure aligned with contemporary dimensional nosologies.
@@ -889,7 +909,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
         - **entropy_loss** encourages per-graph assignment entropy to stay above `--assignment-entropy-floor`.
         - **dirichlet_loss** is the KL term that keeps mean cluster usage close to the Dirichlet prior.
         - **embedding_norm_loss** and **kld_loss** regularize latent vectors on a per-graph basis.
-        - **degree_penalty** (with **degree_correlation_sq**) measures the decorrelation between latent norms and node degree.
+        - **degree_penalty** (with **degree_correlation_sq**) measures the correlation between latent norms and node degree.
         - **consistency_loss** / **consistency_overlap** are the memory-bank temporal consistency terms (0 when disabled).
         - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
         - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete $L_0$ expectation.
@@ -928,98 +948,105 @@ Everything below is calculated based on performance in the first 50 epochs:
     <img src="graphs/consistency_overlap.png"/>
 </p>
 <p align="center"><em>
-
+Flat trace at zero confirms the memory-bank consistency terms were disabled for the main run, so consecutive embeddings evolve independently.
 </em></p>
 <p align="center">
     <b>Stability Test Consistency Overlap</b>
     <img src="graphs/stability_consistency_overlap.png"/>
 </p>
 <p align="center"><em>
-
+Peaks near 1.9e-3 around epoch ~60, after the cluster count has already collapsed to a single realized cluster, highlighting that the added consistency term becomes most active only after the structure has degenerated.
 </em></p>
 <p align="center">
-    <b>Degree Correlation Squared</b>
+    <b>Node Degree Pearson Correlation Squared</b>
     <img src="graphs/degree_correlation_sq.png"/>
 </p>
 <p align="center"><em>
-
+How strongly each latent embedding dimension still correlates with node degree after centering.
+Declines toward zero, demonstrating that latent norm and node degree become decorrelated and keep the degree penalty near 1.1e-4 at convergence.
 </em></p>
 <p align="center">
-    <b>Stability Test Degree Correlation Squared</b>
+    <b>Stability Test Node Degree Pearson Correlation Squared</b>
     <img src="graphs/stability_degree_correlation_sq.png"/>
 </p>
 <p align="center"><em>
-
+Settles an order of magnitude higher, explaining the ≈1.2e-3 penalty cited for the stability run.
 </em></p>
 <p align="center">
     <b>Degree Penalty</b>
     <img src="graphs/degree_penalty.png"/>
 </p>
 <p align="center"><em>
-
+This tracks the scalar regularizer that discourages norm–degree coupling.
+Its steady decay mirrors the correlation-squared plot and motivates the chosen weight.
 </em></p>
 <p align="center">
     <b>Stability Test Degree Penalty</b>
     <img src="graphs/stability_degree_penalty.png"/>
 </p>
 <p align="center"><em>
-
+Stays an order of magnitude higher, underscoring how the stability settings suppress variance by anchoring latent norms to node degree.
 </em></p>
 <p align="center">
     <b>Dirichlet Loss</b>
     <img src="graphs/dirichlet_loss.png"/>
 </p>
 <p align="center"><em>
-
+The KL divergence between empirical cluster usage and the symmetric Dirichlet prior.
+Brief spikes indicate moments when a few clusters temporarily dominate before the prior pulls usage back in line.
 </em></p>
 <p align="center">
     <b>Stability Test Dirichlet Loss</b>
     <img src="graphs/stability_dirichlet_loss.png"/>
 </p>
 <p align="center"><em>
-
+Remains elevated because one or two clusters hoard probability mass, reinforcing that the stability run never recovers a balanced mixture.
 </em></p>
 <p align="center">
     <b>Embedding Norm Loss</b>
     <img src="graphs/embedding_norm_loss.png"/>
 </p>
 <p align="center"><em>
-
+Drops to ≈4.6e-3 by early stopping, showing that latent vectors stay within the intended $L_2$ budget while still supporting 11 populated clusters.
 </em></p>
 <p align="center">
     <b>Stability Test Embedding Norm Loss</b>
     <img src="graphs/stability_embedding_norm_loss.png"/>
 </p>
 <p align="center"><em>
-
+Much earlier plateauing reflects the same global step vs epoch number as with the sparsity warmup issue.
 </em></p>
 <p align="center">
     <b>Entropy Loss</b>
     <img src="graphs/entropy_loss.png"/>
 </p>
 <p align="center"><em>
-
+Hinge penalty that keeps the full graph’s assignment entropy above the 5.5-nat (7.93-bit) floor.
+Because the main run trains on a single graph, that graph never quite reaches the target, so the loss hovers at a small non-zero value rather than spiking—documenting the constant gentle push to keep assignments diffuse.
+There’s only one giant graph so once assignments sharpen on that graph, the single entropy value sits just below the floor and the hinge never fully releases.
 </em></p>
 <p align="center">
     <b>Stability Test Entropy Loss</b>
     <img src="graphs/stability_entropy_loss.png"/>
 </p>
 <p align="center"><em>
-
+Because this run trains on ego-net mini batches with high gate temperature and heavier consistency/degree penalties, its soft assignments stay more diffuse than in the full-graph run even after the argmax collapses to a single realized cluster.
+That keeps the per-graph entropy at or above the 5.5-nat (7.93-bit) floor much more often, so the hinge term spends more time at zero.
 </em></p>
 <p align="center">
     <b>KL Divergence Loss</b>
     <img src="graphs/kld_loss.png"/>
 </p>
 <p align="center"><em>
-
+Captures the per-epoch latent KL divergence loss term.
+Plunges within the first handful of epochs, indicating the encoder snaps quickly into a stable posterior once it settles on 12-14 clusters.
 </em></p>
 <p align="center">
     <b>Stability Test KL Divergence Loss</b>
     <img src="graphs/stability_kld_loss.png"/>
 </p>
 <p align="center"><em>
-
+Levels off at a slightly higher plateau, signaling that the collapsed solution pushes the posterior away from the prior more.
 </em></p>
 <p align="center">
     <b>Negative Logit Mean</b>
@@ -1054,28 +1081,31 @@ Everything below is calculated based on performance in the first 50 epochs:
     <img src="graphs/negative_confidence_weight.png"/>
 </p>
 <p align="center"><em>
-
+This scales the negative-edge BCE term.
+Because the main run’s gate entropy stays near 7.6 bits, this sits around 0.14 with only millipoint wobble, meaning negatives are gently down-weighted the entire time rather than being suppressed after assignments sharpen.
 </em></p>
 <p align="center">
     <b>Stability Test Negative Confidence Weight</b>
     <img src="graphs/stability_negative_confidence_weight.png"/>
 </p>
 <p align="center"><em>
-
+The stability run shows the same mechanism under lower gate entropy (~7.2 bits), so this drifts from ≈0.13 toward ≈0.17 but never exceeds 1.0.
+Negatives remain down-weighted even as the realized clusters collapse.
+This confirms the collapse is not caused by under-weighted negatives.
 </em></p>
 <p align="center">
     <b>Number Active Clusters Stochastic</b>
     <img src="graphs/num_active_clusters_stochastic.png"/>
 </p>
 <p align="center"><em>
-
+Gate counts hover well above the realized 11 clusters, confirming that the sampler continues to explore dozens of latent components even after argmax pruning.
 </em></p>
 <p align="center">
     <b>Stability Test Number Active Clusters Stochastic</b>
     <img src="graphs/stability_num_active_clusters_stochastic.png"/>
 </p>
 <p align="center"><em>
-
+Despite the realized collapse, stochastic gates still touch ~70 clusters; the diverging traces visualize why the stability stop rule missed the latent failure.
 </em></p>
 <p align="center">
     <b>Number Negative Edges</b>
@@ -1124,28 +1154,29 @@ Everything below is calculated based on performance in the first 50 epochs:
     <img src="graphs/sparsity_loss.png"/>
 </p>
 <p align="center"><em>
-
+This measures the aggregate Hard-Concrete L0 penalties for encoder/decoder gates.
+The pattern shown is entirely caused by the sparsity warmup schedule (full warmup factor at global step 100).
 </em></p>
 <p align="center">
     <b>Stability Test Sparsity Loss</b>
     <img src="graphs/stability_sparsity_loss.png"/>
 </p>
 <p align="center"><em>
-
+The same situation as the full-graph run except with the previously mentioned global step issue forcing the decline to start at a much earlier epoch.
 </em></p>
 <p align="center">
     <b>Total Loss</b>
     <img src="graphs/total_loss.png"/>
 </p>
 <p align="center"><em>
-
+This pattern is also driven almost entirely by the sparsity warmup schedule as the remaining loss terms are close to 0 and the sparsity loss has the exact same trend line.
 </em></p>
 <p align="center">
     <b>Stability Test Total Loss</b>
     <img src="graphs/stability_total_loss.png"/>
 </p>
 <p align="center"><em>
-
+This pattern is also driven almost entirely by the sparsity warmup schedule as the remaining loss terms are close to 0 and the sparsity loss has the exact same trend line.
 </em></p>
 <p align="center">
     <b>Total Negative Edges</b>
