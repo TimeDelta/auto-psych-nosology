@@ -1053,28 +1053,28 @@ Levels off at a slightly higher plateau, signaling that the collapsed solution p
     <img src="graphs/neg_logit_mean.png"/>
 </p>
 <p align="center"><em>
-
+Begins near 0.24 and climbs steadily across training—ending around 0.42, essentially overlapping the positive-logit mean—showing how the decoder gradually tightens its calibration band as the latent clusters stabilize.
 </em></p>
 <p align="center">
     <b>Stability Test Negative Logit Mean</b>
     <img src="graphs/stability_neg_logit_mean.png"/>
 </p>
 <p align="center"><em>
-
+Starts around 0.25 band similar to the main run but rises steadily past 0.9 by the time the end of training, showing how the decoder becomes increasingly over-confident about rejecting edges once the stability configuration squeezes almost all clusters out of the latent space.
 </em></p>
 <p align="center">
     <b>Negative Logit Standard Deviation</b>
     <img src="graphs/neg_logit_std.png"/>
 </p>
 <p align="center"><em>
-
+Stays in the range of .001 to .008, confirming tightly clustered logits for the main experiment.
 </em></p>
 <p align="center">
     <b>Stability Test Negative Logit Standard Deviation</b>
     <img src="graphs/stability_neg_logit_std.png"/>
 </p>
 <p align="center"><em>
-
+Expands by an order of magnitude, reflecting the noisy decoder induced by the altered sampling schedule.
 </em></p>
 <p align="center">
     <b>Negative Confidence Weight</b>
@@ -1107,47 +1107,47 @@ Gate counts hover well above the realized 11 clusters, confirming that the sampl
 <p align="center"><em>
 Despite the realized collapse, stochastic gates still touch ~70 clusters; the diverging traces visualize why the stability stop rule missed the latent failure.
 </em></p>
-<p align="center">
+<p align="center">f
     <b>Number Negative Edges</b>
     <img src="graphs/num_negatives.png"/>
 </p>
 <p align="center"><em>
-
+Completely flat at roughly 6,704 sampled negatives as expected.
 </em></p>
 <p align="center">
     <b>Stability Test Number Negative Edges</b>
     <img src="graphs/stability_num_negatives.png"/>
 </p>
 <p align="center"><em>
-
+Oscillates between roughly 1113 and 1206 with no intermediate values due to the global step difference mentioned above.
 </em></p>
 <p align="center">
     <b>Positive Logit Mean</b>
     <img src="graphs/pos_logit_mean.png"/>
 </p>
 <p align="center"><em>
-
+Begins near 0.24 and climbs steadily across training—ending around 0.42, essentially overlapping the positive-logit mean—showing how the decoder gradually tightens its calibration band as the latent clusters stabilize.
 </em></p>
 <p align="center">
     <b>Stability Test Positive Logit Mean</b>
     <img src="graphs/stability_pos_logit_mean.png"/>
 </p>
 <p align="center"><em>
-
+Starts around 0.25 band similar to the main run but rises steadily past 1.0 by the time the end of training, showing how the decoder becomes increasingly over-confident about rejecting edges once the stability configuration squeezes almost all clusters out of the latent space.
 </em></p>
 <p align="center">
     <b>Positive Logit Standard Deviation</b>
     <img src="graphs/pos_logit_std.png"/>
 </p>
 <p align="center"><em>
-
+Stays mostly in the range of .0015 to .005, confirming tightly clustered logits for the main experiment.
 </em></p>
 <p align="center">
     <b>Stability Test Positive Logit Standard Deviation</b>
     <img src="graphs/stability_pos_logit_std.png"/>
 </p>
 <p align="center"><em>
-
+Expands by an order of magnitude, reflecting the noisy decoder induced by the altered sampling schedule.
 </em></p>
 <p align="center">
     <b>Sparsity Loss</b>
@@ -1177,32 +1177,4 @@ This pattern is also driven almost entirely by the sparsity warmup schedule as t
 </p>
 <p align="center"><em>
 This pattern is also driven almost entirely by the sparsity warmup schedule as the remaining loss terms are close to 0 and the sparsity loss has the exact same trend line.
-</em></p>
-<p align="center">
-    <b>Total Negative Edges</b>
-    <img src="graphs/total_negative_edges.png"/>
-</p>
-<p align="center"><em>
-
-</em></p>
-<p align="center">
-    <b>Stability Test Total Negative Edges</b>
-    <img src="graphs/stability_total_negative_edges.png"/>
-</p>
-<p align="center"><em>
-
-</em></p>
-<p align="center">
-    <b>Total Positive Edges</b>
-    <img src="graphs/total_positive_edges.png"/>
-</p>
-<p align="center"><em>
-
-</em></p>
-<p align="center">
-    <b>Stability Test Total Positive Edges</b>
-    <img src="graphs/stability_total_positive_edges.png"/>
-</p>
-<p align="center"><em>
-
 </em></p>
