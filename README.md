@@ -1107,7 +1107,7 @@ Gate counts hover well above the realized 11 clusters, confirming that the sampl
 <p align="center"><em>
 Despite the realized collapse, stochastic gates still touch ~70 clusters; the diverging traces visualize why the stability stop rule missed the latent failure.
 </em></p>
-<p align="center">f
+<p align="center">
     <b>Number Negative Edges</b>
     <img src="graphs/num_negatives.png"/>
 </p>
