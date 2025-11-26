@@ -907,7 +907,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
 - Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the graph before psych-relevance filtering.
 - Run `python3.10 psy_filter_snapshot.py data/ikgraph.graphml --graphml-out data/ikgraph.filtered.graphml` to get final graph for training.
 - MLflow is used for optional experiment tracking.
-    - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact as well as the traind model .pt file.
+    - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact as well as the trained model .pt file.
     - Metric explanations:
         - **total_loss** = weighted sum of reconstruction, sparsity, entropy, Dirichlet, embedding-norm, KL, consistency, gate-entropy, and degree penalties reported below.
         - **recon_loss** averages the BCE losses for positive and sampled negative edges per graph.
