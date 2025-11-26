@@ -37,6 +37,7 @@
     - [Overall Metrics](#overall-metrics)
     - [HiTOP Alignment Summary](#hitop-alignment-summary)
     - [RDoC Alignment Summary](#rdoc-alignment-summary)
+    - [Cluster Snapshots (main partitioning run)](#cluster-snapshots--main-partitioning-run-)
     - [Stability Metrics (Bootstrapped Subgraph and Semantic Consistency)](#stability-metrics--bootstrapped-subgraph-and-semantic-consistency-)
     - [Training Dynamics](#training-dynamics)
         - [Calibration and Reconstruction Diagnostics](#calibration-and-reconstruction-diagnostics)
@@ -598,6 +599,11 @@ These values quantify the residual label leakage after removing most diagnosis t
 | SBM-4 | Cognitive Systems | 0.333 | 0.093 | 0.145 | 3.90e-06 | 0.181 |
 | **RGCN-SCAE Mean (± SD)** | - | 0.622±0.409 | 0.167±0.189 | 0.169±0.220 | q<0.05 coverage: 25% | 0.169 |
 | **SBM Mean (± SD)** | - |  0.993±0.080 |  0.00166±0.00599 |  0.00304±0.00946 | q<0.05 coverage: 0.038% |  0.149 |
+
+### Cluster Snapshots (main partitioning run)
+- **Cluster 3 — Negative Valence neurotransmission.** The medoid node is *Neurotransmitter Depression* and its eight closest neighbors (e.g., *Neurophysiological Depression*, *Depression Dysfunction*, *Depression Of Brain Activity*) remain entirely within neurophysiology phrasing. This is the same cluster that drives the strong RDoC Negative Valence alignment in the table above, so we explicitly document it here as the clearest affective-neurochemical factor recovered by the encoder.
+- **Cluster 160 — Parkinsonian cognitive systems.** Centered on the medoid *PD*, its nearest nodes include *PDD*, *pDCD*, and *PDQ*, all abbreviations tied to Parkinson’s disease staging or questionnaires. It underpins the cognitive-systems precision entry for RGCN-SCAE-160, illustrating that the model isolates tightly condensed instrument jargon rather than mixing it with generic symptom language.
+- **Cluster 212 — Depressive/anxiety behavioral language.** With medoid *Depressive Response* and neighbors like *Depressive-Related Behavior*, *Depressive Emotional Changes*, and *Depressive And Anxiety-Like*, this cluster captures the broader behavioral lexicon spanning distress and anxious arousal. Its enrichment appears under the “Unspecified Clinical” rows, so surfacing the raw node names helps explain why it straddles multiple HiTOP domains even though the quantitative metrics classify it as clinically mixed.
 
 ### Stability Metrics (Bootstrapped Subgraph and Semantic Consistency)
 | **Framework** | **# Labels (Baseline)** | **# Clusters (Learned)** | **Cluster-Count Ratio** | **Mean Coherence (± 90 % CI)** | **Log-Size Weighted Coherence** |
