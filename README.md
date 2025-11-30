@@ -319,6 +319,7 @@ Positional encodings derived from Laplacian eigenvectors are standardized within
 ##### Addressing Degree and Hub Bias
 Even after the adjustments above, the latent space can correlate with degree if left unregulated.
 A dedicated orthogonality penalty therefore measures the squared correlation between latent coordinates and the logarithm of node degree, driving the optimizer toward representations that encode semantics rather than centrality.
+Essentially, this inhibits the encoder from embedding nodes along the principal degree axis of the graph, which is a common degeneracy in heterogeneous graphs, thereby encouraging reliance on relational and attribute structure rather than degree.
 Degree-aware dropout complements this penalty by reducing the influence of hubs at the message-passing stage itself.
 
 ##### Balancing Multiplex Relation Frequencies
