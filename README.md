@@ -10,7 +10,7 @@
 - [Research Question](#research-question)
 - [Hypothesis](#hypothesis)
     - [Hypothesis Metrics Justification](hypothesis-metrics-justification)
-- [Methods](#methods)
+- [Materials and Methods](#materials-and-methods)
     - [Graph Creation](#graph-creation)
     - [Knowledge Graph Dataset](#knowledge-graph-dataset)
     - [Preventing Biased Alignment](#preventing-biased-alignment)
@@ -20,15 +20,15 @@
         - [Training](#training)
             - [Commands](#commands)
             - [Mitigating Cluster Collapse and Runaway Imbalance](#mitigating-cluster-collapse-and-runaway-imbalance)
-            - [Stabilizing Hard-Concrete Gates](#stabilizing-hard--concrete-gates)
+            - [Stabilizing Hard-Concrete Gates](#stabilizing-hard-concrete-gates)
             - [Gate Revival Hook](#gate-revival-hook)
-            - [Controlling Message-Passing Drift](#controlling-message--passing-drift)
+            - [Controlling Message-Passing Drift](#controlling-message-passing-drift)
             - [Addressing Degree and Hub Bias](#addressing-degree-and-hub-bias)
             - [Balancing Multiplex Relation Frequencies](#balancing-multiplex-relation-frequencies)
             - [Hardening Negative Sampling](#hardening-negative-sampling)
-            - [Maintaining Cross-Batch Consistency](#maintaining-cross--batch-consistency)
+            - [Maintaining Cross-Batch Consistency](#maintaining-cross-batch-consistency)
             - [Latent Regularization and Diagnostics](#latent-regularization-and-diagnostics)
-            - [Trainer-Level Safeguards](#trainer--level-safeguards)
+            - [Trainer-Level Safeguards](#trainer-level-safeguards)
             - [Objective](#objective)
             - [Reconstruction Loss and Entropy Controls](#reconstruction-loss-and-entropy-controls)
         - [Adaptive Subgraph Sampling to Mitigate Overfitting](#adaptive-subgraph-sampling-to-mitigate-overfitting)
@@ -183,7 +183,7 @@ By using a knowledge graph that was mined from the scientific literature into a 
 Unlike many ML approaches that risk reproducing existing DSM or RDoC categories (by training directly on them), this method removes those labels during graph construction.
 Any observed alignment that later emerges with HiTOP or RDoC therefore reflects genuine structural similarity rather than trivial lexical overlap, ensuring a more independent test of whether automated nosology converges with established frameworks.
 
-## Methods
+## Materials and Methods
 ### Knowledge Graph Dataset
 The knowledge graph was created from a subset of the IKraph dataset [20].
 This data is then pared down to only the psychiatrically relevant nodes and edges using heuristics (final stats: 59786 nodes / 69248 edges).
