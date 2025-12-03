@@ -653,7 +653,7 @@ This behavior reflects successful compression without degeneracy.
 </p>
 <p align="center"><em>
 Realized clusters during the stability run.
-The model collapses to a single realized cluster by ~epoch 66 despite high-entropy gating.
+The model collapses to a single realized cluster by ~epoch 56 despite high-entropy gating.
 This confirms that the stability setup enforces excessive compression and masks finer structure.
 </em></p>
 <p align="center">
@@ -680,15 +680,14 @@ This demonstrates that the stability-oriented regularization settings over-compr
 </p>
 <p align="center"><em>
 Assignment entropy quantifies how spread out each node’s membership distribution is, and the training loop keeps that spread above a target to prevent premature cluster collapse and to maintain capacity for later specialization.
-Entropy remains high for most of training and gradually sharpens as cluster usage stabilizes.
-This trajectory indicates that the model maintains diverse cluster assignments early on and only commits to a more structured latent organization near convergence.
+There is an initial increase from ~5.29 to ~5.37 bits during the exploratory phase, after which it remains tightly stable between ~5.37–5.40 bits throughout the remainder of training.
+The low variance and high plateau reflect consistent multi-cluster usage and an absence of degenerate assignment behavior.
 </em></p>
 <p align="center">
     <b>Stability Test Assignment Entropy</b>
     <img src="graphs/stability_assignment_entropy.png"/>
 </p>
 <p align="center"><em>
-Assignment entropy during the stability-focused retraining run.
 Despite entropy remaining high throughout, the model ultimately collapses to a small number of active clusters.
 This dissociation between high entropy and low realized cluster count highlights over-regularization in the stability configuration and motivates revisiting the bootstrap hyperparameters.
 </em></p>
