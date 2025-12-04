@@ -168,7 +168,7 @@ Also reported is a log-size–weighted variant and non-parametric form of confid
 - **Stability metrics:** To quantify robustness, the pipeline reruns alignment on bootstrap subgraphs of the full knowledge graph and computes the ARI for each replicate.
 ARI is derived from the contingency table of cluster–label overlaps as $\frac{\sum_{ij}(n_{ij}^2) − [\sum_i a_i^2 \sum_j b_j^2]/N^2}{0.5[\sum_i a_i^2 + \sum_j b_j^2] − [\sum_i a_i^2 \sum_j b_j^2]/N^2}$, correcting for chance agreement.
 The bootstrap distribution is summarized (mean, spread, and percentile intervals) and coherence confidence interval widths are tracked as an orthogonal check on semantic stability.
-- **Alignment metrics:** Global correspondence is assessed with normalized mutual information using the arithmetic mean denominator, adjusted mutual information that subtracts the expected mutual information under a permutation null, the homogeneity/completeness/v-measure trio, and ARI.
+- **Alignment metrics:** Global correspondence is assessed with normalized mutual information (NMI) using the arithmetic mean denominator, adjusted mutual information that subtracts the expected mutual information under a permutation null, the homogeneity/completeness/v-measure trio, and ARI.
 These rely on the shared node set between the learned partition and HiTOP/RDoC labels.
 Full confusion matrices accompany the summary statistics so that reviewers can inspect which domains contribute most to each score.
 - **Per-cluster alignment metrics:** Following the enrichment step, each cluster is paired with the label that attains the minimum false-discovery–rate value.
@@ -864,9 +864,11 @@ Addressing these constraints will clarify whether graph-based compression can su
 
 ## Abbreviations
 - ARI = adjusted Rand index
+- CI = Confidence Interval
 - DSM = Diagnostic and Statistical Manual of Mental Disorders
 - HiTOP = Hierarchical Taxonomy of Psychopathology
 - ICD = International Classification of Diseases
+- NMI = Normalized Mutual Information
 - RDoC = Research Domain Criteria
 - RGCN = Relational Graph Convolutional Network
 - SBM = Stochastic Block Model
