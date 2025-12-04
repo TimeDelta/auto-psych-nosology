@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to save a Lorenz curve plot (PNG).",
     )
+    parser.add_argument(
+        "--plot-title-prefix",
+        type=str,
+        default="",
+        help="Optional prefix prepended to the Lorenz plot title.",
+    )
     return parser.parse_args()
 
 
@@ -97,7 +103,10 @@ def maybe_write_csv(
 
 
 def maybe_plot(
-    plot_path: Path, fractions: List[float], cumulative: List[float]
+    plot_path: Path,
+    fractions: List[float],
+    cumulative: List[float],
+    title_prefix: str,
 ) -> None:
     if plot_path is None:
         return
@@ -107,7 +116,10 @@ def maybe_plot(
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Equality line")
     ax.set_xlabel("Fraction of clusters")
     ax.set_ylabel("Fraction of nodes")
-    ax.set_title("Cluster Size Lorenz Curve")
+    title = "Cluster Size Lorenz Curve"
+    if title_prefix:
+        title = f"{title_prefix} — {title}"
+    ax.set_title(title)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.set_aspect("equal", adjustable="box")
@@ -125,7 +137,7 @@ def main() -> None:
     gini = gini_coefficient(fractions, cumulative)
 
     maybe_write_csv(args.curve_csv, fractions, cumulative)
-    maybe_plot(args.plot, fractions, cumulative)
+    maybe_plot(args.plot, fractions, cumulative, args.plot_title_prefix)
 
     print(
         f"Clusters: {len(sizes)} | Nodes: {sum(sizes)} | "
