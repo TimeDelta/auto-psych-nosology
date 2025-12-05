@@ -36,6 +36,7 @@
 - [Results](#results)
     - [Baseline Psychiatric Label Coverage](#baseline-psychiatric-label-coverage)
     - [Overall Metrics](#overall-metrics)
+    - [Cluster Sizes](#cluster-sizes)
     - [HiTOP Alignment Summary](#hitop-alignment-summary)
     - [RDoC Alignment Summary](#rdoc-alignment-summary)
     - [Cluster Snapshots (main partitioning run)](#cluster-snapshots--main-partitioning-run-)
@@ -590,6 +591,26 @@ These values quantify the residual label leakage after removing most diagnosis t
 |                             | Coherence–F1 correlation | Correlation between semantic tightness and alignment | - | **HiTOP** Spearman 0.881 / Pearson 0.728; **RDoC** Spearman 0.786 / Pearson 0.633 | **HiTOP** Spearman 0.420 / Pearson 0.471; **RDoC** Spearman 0.502 / Pearson 0.593 |
 | **Label Coverage** | Reference domains with ≥1 significant cluster | Fraction of HiTOP/RDoC domains attaining q<0.05 matches | ≥ 0.6 | HiTOP: **6/8** domains; RDoC: **4/6** constructs | **HiTOP**: 8/8 domains; **RDoC**: 5/6, but most hits are micro-clusters |
 
+### Cluster Sizes
+<p align="center">
+    <img src="plots/scae_cluster_size_hist.png">
+</p>
+<p align="center">
+    <img src="plots/sbm_cluster_size_hist.png">
+</p>
+<p align="center">
+    <img src="plots/scae_lorenz.png">
+</p>
+<p align="center"><em>
+Gini coefficient: 0.642942
+</em></p>
+<p align="center">
+    <img src="plots/sbm_lorenz.png">
+</p>
+<p align="center"><em>
+Gini coefficient: 0.686602
+</em></p>
+
 ### HiTOP Alignment Summary
 | **Cluster ID** | **Label Match (HiTOP Domain)** | **Precision** | **Recall** | **F1 Score** | **q-value (FDR)** | **Medoid Cosine Similarity** |
 | ---------------| ------------------------------ | ------------- | ---------- | ------------ | ----------------- | ---------------------------- |
@@ -740,33 +761,35 @@ Consistency loss for the stability run.
 The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-cluster solution.
 </em></p>
 <p align="center">
-    <b>Encoder Clusters</b>
+    <b>Expected Cluster Count</b>
     <img src="plots/cluster_l0.png"/>
 </p>
 <p align="center"><em>
-This is the encoder-side sparsity metric computed as the expected L0 norm (i.e., probability mass of “on” gates) across all cluster-gate units in the SCAE encoder.
+This is the encoder-side sparsity metric computed as the expected L0 norm (probability mass of “on” gates) across all cluster-gate units in the SCAE encoder.
 It directly measures how many latent clusters the encoder is actively using at each step.
 </em></p>
 <p align="center">
-    <b>Stability Test Encoder Clusters</b>
+    <b>Stability Test Expected Cluster Count</b>
     <img src="plots/stability_cluster_l0.png"/>
 </p>
 <p align="center"><em>
-Hard Concrete L0 expectation plunges to roughly 150 active gates within the first few dozen epochs and then flatlines, evidencing the over-pruning introduced by the stability configuration.
+Expected active cluster usage declines monotonically from ~235 gates to ~150 over the course of training, indicating progressive contraction of the latent space despite stable entropy levels.
+The sharp transition near step ~30 marks the point at which the encoder begins to commit to a smaller subset of latent factors, after which sparsity tightens gradually rather than collapsing abruptly.
+This trajectory illustrates that the eventual two-macro-cluster solution emerges not from abrupt collapse but from continuous reduction in active gate mass across iterations.
 </em></p>
 <p align="center">
     <b>Inter-Cluster Density</b>
     <img src="plots/inter_l0.png"/>
 </p>
 <p align="center"><em>
-    How many pairwise cluster interactions are contributing to reconstruction.
+How many pairwise cluster interactions are contributing to reconstruction. Has the exact same shape as the expected cluster count but with a different magnitude.
 </em></p>
 <p align="center">
     <b>Stability Test Inter-Cluster Density</b>
     <img src="plots/stability_inter_l0.png"/>
 </p>
 <p align="center"><em>
-
+Has the exact same shape as the stability test run expected cluster count but with a different magnitude.
 </p>
 </em><p align="center">
     <b>Sparsity Warmup Factor</b>
@@ -814,7 +837,7 @@ The node-weighted coherence of 0.1607 ± 1.2e-5 (identical when weighted by log 
 
 The RGCN-SCAE partitioning already satisfies the central design goal of parsimony: eleven clusters cover the entire 59,786-node psychiatric subgraph, keeping the cluster-count ratio close to the label baselines while still capturing diverse semantics.
 The node-weighted semantic coherence (0.18) is slightly higher than the SBM baseline despite the latter’s far greater cluster capacity, and the semantically derived coherence–F1 correlations indicate that tighter clusters consistently align better with HiTOP/RDoC (Spearman ≥0.79).
-In contrast, the degree-corrected SBM explodes into 18,670 clusters (cluster-count ratio >2,000×) and consequently reports trivial per-cluster recall and F1, even though individual clusters can attain high precision.
+In contrast, the SBM explodes into 18,670 clusters (cluster-count ratio >2,000×) and consequently reports trivial per-cluster recall and F1, even though individual clusters can attain high precision.
 
 Alignment metrics show complementary strengths.
 Globally, the SBM achieves higher NMI because its many clusters can overfit to the reference labels, but the RGCN-SCAE delivers substantially better Adjusted Rand Index (0.112 vs. 0.016 for HiTOP) while using only ~0.06 % of the cluster count.
@@ -825,7 +848,13 @@ Importantly, visualizing the full cluster-size distribution reveals that the SBM
 The Lorenz curve illustrates that the SBM model distributed nearly all of its explanatory mass into a small number of extremely large clusters, while simultaneously generating thousands of microscopic clusters that are statistically pure by construction but uninterpretable in isolation.
 This reveals why mutual-information-based indices are inflated despite recall collapsing to near zero: the SBM increases likelihood by splitting low-degree nodes into singleton components, producing purity without capturing meaningful structure.
 
-The degree-corrected SBM’s expansion to 18,670 clusters is an expected consequence of applying a likelihood-maximizing block model to a sparse, heterogeneous, multiplex graph.
+The fact that inter-cluster density decays with identical temporal curvature as the expected cluster count (just at squared magnitude) indicates that relational sparsity is directly induced by cluster pruning rather than emergent structure differentiation.
+The current early-stopping criterion monitors only reconstruction loss with a patience window and is therefore blind to changes in latent capacity.
+In both main and stability runs, loss plateaus while encoder-side L₀ usage, inter-cluster density, and realized cluster count continue to drift, indicating that training is halted while the factorization is still collapsing rather than after the latent dimensionality has stabilized.
+Given the known tendency of sparsity-regularized latent models to undergo premature collapse when regularization pressure outpaces structure formation, a loss-only stopping rule is misaligned with the scientific objective of recovering a non-degenerate transdiagnostic partition.
+A more appropriate criterion should require simultaneous plateau of reconstruction and structural metrics (e.g., gate entropy, expected L₀, and partition stability) before declaring convergence.
+
+The SBM’s expansion to 18,670 clusters is an expected consequence of applying a likelihood-maximizing block model to a sparse, heterogeneous, multiplex graph.
 When edge densities vary dramatically across node types and degrees—as they do in this knowledge graph—the SBM achieves higher likelihood by carving the network into many small, highly specific micro-blocks rather than discovering broader transdiagnostic modules.
 This behavior reflects the model’s parametric bias toward fine-grained partitions under heterogeneous degree distributions rather than meaningful mesoscale structure.
 In contrast, the RGCN-SCAE’s self-compressing latent space forces a parsimonious representation that merges these micro-patterns into coherent, semantically enriched domains, thereby revealing structure that the SBM’s over-fragmentation obscures.
@@ -853,7 +882,7 @@ Third, the partitioning is not anchored to clinical priors or outcome-driven con
 Consequently, even coherent latent clusters may not map cleanly onto patient-level outcomes or treatment response profiles, and efficacy against real-world clinical data has not yet been demonstrated.
 
 ## Conclusion
-The current pipeline verifies that a self-compressing RGCN trained on a psychiatric knowledge graph can recover interpretable, statistically enriched partitions while using orders of magnitude fewer clusters than a degree-corrected SBM.
+The current pipeline verifies that a self-compressing RGCN trained on a psychiatric knowledge graph can recover interpretable, statistically enriched partitions while using orders of magnitude fewer clusters than a SBM.
 Nevertheless, two structural weaknesses limit the strength of that evidence: nosology nodes remain embedded in the graph because removing them destroys every edge, and stability estimates rely on only 64 bootstraps.
 The highest priority for future work is validating similar results on a higher quality knowledge graph.
 Specifically, incorporating non-disease seed pathways into the knowledge graph creation—for example, leveraging phenotype and side-effect modalities—will also be essential so that diagnostic labels can be removed without triggering degeneracy and the nosology filter can operate as originally intended.
