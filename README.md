@@ -658,7 +658,7 @@ Gini coefficient: 0.686602
 | **Gate Entropy Stability** | Graph-wide | Lower is better | 0.885 ± <1e-3 bits (node-weighted gate entropy derived from cluster masses 41,690 and 18,096) |
 | **Effective Cluster Count Variance** | Graph-wide | Lower is better | 1.85 ± <1e-3 (computed as 2^H; no across-bootstrap variance observed) |
 
-The stability run therefore has two distinguishable macro-clusters when summarized by cluster mass and entropy, while the hard argmax diagnostic used for `realized_active_clusters` collapses to a single winning cluster late in training.
+The stability stress test run therefore has two distinguishable macro-clusters when summarized by cluster mass and entropy, while the hard argmax diagnostic used for `realized_active_clusters` collapses to a single winning cluster late in training.
 Both diagnostics indicate severe over-compression, but they measure different parts of the assignment process.
 
 ### Training Dynamics
@@ -676,7 +676,7 @@ This behavior reflects successful compression without degeneracy.
     <img src="plots/stability_realized_active_clusters.png"/>
 </p>
 <p align="center"><em>
-Realized clusters during the stability run.
+Realized clusters during the stability stress test run.
 The hard argmax diagnostic collapses to a single realized cluster by ~epoch 56 despite high-entropy gating and a two-macro-cluster mass distribution.
 This confirms that the stability setup enforces excessive compression and masks finer structure.
 </em></p>
@@ -728,7 +728,7 @@ Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remai
     <img src="plots/stability_gate_entropy_bits.png"/>
 </p>
 <p align="center"><em>
-Gate entropy across the stability run.
+Gate entropy across the stability stress test run.
 Although gate entropy remains high, the model still converges to a nearly two-macro-cluster solution whose argmax assignments are effectively single-cluster, demonstrating that gate entropy alone is not a sufficient indicator of latent diversity under strong regularization pressure.
 </em></p>
 <p align="center">
@@ -744,7 +744,7 @@ The decoder remains well-calibrated, and positive/negative logits track closely,
     <img src="plots/stability_reconstruction_loss.png"/>
 </p>
 <p align="center"><em>
-Reconstruction loss during the stability run.
+Reconstruction loss during the stability stress test run.
 Although this configuration achieves lower reconstruction loss than the main run, it does so by over-compressing the latent space, reflecting a known failure mode where high reconstruction performance coincides with collapsed cluster structure.
 </em></p>
 <p align="center">
@@ -760,7 +760,7 @@ The gradual decline reflects improving coherence of node embeddings across overl
     <img src="plots/stability_consistency_loss.png"/>
 </p>
 <p align="center"><em>
-Consistency loss for the stability run.
+Consistency loss for the stability stress test run.
 The elevated and noisier profile compared to the main run reflects competing pressures between negative-sampling calibration, entropy constraints, and excessive compression, further supporting the interpretation that the stability configuration induces a degenerate two-macro-cluster solution with effectively single-cluster hard assignments.
 </em></p>
 <p align="center">
@@ -811,18 +811,18 @@ This is set from the model’s global step, not epochs but the x-axis here is ep
 
 The above MLflow traces for the base RGCN-SCAE run and the stability-focused retraining provide an audit trail of the gate trajectories that underlie the preceding stability table.
 The baseline model’s realized active clusters (how many clusters had at least one node assigned to it after the argmax) oscillated between ten and twenty before ending early at eleven clusters by epoch 147 due to the same number of realized active clusters for ten epochs consecutively, and its assignment entropy plateaued near 5.38 bits with gate entropy ≈7.65 bits.
-In contrast, the stability run collapsed to a single realized cluster by epoch 66 even though the mass-based summary retained two macro-clusters, stochastic sampling continued to touch 68–73 clusters, and gate entropy remained ≈7.25 bits.
+In contrast, the stability stress test run collapsed to a single realized cluster by epoch 66 even though the mass-based summary retained two macro-clusters, stochastic sampling continued to touch 68–73 clusters, and gate entropy remained ≈7.25 bits.
 Plotting realized active clusters, num active clusters, and assignment entropy over epochs makes this divergence visually explicit and documents that the collapse occurred despite high-entropy gating, implying that the stopping criterion is insufficiently sensitive to emerging macro-clusters.
 For full transparency, the remaining MLflow graphs are included in the appendix.
 
 #### Calibration and Reconstruction Diagnostics
 Calibration statistics show how pretraining choices constrained the stability experiment.
-Decoder behavior mirrors this drift: the baseline model ended with overlapping positive/negative logits (means 0.424/0.423, standard deviations 0.003–0.005) while processing 6,704 negatives per batch, but the stability run pushed logits above 1.0/0.96 with an order-of-magnitude higher variance and only 1,206 negatives.
+Decoder behavior mirrors this drift: the baseline model ended with overlapping positive/negative logits (means 0.424/0.423, standard deviations 0.003–0.005) while processing 6,704 negatives per batch, but the stability stress test run pushed logits above 1.0/0.96 with an order-of-magnitude higher variance and only 1,206 negatives.
 These distributions explain why the stability configuration attains a lower reconstruction loss (0.00120 vs. 0.00206) yet produces fewer populated clusters.
 
 #### Regularization Burden
 Loss decompositions clarify which constraints dominate optimization.
-At convergence the stability run reports a consistency penalty of 1.9e-3 and a degree-penalty of 1.2e-3, roughly an order of magnitude larger than the corresponding 4.5e-7 and 1.1e-4 terms in the baseline run.
+At convergence the stability stress test run reports a consistency penalty of 1.9e-3 and a degree-penalty of 1.2e-3, roughly an order of magnitude larger than the corresponding 4.5e-7 and 1.1e-4 terms in the baseline run.
 Conversely, the encoder/decoder sparsity penalties (encoder clusters = 150.1; inter-cluster density = 3.57e4) are substantially lower than the baseline’s 225.1 / 5.51e4, corroborating the qualitative observation that the stability regimen over-compresses the latent space.
 
 ## Discussion
@@ -833,7 +833,7 @@ The results provide consistent but constraining evidence.
 While the learned partitions exhibit moderate semantic coherence and statistically significant enrichment with respect to selected HiTOP and RDoC domains, they fail to achieve meaningful global alignment or robust, non-degenerate structure under perturbation.
 
 Under the subgraph-bootstrap robustness test, the model collapsed to a low-complexity solution: two macro-clusters by mass, with hard argmax assignments dominated by a single realized cluster.
-This outcome is consistent with the graph containing insufficient signal to sustain richer partitions under perturbation, but the stability run also differed from the main run in substantially higher regularization pressure, so overregularization cannot be ruled out as a potential cause.
+This outcome is consistent with the graph containing insufficient signal to sustain richer partitions under perturbation, but the stability stress test run also differed from the main run in substantially higher regularization pressure, so overregularization cannot be ruled out as a potential cause.
 The bootstrap result therefore contributes to but does not independently establish graph insufficiency interpretation.
 
 ### Evidence of Structural Insufficiency in the Knowledge Graph
@@ -914,8 +914,8 @@ The subgraph-bootstrap experiments were intended as a perturbation-based robustn
 Because the model was trained across partially overlapping sampled subgraphs rather than only on a single fixed graph, one reasonable expectation was that, if the graph contained robust mesoscale organization, the recovered partitions would remain broadly similar while showing some variability across runs.
 The methods section explicitly motivates this procedure as a way to reduce overfitting to idiosyncratic topology and estimate replication reliability on partially overlapping realizations of the same graph.
 
-Instead, the stability run collapsed to a degenerate partition (two macro-clusters by mass, with hard argmax assignments dominated by a single realized cluster) under the perturbed regime.
-This outcome is consistent with graph underconstraint, but an alternative explanation cannot be dismissed: the stability run differed from the main run not only in sampling regime but also in substantially higher regularization pressure-approximately 5.5x fewer negatives per batch (1,206 vs. 6,704), a consistency penalty roughly 4,200x larger (1.9e-3 vs. 4.5e-7), and lower active gate counts (150.1 vs. 225.1).
+Instead, the stability stress test run collapsed to a degenerate partition (two macro-clusters by mass, with hard argmax assignments dominated by a single realized cluster) under the perturbed regime.
+This outcome is consistent with graph underconstraint, but an alternative explanation cannot be dismissed: the stability stress test run differed from the main run not only in sampling regime but also in substantially higher regularization pressure-approximately 5.5x fewer negatives per batch (1,206 vs. 6,704), a consistency penalty roughly 4,200x larger (1.9e-3 vs. 4.5e-7), and lower active gate counts (150.1 vs. 225.1).
 Each of these factors alone could plausibly be sufficient to induce collapse independently of graph signal content.
 The collapse is therefore consistent with graph underconstraint, but it cannot be attributed to that cause definitively.
 A calibrated stability test that matches the main run's regularization strength and varies only the training distribution would be needed to isolate the contribution of graph signal from that of overregularization.
@@ -1112,11 +1112,11 @@ Everything below is calculated based on performance in the first 50 epochs:
 - calibration_loss_curvature = 0 for both runs
 - calibration_loss_slope = 0 for both runs
 - main run calibration_mean_active_clusters = 245
-- stability run calibration_mean_active_clusters = 120.454
+- stability stress test run calibration_mean_active_clusters = 120.454
 - main run calibration_rel_var_active_clusters = 0
-- stability run calibration_rel_var_active_clusters = .9
+- stability stress test run calibration_rel_var_active_clusters = .9
 - main run calibration_var_active_clusters = 0
-- stability run calibration_var_active_clusters = 12912.636
+- stability stress test run calibration_var_active_clusters = 12912.636
 
 ### Training Graphs
 - Gate Entropy loss was permanently 0 for both runs.
@@ -1147,7 +1147,7 @@ Declines toward zero, demonstrating that latent norm and node degree become deco
     <img src="plots/stability_degree_correlation_sq.png"/>
 </p>
 <p align="center"><em>
-Settles an order of magnitude higher, explaining the ≈1.2e-3 penalty cited for the stability run.
+Settles an order of magnitude higher, explaining the ≈1.2e-3 penalty cited for the stability stress test run.
 </em></p>
 <p align="center">
     <b>Degree Penalty</b>
@@ -1177,7 +1177,7 @@ Brief spikes indicate moments when a few clusters temporarily dominate before th
     <img src="plots/stability_dirichlet_loss.png"/>
 </p>
 <p align="center"><em>
-Remains elevated because one or two clusters hoard probability mass, reinforcing that the stability run never recovers a balanced mixture.
+Remains elevated because one or two clusters hoard probability mass, reinforcing that the stability stress test run never recovers a balanced mixture.
 </em></p>
 <p align="center">
     <b>Embedding Norm Loss</b>
@@ -1266,7 +1266,7 @@ Because the main run’s gate entropy stays near 7.6 bits, this sits around 0.14
     <img src="plots/stability_negative_confidence_weight.png"/>
 </p>
 <p align="center"><em>
-The stability run shows the same mechanism under lower gate entropy (~7.2 bits), so this drifts from ≈0.13 toward ≈0.17 but never exceeds 1.0.
+The stability stress test run shows the same mechanism under lower gate entropy (~7.2 bits), so this drifts from ≈0.13 toward ≈0.17 but never exceeds 1.0.
 Negatives remain down-weighted even as the realized clusters collapse.
 This confirms the collapse is not caused by under-weighted negatives.
 </em></p>
