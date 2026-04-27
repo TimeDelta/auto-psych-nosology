@@ -811,7 +811,7 @@ This is set from the model’s global step, not epochs but the x-axis here is ep
 
 The above MLflow traces for the base RGCN-SCAE run and the stability-focused retraining provide an audit trail of the gate trajectories that underlie the preceding stability table.
 The baseline model’s realized active clusters (how many clusters had at least one node assigned to it after the argmax) oscillated between ten and twenty before ending early at eleven clusters by epoch 147 due to the same number of realized active clusters for ten epochs consecutively, and its assignment entropy plateaued near 5.38 bits with gate entropy ≈7.65 bits.
-In contrast, the stability stress test run collapsed to a single realized cluster by epoch 66 even though the mass-based summary retained two macro-clusters, stochastic sampling continued to touch 68–73 clusters, and gate entropy remained ≈7.25 bits.
+In contrast, the stability stress test run collapsed to a single realized cluster by epoch 56 even though the mass-based summary retained two macro-clusters, stochastic sampling continued to touch 68–73 clusters, and gate entropy remained ≈7.25 bits.
 Plotting realized active clusters, num active clusters, and assignment entropy over epochs makes this divergence visually explicit and documents that the collapse occurred despite high-entropy gating, implying that the stopping criterion is insufficiently sensitive to emerging macro-clusters.
 For full transparency, the remaining MLflow graphs are included in the appendix.
 
