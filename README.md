@@ -838,15 +838,14 @@ The bootstrap result therefore contributes to but does not independently establi
 
 ### Evidence of Structural Insufficiency in the Knowledge Graph
 #### Degenerate Solutions as Optimal Representations
-A central empirical finding is that low-complexity partitions (one-two clusters) achieve:
+A central empirical finding from the stability stress test is that the collapsed partition (two macro-clusters by mass, single realized cluster under argmax) achieves:
 
-- near-perfect reproducibility across bootstrap samples
-- competitive or improved reconstruction behavior
-- minimal variance across resampled training runs
+- near-zero coherence variance across 64 bootstrap subgraph evaluations within the stability run (CI width = 2.3e-5; all 64 bootstraps converged to the same partition)
+- lower reconstruction loss than the main 11-cluster run (0.00120 vs. 0.00206)
 
 despite exhibiting poor alignment with reference frameworks.
 
-This indicates that the graph admits a low-rank explanation that dominates the optimization landscape.
+This indicates that the graph admits a low-rank explanation that dominates the optimization landscape under regularization pressure.
 If finer-grained latent structure were strongly supported by the relational signal, then perturbing training away from a single fixed graph should have preserved at least some comparable mesoscale organization.
 Instead, the emergence of a trivial coarse solution under the perturbed training regime is consistent with the graph not containing enough recoverable information to sustain richer partitions, though the confounded regularization settings in that run prevent this from being treated as conclusive.
 
@@ -869,7 +868,7 @@ A critical structural limitation emerges from the graph construction process:
 - retaining them introduces partial label leakage (~18.6%)
 
 This reveals that diagnostic nodes function as topological anchors or articulation points, maintaining connectivity between otherwise weakly linked components.
-The manuscript explicitly notes that removing those nodes made partitioning impossible because the graph collapsed into isolated nodes, and that only 815 nosology-related nodes were removed while 11,115 remained.
+Removing those nodes made partitioning impossible because the graph collapsed into isolated nodes and only 815 nosology-related nodes were removed while 11,115 remained.
 
 As a result, the graph simultaneously:
 
@@ -927,8 +926,7 @@ Baseline coverage analysis shows:
 - low precision for RDoC (0.062)
 - moderate recall but sparse reliable labeling
 
-This indicates that even the evaluation signal embedded in the graph is weak and noisy.
-The manuscript reports that HiTOP labels retain precision 0.186 / recall 0.595 and RDoC labels retain precision 0.062 / recall 0.694 after filtering, confirming limited but non-zero leakage and weak label purity.
+This indicates that even the evaluation signal embedded in the graph is weak and noisy and confirms limited but non-zero leakage and weak label purity.
 
 This limits the interpretability of alignment metrics and further reinforces the conclusion that the graph lacks sufficient structured information.
 
