@@ -76,7 +76,7 @@ Despite their conceptual strengths, HiTOP and RDoC each face scalability challen
 Another central challenge also remains: integrating dimensional constructs with diverse biological and clinical findings in a manner that is both valid and scalable.
 Information-theoretic and graph-based approaches offer a principled alternative, emphasizing model parsimony and data-driven emergence of latent structure.
 
-Automated methods—ranging from clustering of genetic risk variants to network-based analyses of neuroimaging—demonstrate that algorithmic approaches can yield biologically coherent groupings that differ from traditional nosologies [11], [12].
+Automated methods-ranging from clustering of genetic risk variants to network-based analyses of neuroimaging-demonstrate that algorithmic approaches can yield biologically coherent groupings that differ from traditional nosologies [11], [12].
 However, applications in psychiatry have thus far been limited in scope, often relying on predefined categories or single modalities, raising concerns about reproducing existing biases rather than discovering new structure [14]–[18].
 
 ## Literature Review
@@ -154,27 +154,27 @@ This highlights the need for continued research into models that combine these s
 Can a proof-of-concept transdiagnostic dimensional psychiatric nosology be developed in an automated way by mining the scientific literature into a multiplex knowledge graph and partitioning it using information-theoretic methods, and how does its structure compare with HiTOP and RDoC in terms of cluster coherence, parsimony, stability, and alignment?
 
 ## Hypothesis
-The automated pipeline is expected to yield a dimensional nosology whose structural efficiency remains within 10% of the HiTOP and RDoC label cardinalities (cluster-count ratio ≥ 0.9 relative to each framework) while maintaining SentenceTransformer-based semantic coherence means—and their bootstrap 90% confidence intervals—at or above the medians observed for matched HiTOP/RDoC partitions.
+The automated pipeline is expected to yield a dimensional nosology whose structural efficiency remains within 10% of the HiTOP and RDoC label cardinalities (cluster-count ratio ≥ 0.9 relative to each framework) while maintaining SentenceTransformer-based semantic coherence means-and their bootstrap 90% confidence intervals-at or above the medians observed for matched HiTOP/RDoC partitions.
 Stability will be demonstrated by bootstrapping both the adjusted Rand index (ARI), targeting ≥ 0.2 of each framework’s self-alignment baseline, and the coherence estimates (targeting confidence interval widths ≤ 0.15), showing that clusters remain consistent under resampling despite corpus heterogeneity.
 Alignment will be evaluated with normalized and adjusted mutual information, homogeneity/completeness, and ARI (targets ≥ 0.75, ≥ 0.75, and ≥ 0.70 respectively), supported by Benjamini–Hochberg–corrected hypergeometric enrichments in which at least 60% of clusters achieve FDR < 0.05, per-cluster precision/recall/F1 summaries, and medoid-based semantic cosine similarities to canonical HiTOP/RDoC descriptors.
-To ensure that enrichment is not only cluster-dense but label-relevant, the coverage-adjusted enrichment rate—the fraction of HiTOP/RDoC label nodes captured by significant overlaps—should also reach ≥ 0.60.
+To ensure that enrichment is not only cluster-dense but label-relevant, the coverage-adjusted enrichment rate-the fraction of HiTOP/RDoC label nodes captured by significant overlaps-should also reach ≥ 0.60.
 Collectively these metrics test whether compression-oriented clustering on the literature can reproduce the breadth of symptom- and mechanism-focused nosologies while remaining parsimonious, stable, and interpretable.
 
-By testing whether an automated, data-driven method can reproduce or extend the dimensional structure of leading nosologies, this research explores the feasibility of a scalable and self-updating framework for psychiatric classification—one that could bridge the gap between biological findings and clinical phenomena without the overhead of manually defined diagnostic categories.
+By testing whether an automated, data-driven method can reproduce or extend the dimensional structure of leading nosologies, this research explores the feasibility of a scalable and self-updating framework for psychiatric classification-one that could bridge the gap between biological findings and clinical phenomena without the overhead of manually defined diagnostic categories.
 
 ### Hypothesis Metrics Justification
 - **Parsimony metrics:** Structural economy is captured by the cluster-count ratio $|C| / |L_fw|$, where $|C|$ denotes the number of clusters with at least one aligned node and $|L_fw|$ is the number of HiTOP or RDoC labels.
-Semantic compactness is computed for every cluster by embedding member-node text with a SentenceTransformer model and averaging the pairwise cosines: for embeddings ${e_i}$ and cluster size $n$, the mean coherence is $(2 / [n(n−1)]) * Σ_{i<j} cos(e_i, e_j)$.
+Semantic compactness is computed for every cluster by embedding member-node text with a SentenceTransformer model and averaging the pairwise cosines: for embeddings ${e_i}$ and cluster size $n$, the mean coherence is $(2 / [n(n-1)]) * Σ_{i<j} cos(e_i, e_j)$.
 Also reported is a log-size–weighted variant and non-parametric form of confidence intervals by bootstrap resampling the cosine sample 64 times.
 - **Stability metrics:** To quantify robustness, the pipeline reruns alignment on bootstrap subgraphs of the full knowledge graph and computes the ARI for each replicate.
-ARI is derived from the contingency table of cluster–label overlaps as $\frac{\sum_{ij}(n_{ij}^2) − [\sum_i a_i^2 \sum_j b_j^2]/N^2}{0.5[\sum_i a_i^2 + \sum_j b_j^2] − [\sum_i a_i^2 \sum_j b_j^2]/N^2}$, correcting for chance agreement.
+ARI is derived from the contingency table of cluster–label overlaps as $\frac{\sum_{ij}(n_{ij}^2) - [\sum_i a_i^2 \sum_j b_j^2]/N^2}{0.5[\sum_i a_i^2 + \sum_j b_j^2] - [\sum_i a_i^2 \sum_j b_j^2]/N^2}$, correcting for chance agreement.
 The bootstrap distribution is summarized (mean, spread, and percentile intervals) and coherence confidence interval widths are tracked as an orthogonal check on semantic stability.
 - **Alignment metrics:** Global correspondence is assessed with normalized mutual information (NMI) using the arithmetic mean denominator, adjusted mutual information that subtracts the expected mutual information under a permutation null, the homogeneity/completeness/v-measure trio, and ARI.
 These rely on the shared node set between the learned partition and HiTOP/RDoC labels.
 Full confusion matrices accompany the summary statistics so that reviewers can inspect which domains contribute most to each score.
 - **Per-cluster alignment metrics:** Following the enrichment step, each cluster is paired with the label that attains the minimum false-discovery–rate value.
-Precision is $overlap / cluster_{size}$, recall is $overlap / label_{support}$, F1 score has the normal definition, and the overlap rate is $overlap / (cluster_size + label_support − overlap)$.
-- **Statistical enrichment:** For a cluster of size $n$ and a label with support $K$ in a population of $N$ aligned nodes, a one-sided hypergeometric survival probability $P(X ≥ k)$ where $k$ is the observed overlap: $\sum_{i=k}^{min(n,K)} [\binom{K}{i} \binom{N−K}{n−i}] / \binom{N}{n}$ is computed.
+Precision is $overlap / cluster_{size}$, recall is $overlap / label_{support}$, F1 score has the normal definition, and the overlap rate is $overlap / (cluster_size + label_support - overlap)$.
+- **Statistical enrichment:** For a cluster of size $n$ and a label with support $K$ in a population of $N$ aligned nodes, a one-sided hypergeometric survival probability $P(X ≥ k)$ where $k$ is the observed overlap: $\sum_{i=k}^{min(n,K)} [\binom{K}{i} \binom{N-K}{n-i}] / \binom{N}{n}$ is computed.
 Benjamini–Hochberg correction [19] is then applied across all cluster–label pairs to produce FDR-controlling q-values.
 Only labels with $q$ < 0.05 are carried into the narrative alignment tables.
 - **Semantic correspondence diagnostics:** Medoid analysis identifies, for each cluster, the node whose embedding maximizes the average cosine to other members.
@@ -213,7 +213,7 @@ In the final graph used for partitioning, only 815 nosology-related nodes were r
 ### Partitioning
 Two complementary strategies were tested for discovering mesoscale structure in the multiplex psychopathology graph.
 First, a stochastic block model (SBM) [21], which provides a probabilistic baseline that infers discrete clusters by maximizing the likelihood of observed edge densities across multiple resolution levels.
-This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits SBM’s familiar computational burdens—quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
+This family of models gives interpretable, DSM-like partitions together with principled estimates of uncertainty, but inherits SBM’s familiar computational burdens-quadratic scaling in the number of vertices and a rigid parametric form for block interactions.
 This was used as a baseline.
 The other model architecture tested was a **Relational Graph Convolutional Network Self-Compressing Autoencoder (RGCN-SCAE)**.
 This model was trained exclusively on the full graph to derive a single global partitioning that captures the complete relational structure.
@@ -223,7 +223,7 @@ The rest of this section pertains solely to the RGCN-SCAE partitioning.
 #### Encoder Architecture
 The encoder couples a Deep Sets attribute encoder [22] with a stacked RGCN layers that produces a temperature-controlled assignment matrix of shape |Nodes| $\times$ |Clusters|, forming the probabilistic basis for downstream partitioning via differentiable hard-concrete ($L_0$) gates [23].
 Each node is first encoded by a DeepSets-style node attribute encoder, implementing the Zaheer et al. $\rho$/$\phi$ formulation, that is permutation-invariant.
-This component integrates arbitrarily structured metadata—text learned embeddings, biomarkers and ontology terms.
+This component integrates arbitrarily structured metadata-text learned embeddings, biomarkers and ontology terms.
 It can expand its vocabulary online, allowing new attributes to be assimilated without retraining existing embeddings.
 Each node label is first embedded with the `pritamdeka/S-Scibert-snli-multinli-stsb` SentenceTransformer, producing a 768-dimensional biomedical vector that already reflects domain-specific semantic organization.
 To prevent these high-capacity descriptors from overwhelming the other DeepSet inputs, they are contracted with a Johnson–Lindenstrauss projection to dimension $d_p$ (default 128, configurable via `--text-encoder-projection-dim`, or disabled by setting that flag to 0).
@@ -317,7 +317,7 @@ To keep them responsive, sparsity penalties are warmed up gradually so that the 
 Gate logits are clipped before entering the hard-concrete transform, preventing them from saturating in regions where gradients vanish.
 Each gate draw is blended with an exponential moving average, reducing the variance of stochastic samples without biasing their mean.
 When a gate does fall dormant yet still receives assignment mass, a revival routine resets its log-parameter toward neutrality, reintroducing it into the active set.
-Detailed diagnostics—expected $L_0$ counts, instantaneous gate entropy, and gate samples—are recorded every epoch so that emerging instabilities are observable.
+Detailed diagnostics-expected $L_0$ counts, instantaneous gate entropy, and gate samples-are recorded every epoch so that emerging instabilities are observable.
 
 ##### Gate Revival Hook
 During every optimisation step the trainer measures both the instantaneous hard-concrete sample for each cluster gate and its mean assignment mass within the mini-batch.
@@ -365,7 +365,7 @@ Assignment entropy, cluster usage, gate samples, reconstruction losses, and time
 The trainer orchestrates the preceding mechanisms while enforcing practical guardrails.
 Mini-batches are constructed by a budget-aware sampler that limits the number of nodes admitted per step, so even pathological subgraphs remain tractable.
 Gradient accumulation, gradient clipping, and optional mixed precision provide additional numerical headroom.
-Stability-aware stopping criteria monitor sliding windows of the principal metrics—usually the number of active clusters—and halt the run once those metrics stay within prescribed absolute and relative bounds.
+Stability-aware stopping criteria monitor sliding windows of the principal metrics-usually the number of active clusters-and halt the run once those metrics stay within prescribed absolute and relative bounds.
 Checkpointing is performed atomically alongside optional MLflow logging, enabling deterministic recovery and rigorous experiment tracking.
 
 Collectively, these interventions ensure that the self-compressing RGCN maintains stable dynamics across the multiplex psychopathology graph while remaining verifiable under standard academic reporting conventions.
@@ -459,7 +459,7 @@ so the term activates only when entropy dips below the target floor $H_{\text{fl
 | $\lambda_H$        | Weight assigned to the entropy penalty. |
 
 However, the entropy regularization only handles local degeneracy because it acts locally.
-The model could still produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure — all symptoms in one, all treatments in another, etc.
+The model could still produce a few large "meta-clusters" that reconstruct edges well but lack finer internal structure - all symptoms in one, all treatments in another, etc.
 To prevent this, the model matches the mean assignment usage against a Dirichlet-inspired prior stored as a categorical baseline $\pi$. Let $u_k = \frac{\sum_i p_{ik}}{\sum_{k'} \sum_i p_{ik'}}$ be the empirical cluster usage.
 It minimizes the KL divergence
 
@@ -535,7 +535,7 @@ The two approaches are treated as triangulating evidence: concordant structure a
 | **Objective**                 | Minimizes reconstruction loss → learns information-optimal embeddings that compress the multiplex graph while preserving semantic structure. | Maximizes likelihood under a generative model → partitions graph to best explain edge densities between groups.             |
 | **Adaptivity**                | Learns directly from heterogeneous, weighted, typed edges and can incorporate node attributes, features, and higher-order dependencies.      | Operates purely on adjacency structure assuming a fixed parametric form (block interaction matrix). Difficult to extend to new modalities. |
 | **Scalability** | Much higher computational cost for training; can integrate multiple modalities in future.                  | Inference is typically O(N²), with N = #nodes in graph.     |
-| **Output**                    | Produces a *latent manifold* where distances encode both structural and semantic similarity — enabling *continuous transdiagnostic spectra*. | Produces discrete clusters — enforcing categorical partitions reminiscent of DSM-like divisions.     |
+| **Output**                    | Produces a *latent manifold* where distances encode both structural and semantic similarity - enabling *continuous transdiagnostic spectra*. | Produces discrete clusters - enforcing categorical partitions reminiscent of DSM-like divisions.     |
 
 ## Results
 All reported metrics are computed by first heuristically inferring HiTOP/RDoC labels by combining node-type priors with attribute-text patterns when explicit mappings are unavailable.
@@ -543,7 +543,7 @@ Those inferred labels define the reference distributions for mutual information,
 
 ### Baseline Psychiatric Label Coverage
 The psychiatric-filtered knowledge graph contains 59,785 nodes before partitioning, which shows a HiTOP precision 0.186 / recall 0.595 (TP = 11,114, labeled nodes = 18,691) and an RDoC precision 0.062 / recall 0.694 (TP = 3,695, labeled nodes = 5,328).
-These values quantify the residual label leakage after removing most diagnosis terms—recall remains moderate because many HiTOP/RDoC signals survive the filter, but precision is very low because only 18.6 % (HiTOP) and 6.2 % (RDoC) of psychiatric nodes still carry reference labels.
+These values quantify the residual label leakage after removing most diagnosis terms-recall remains moderate because many HiTOP/RDoC signals survive the filter, but precision is very low because only 18.6 % (HiTOP) and 6.2 % (RDoC) of psychiatric nodes still carry reference labels.
 
 **HiTOP per-label coverage**
 
@@ -572,15 +572,15 @@ These values quantify the residual label leakage after removing most diagnosis t
 ### Overall Metrics
 | **Metric Class** | **Metric** | **Description** | **Target / Baseline** | **RGCN-SCAE Result** | **SBM Result** |
 | ------------ | ----------------------------------------- | --------------------------------------------------------- | ------------------- | ----------- | ---------- |
-| **Parsimony** | Cluster Count Ratio | Structural economy relative to HiTOP/RDoC label | count ≥ 0.9 | **HiTOP** 11/8 = 1.38×; **RDoC** 11/6 = 1.83× | **HiTOP** 18,670/8 ≈ 2.33e3×; **RDoC** 18,670/6 ≈ 3.11e3× |
+| **Parsimony** | Cluster Count Ratio | Structural economy relative to HiTOP/RDoC label | count ≥ 0.9 | **HiTOP** 11/8 = 1.38x; **RDoC** 11/6 = 1.83x | **HiTOP** 18,670/8 ≈ 2.33e3x; **RDoC** 18,670/6 ≈ 3.11e3x |
 |               | Node-weighted mean semantic coherence | Mean intra-cluster embedding cosine (SentenceTransformer) | ≥ HiTOP/RDoC median | 0.180 | 0.171 |
-|               | Coherence 90 % CI width (bootstrap × 64) | Semantic compactness stability | ≤ 0.15 | 2.3e-5 (node-weighted across 2 macro-clusters) | n/a |
+|               | Coherence 90 % CI width (bootstrap x 64) | Semantic compactness stability | ≤ 0.15 | 2.3e-5 (node-weighted across 2 macro-clusters) | n/a |
 | **Stability** | Adjusted Rand Index (bootstrapped subgraphs) | Resampling-based consistency of partitions | ≥ 0.85 of full-graph ARI (HiTOP 0.112 ⇒ target ≥0.095; RDoC 0.038 ⇒ target ≥0.032) | **HiTOP** 0.164 / **RDoC** 0.022 (stability partition) | n/a |
 |               | Coherence CI width (across replicates) | Semantic stability across subsamples | ≤ 0.15 | ≤3.0e-5 (all 64 bootstraps converged to the same partition) | n/a |
 | **Alignment (Global)** | Normalized Mutual Information | Overall correspondence between learned and reference labels | ≥ 0.75 | **HiTOP** 0.116, **RDoC** 0.025 | **HiTOP** 0.198, **RDoC** 0.088 |
-|                        | Adjusted Mutual Information | Chance-corrected variant | ≥ 0.75 | **HiTOP** 0.115, **RDoC** 0.020 | **HiTOP** 0.048, **RDoC** −0.013 |
+|                        | Adjusted Mutual Information | Chance-corrected variant | ≥ 0.75 | **HiTOP** 0.115, **RDoC** 0.020 | **HiTOP** 0.048, **RDoC** -0.013 |
 |                        | Homogeneity / Completeness / V-measure | Purity and coverage of label mapping | ≥ 0.75 each | **HiTOP** H=0.134, C=0.102, V=0.116; **RDoC** H=0.043, C=0.017, V=0.025 | **HiTOP** H=0.696, C=0.115, V=0.198; **RDoC** H=0.659, C=0.047, V=0.088 |
-|                        | Adjusted Rand Index (against HiTOP/RDoC) | Cluster-label agreement | ≥ 0.70 | **HiTOP** 0.112, **RDoC** 0.038 | **HiTOP** 0.016, **RDoC** −0.0013 |
+|                        | Adjusted Rand Index (against HiTOP/RDoC) | Cluster-label agreement | ≥ 0.70 | **HiTOP** 0.112, **RDoC** 0.038 | **HiTOP** 0.016, **RDoC** -0.0013 |
 | **Alignment (Per-cluster)** | Precision | Fraction of cluster nodes matching label | - | **HiTOP** μ±σ = 0.623±0.117 (n=8); **RDoC** μ±σ = 0.622±0.409 (n=8) | **HiTOP** μ±σ = 0.992±0.062 (n=6,058); **RDoC** μ±σ = 0.993±0.080 (n=2,647) |
 |                             | Recall | Fraction of label nodes captured | - | **HiTOP** μ±σ = 0.182±0.199; **RDoC** μ±σ = 0.167±0.189 | **HiTOP** μ±σ = 7.8e-4±4.6e-3; **RDoC** μ±σ = 1.66e-3±6.0e-3 |
 |                             | F1 Score | Harmonic mean of precision and recall | - | **HiTOP** μ±σ = 0.233±0.207; **RDoC** μ±σ = 0.169±0.220 | **HiTOP** μ±σ = 0.00148±0.0077; **RDoC** μ±σ = 0.00304±0.0095 |
@@ -640,16 +640,16 @@ Gini coefficient: 0.686602
 | **SBM Mean (± SD)** | - |  0.993±0.080 |  0.00166±0.00599 |  0.00304±0.00946 | q<0.05 coverage: 0.038% |  0.149 |
 
 ### Cluster Snapshots (main partitioning run)
-- **Cluster 3 — Negative Valence neurotransmission.** The medoid node is *Neurotransmitter Depression* and its eight closest neighbors (e.g., *Neurophysiological Depression*, *Depression Dysfunction*, *Depression Of Brain Activity*) remain entirely within neurophysiology phrasing. This is the same cluster that drives the strong RDoC Negative Valence alignment in the table above, so we explicitly document it here as the clearest affective-neurochemical factor recovered by the encoder.
-- **Cluster 160 — Parkinsonian cognitive systems.** Centered on the medoid *PD*, its nearest nodes include *PDD*, *pDCD*, and *PDQ*, all abbreviations tied to Parkinson’s disease staging or questionnaires. It underpins the cognitive-systems precision entry for RGCN-SCAE-160, illustrating that the model isolates tightly condensed instrument jargon rather than mixing it with generic symptom language.
-- **Cluster 212 — Depressive/anxiety behavioral language.** With medoid *Depressive Response* and neighbors like *Depressive-Related Behavior*, *Depressive Emotional Changes*, and *Depressive And Anxiety-Like*, this cluster captures the broader behavioral lexicon spanning distress and anxious arousal. Its enrichment appears under the “Unspecified Clinical” rows, so surfacing the raw node names helps explain why it straddles multiple HiTOP domains even though the quantitative metrics classify it as clinically mixed.
+- **Cluster 3 - Negative Valence neurotransmission.** The medoid node is *Neurotransmitter Depression* and its eight closest neighbors (e.g., *Neurophysiological Depression*, *Depression Dysfunction*, *Depression Of Brain Activity*) remain entirely within neurophysiology phrasing. This is the same cluster that drives the strong RDoC Negative Valence alignment in the table above, so we explicitly document it here as the clearest affective-neurochemical factor recovered by the encoder.
+- **Cluster 160 - Parkinsonian cognitive systems.** Centered on the medoid *PD*, its nearest nodes include *PDD*, *pDCD*, and *PDQ*, all abbreviations tied to Parkinson’s disease staging or questionnaires. It underpins the cognitive-systems precision entry for RGCN-SCAE-160, illustrating that the model isolates tightly condensed instrument jargon rather than mixing it with generic symptom language.
+- **Cluster 212 - Depressive/anxiety behavioral language.** With medoid *Depressive Response* and neighbors like *Depressive-Related Behavior*, *Depressive Emotional Changes*, and *Depressive And Anxiety-Like*, this cluster captures the broader behavioral lexicon spanning distress and anxious arousal. Its enrichment appears under the “Unspecified Clinical” rows, so surfacing the raw node names helps explain why it straddles multiple HiTOP domains even though the quantitative metrics classify it as clinically mixed.
 
 ### Stability Metrics (Bootstrapped Subgraph and Semantic Consistency)
 | **Framework** | **# Labels (Baseline)** | **# Clusters (Learned)** | **Cluster-Count Ratio** | **Mean Coherence (± 90 % CI)** | **Log-Size Weighted Coherence** |
 | ------------- | ----------------------- | ------------------------ | ----------------------- | ------------------------------ | --------------------------------------------- |
-| **HiTOP** | 8 | 2 | 2/8 = 0.25× | 0.1607 ± 1.2e-5 (node-weighted) | 0.1607 ± 1.2e-5 |
-| **RDoC** | 6 | 2 | 2/6 = 0.33× | 0.1607 ± 1.2e-5 (node-weighted) | 0.1607 ± 1.2e-5 |
-| **Overall Mean** | 7 (HiTOP/RDoC mean) | 2 | 2/7 = 0.29× | 0.1607 ± 1.2e-5 | 0.1607 ± 1.2e-5 |
+| **HiTOP** | 8 | 2 | 2/8 = 0.25x | 0.1607 ± 1.2e-5 (node-weighted) | 0.1607 ± 1.2e-5 |
+| **RDoC** | 6 | 2 | 2/6 = 0.33x | 0.1607 ± 1.2e-5 (node-weighted) | 0.1607 ± 1.2e-5 |
+| **Overall Mean** | 7 (HiTOP/RDoC mean) | 2 | 2/7 = 0.29x | 0.1607 ± 1.2e-5 | 0.1607 ± 1.2e-5 |
 
 | **Metric** | **HiTOP / RDoC References** | **Target** | **Value (Mean ± SD [90 % CI])** |
 | ---------- | ---------------------------------- | ---------- | ------------------------------- |
@@ -721,7 +721,7 @@ This dissociation between high entropy and low realized cluster count highlights
 </p>
 <p align="center"><em>
 Gate entropy for the main run, reflecting the diversity of hard-concrete gate activations.
-Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate—an important safeguard against early latent collapse.
+Gate entropy stays elevated (≈7–8 bits), indicating that cluster gates remain broadly active and do not prematurely saturate-an important safeguard against early latent collapse.
 </em></p>
 <p align="center">
     <b>Stability Test Gate Entropy Bits</b>
@@ -832,9 +832,9 @@ This study evaluated whether a multiplex psychiatric knowledge graph, derived fr
 The results provide consistent but constraining evidence.
 While the learned partitions exhibit moderate semantic coherence and statistically significant enrichment with respect to selected HiTOP and RDoC domains, they fail to achieve meaningful global alignment or robust, non-degenerate structure under perturbation.
 
-Under the subgraph-bootstrap robustness test, the model converged deterministically to a trivial low-complexity solution: two macro-clusters by mass, with hard argmax assignments dominated by a single realized cluster.
-This outcome is notable because the subgraph regime was introduced to test whether similar structure would remain identifiable when training moved away from a single fixed graph, not simply to manufacture stable results.
-Although the implementation still included some stability-oriented safeguards, the collapse happening again to the same coarse partition suggests that the dominant recoverable signal in the graph itself is low-complexity rather than richly mesoscale.
+Under the subgraph-bootstrap robustness test, the model collapsed to a low-complexity solution: two macro-clusters by mass, with hard argmax assignments dominated by a single realized cluster.
+This outcome is consistent with the graph containing insufficient signal to sustain richer partitions under perturbation, but the stability run also differed from the main run in substantially higher regularization pressure, so overregularization cannot be ruled out as a potential cause.
+The bootstrap result therefore contributes to but does not independently establish graph insufficiency interpretation.
 
 ### Evidence of Structural Insufficiency in the Knowledge Graph
 #### Degenerate Solutions as Optimal Representations
@@ -848,7 +848,7 @@ despite exhibiting poor alignment with reference frameworks.
 
 This indicates that the graph admits a low-rank explanation that dominates the optimization landscape.
 If finer-grained latent structure were strongly supported by the relational signal, then perturbing training away from a single fixed graph should have preserved at least some comparable mesoscale organization.
-Instead, the repeated emergence of a trivial coarse solution suggests that the graph does not contain enough recoverable information to sustain richer partitions under perturbation.
+Instead, the emergence of a trivial coarse solution under the perturbed training regime is consistent with the graph not containing enough recoverable information to sustain richer partitions, though the confounded regularization settings in that run prevent this from being treated as conclusive.
 
 #### Local Semantic Coherence Without Global Structure
 The coexistence of:
@@ -878,10 +878,27 @@ As a result, the graph simultaneously:
 
 This creates a fundamental constraint: the graph does not contain sufficient redundant cross-domain relationships, such as symptom-biomarker-treatment connectivity, to sustain a diagnosis-independent structure.
 
+#### Graph Sparsity and SBM Micro-Fragmentation
+
+Two graph-level structural properties provide additional evidence of insufficiency that is independent of training dynamics.
+
+First, the psychiatric subgraph contains 59,786 nodes and 69,248 edges, giving an average degree of approximately 2.3.
+This is a near-tree-like sparsity regime in which most nodes have at most two or three neighbors.
+Community detection methods generally require substantially higher average connectivity to produce stable mesoscale structure; at this density, most nodes lack enough relational context for well-defined cluster membership, and the dominant topological feature is a sparse backbone rather than interlocking communities.
+
+Second, the SBM result corroborates this through an independent channel.
+SBM infers partition structure by maximizing the likelihood of observed edge densities under a generative block model (it has no compression objective and is not subject to the reconstruction biases described in the alternative explanation below).
+Yet it produces 18,670 clusters from 59,786 nodes, yielding an average cluster size of approximately 3.2 nodes.
+This is effectively degenerate micro-fragmentation.
+Because SBM's failure mode is governed purely by the graph's edge structure, this is a direct graph-level signal.
+SBM's likelihood function rewards explaining observed edge densities at whatever scale the data warrants.
+It has no incentive to over-compress, but equally no incentive to find mesoscale structure specifically.
+That the graph fragments to ~3.2-node micro-clusters means its edge density pattern provides no statistical support for merging nodes into larger mesoscale groups: if block structure at that scale existed, SBM's likelihood would favor it.
+
 #### Consistent Failure Modes Across Inductive Biases
 Two contrasting partitioning approaches were evaluated:
 
-- SBM, favoring fine-grained density-based clustering
+- SBM, which finds the maximum-likelihood partition at whatever scale the graph's edge density supports
 - RGCN-SCAE, favoring compressed representation-based clustering
 
 These methods produce opposite failure modes:
@@ -897,10 +914,11 @@ The subgraph-bootstrap experiments were intended as a perturbation-based robustn
 Because the model was trained across partially overlapping sampled subgraphs rather than only on a single fixed graph, one reasonable expectation was that, if the graph contained robust mesoscale organization, the recovered partitions would remain broadly similar while showing some variability across runs.
 The methods section explicitly motivates this procedure as a way to reduce overfitting to idiosyncratic topology and estimate replication reliability on partially overlapping realizations of the same graph.
 
-Instead, the model converged twice to the same low-complexity solution.
-This result is more informative than simple reproducibility.
-It suggests that once the graph is perturbed away from the single fixed training instance, the richer partition does not remain identifiable, whereas the trivial coarse solution does.
-In this context, the observed reproducibility is better interpreted as evidence that the graph is underconstrained and that its most robust signal is a low-complexity one, not as evidence that the model successfully recovered meaningful higher-order structure.
+Instead, the stability run collapsed to a degenerate partition (two macro-clusters by mass, with hard argmax assignments dominated by a single realized cluster) under the perturbed regime.
+This outcome is consistent with graph underconstraint, but an alternative explanation cannot be dismissed: the stability run differed from the main run not only in sampling regime but also in substantially higher regularization pressure-approximately 5.5x fewer negatives per batch (1,206 vs. 6,704), a consistency penalty roughly 4,200x larger (1.9e-3 vs. 4.5e-7), and lower active gate counts (150.1 vs. 225.1).
+Each of these factors alone could plausibly be sufficient to induce collapse independently of graph signal content.
+The collapse is therefore consistent with graph underconstraint, but it cannot be attributed to that cause definitively.
+A calibrated stability test that matches the main run's regularization strength and varies only the training distribution would be needed to isolate the contribution of graph signal from that of overregularization.
 
 #### Weak and Noisy Reference Signal
 Baseline coverage analysis shows:
@@ -914,29 +932,43 @@ The manuscript reports that HiTOP labels retain precision 0.186 / recall 0.595 a
 
 This limits the interpretability of alignment metrics and further reinforces the conclusion that the graph lacks sufficient structured information.
 
-### Reinterpreting the Compression Objective
-The observed behavior highlights a fundamental limitation of reconstruction-based objectives in this setting.
+### Alternative Explanation: Objective Mismatch
 
-The model preferentially learns representations that:
+An alternative to the graph insufficiency interpretation is that the reconstruction-based objective is itself the primary bottleneck.
 
-- efficiently encode edge structure
-- minimize description length
+GAE and VGAE methods are known to perform poorly on community detection.
+Salha-Galvan et al. [26] show through extensive evaluation that standard GAE/VGAE methods are routinely outperformed by simpler alternatives such as Louvain on community detection benchmarks, and that explicitly adding a modularity-inspired regularizer to the reconstruction loss is necessary for competitive community detection performance.
+The RGCN-SCAE uses reconstruction loss as its primary objective and does not include a modularity or community-preserving term, placing it within the class of methods Salha-Galvan et al. identify as structurally ill-suited for mesoscale recovery.
 
-but do not necessarily:
+Degree heterogeneity compounds this.
+Liu et al. [27] demonstrate that GAE performance degrades systematically under long-tailed degree distributions because high-degree nodes develop larger embedding norms and dominate decoder scores.
+Subramonian et al. [28] further prove that GCNs with symmetric normalized filters exhibit preferential attachment bias, where high-degree nodes are systematically overweighted in message-passing aggregation regardless of their semantic content.
 
-- preserve semantically meaningful distinctions
-- reflect clinically interpretable latent factors
+The RGCN-SCAE addresses parts of this with a degree orthogonality penalty and a per-graph embedding norm penalty.
+However, these mitigations operate on different quantities than what is identified by Liu et al. [27].
+The degree orthogonality penalty discourages the correlation of node log degree with any coordinate in the latent space.
+The norm penalty shapes the scale of the embedding space, bounding the per-graph average squared norm, but does not equalize norms across degree classes, which means high-degree nodes can retain a relative norm advantage over low-degree nodes even when the average is bounded.
+The reconstruction BCE loss, by contrast, accumulates positive-edge terms across the full edge set.
+Under near-tree-like graph sparsity (average degree $\approx$ 2.3), a small number of hub nodes account for a disproportionate share of positive edges, and the gradient pressure to reconstruct their connectivity flows through the Sinkhorn-balanced assignment vectors consumed by the decoder - downstream of the latent space where the degree penalty acts.
+The two objectives do not directly conflict: the model can satisfy the degree orthogonality penalty in the embedding space while still converging to a coarse partition that efficiently reconstructs hub connectivity patterns in the decoder.
 
-This produces a compression-structure tradeoff in which the solution favored by the objective is not the solution most useful for scientific interpretation.
-In this study, the graph appears to support compression more strongly than it supports recovery of differentiated transdiagnostic structure.
+This means the over-compression observed in the RGCN-SCAE is plausibly explained by objective mismatch alone, even on a graph with richer potential structure.
+The SBM micro-fragmentation described above is the strongest evidence against a pure objective-mismatch explanation: SBM has no reconstruction bias and no tendency toward over-compression, but its likelihood function also has no specific affinity for mesoscale groups.
+It simply finds the partition that best fits the observed edge density at whatever scale the data supports.
+That SBM's best fit is about 3.2-node micro-clusters indicates that the graph's edge density pattern itself provides no statistical support for mesoscale block structure, which is not a property of the objective but of the graph.
+
+The most likely interpretation is that both factors contribute simultaneously and interact.
+A sparse graph with near-tree-like connectivity provides a weak training signal regardless of the objective used, but a reconstruction-based objective specifically amplifies that weakness by directing gradient pressure toward hub connectivity rather than mesoscale structure.
+Either factor alone might be overcome (a better objective on a sparse graph, or a reconstruction objective on a denser, more structured graph) but their combination created compounding pressure toward degenerate solutions in this instance.
+The current experiments cannot quantify the relative contribution of each, but treating them as mutually exclusive alternatives is probably a false framing.
 
 ### Implications for Automated Psychiatric Nosology
 These findings suggest that:
 
-1. This literature-derived knowledge graph in conjunction with these partitioning methods, as constructed and filtered here, is insufficient to recover a full transdiagnostic psychiatric nosology.
+1. This literature-derived knowledge graph in conjunction with these partitioning methods, as constructed and filtered here, does not yield a robust transdiagnostic psychiatric nosology. Whether this reflects fundamental graph insufficiency, training instability, or both cannot be fully disentangled from the current experiments.
 2. Detectable signal exists, but it is fragmented and lacks the connectivity required for robust global structure.
-3. Model improvements alone are unlikely to resolve this limitation without corresponding improvements in graph construction.
-4. Inductive constraints aligned with clinical structure, such as temporal dynamics, causal relationships, or multimodal integration, are likely necessary.
+3. Model improvements alone are unlikely to resolve this limitation if the primary bottleneck is graph construction; however, a cleaner ablation separating regularization effects from graph signal would be necessary to confirm this.
+4. Inductive constraints aligned with clinical structure, such as temporal dynamics, causal relationships, or multimodal integration, are likely necessary regardless of which explanation dominates.
 
 Rather than demonstrating failure of automated nosology in principle, these results clarify the conditions under which it is feasible.
 
@@ -947,7 +979,9 @@ Several limitations contribute to the observed insufficiency:
 - Heuristic filtering and label inference introduce noise and partial circularity.
 - The graph lacks temporal, patient-level, and causal structure, limiting its ability to represent disease progression.
 - Structural dependence on diagnostic nodes suggests incomplete relational coverage across modalities.
-- The subgraph-bootstrap experiment included stability-oriented implementation choices, so the results should not be overstated as arising from a purely adversarial perturbation regime.
+- The subgraph-bootstrap experiment introduced substantially higher regularization pressure than the main run-approximately 5.5x fewer negatives, a consistency penalty roughly 4,200x larger, and lower active gate counts (150.1 vs. 225.1 in the main run).
+Excessive L0 gate pressure under these conditions is a plausible cause of the observed collapse that may be independent of graph signal insufficiency.
+The stability results should therefore be treated as suggestive rather than conclusive evidence of graph underconstraint.
 
 These limitations collectively constrain the recoverable structure.
 
@@ -967,11 +1001,13 @@ These approaches may increase the recoverable mutual information necessary for m
 ## Conclusion
 This study demonstrates that unsupervised, information-theoretic partitioning of this large-scale psychiatric knowledge graph can uncover locally coherent and partially interpretable structure, but does not yield a robust or globally consistent transdiagnostic nosology.
 
-The dominant empirical finding is that trivial low-complexity solutions remain recoverable under subgraph perturbation, whereas richer partitions do not.
+Stronger graph-internal evidence for structural insufficiency comes from three independent sources: the topological collapse of the graph when nosological anchor nodes are removed, the failure of the main run to produce meaningful global alignment (HiTOP NMI 0.116, ARI 0.112) under well-calibrated training conditions, and the contrasting failure modes of two methodologically distinct partitioning algorithms on the same graph.
+The subgraph-bootstrap experiment is consistent with this interpretation but is confounded by overregularization and should not be treated as independent corroboration.
 The coexistence of local enrichment and weak global alignment further suggests that the graph encodes fragmented signals without a unifying topology.
 
-Taken together, these results support the conclusion that the primary limitation is not only the partitioning methodology, but the information insufficiency and structural incompleteness of the graph produced by the present construction pipeline.
-More precisely, the graph appears insufficient to support recovery of robust, non-trivial mesoscale psychiatric structure under perturbation.
+Taken together, these results are most parsimoniously explained by information insufficiency and structural incompleteness in the graph produced by the present construction pipeline, though the evidence does not fully exclude the alternative that better-calibrated training procedures could recover richer structure from the same graph.
+The graph depends on nosological anchor nodes to maintain connectivity, produces weak global alignment even under favorable training conditions, and resists coherent partitioning by two independent methods.
+Each of these is a graph-level property independent of the training confounds in the stability experiment.
 
 This work therefore reframes the challenge of automated psychiatric nosology: success depends not only on advances in representation learning, but critically on the construction of data sources that contain sufficient, well-structured, and interconnected information to make such discovery possible.
 
@@ -1013,6 +1049,9 @@ This work therefore reframes the challenge of automated psychiatric nosology: su
 1. C. Louizos, M. Welling, and D. P. Kingma, “Learning Sparse Neural Networks through L₀ Regularization,” arXiv preprint arXiv:1712.01312, 2017, presented at ICLR 2018.
 1. W. B. Johnson, J. Lindenstrauss, and G. Schechtman, “Extensions of Lipschitz maps into Banach spaces,” Israel Journal of Mathematics, vol. 54, no. 2, pp. 129–138, May 1986.
 1. Y. Li, Y. Zhang, and C. Liu, “MDGCL: Graph Contrastive Learning Framework with Multiple Graph Diffusion Methods,” Neural Processing Letters, vol. 56, art. no. 213, 2024. doi: 10.1007/s11063-024-11672-3
+1. G. Salha-Galvan, J. F. Lutzeyer, G. Dasoulas, R. Hennequin, and M. Vazirgiannis, “Modularity-aware graph autoencoders for joint community detection and link prediction,” Neural Networks, vol. 153, pp. 474–495, 2022, doi: 10.1016/j.neunet.2022.06.021.
+1. Y. Liu, H. Zhang, X. Gao, L. Guo, Z. Tao, and T. He, “Norm Augmented Graph AutoEncoders for Link Prediction,” in Proc. ICASSP, 2025. arXiv:2502.05868.
+1. A. Subramonian, L. Sagun, and Y. Sun, “Networked inequality: preferential attachment bias in graph neural network link prediction,” in Proceedings of the 41st International Conference on Machine Learning (ICML), Vienna, Austria, 2024, Art. no. 1908, pp. 1–35.
 
 ## Appendix
 ### Code Notes
@@ -1065,7 +1104,7 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
 - Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
 - To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1` and `python3.10 inspect_cluster.py --graph data/ikgraph.filtered.graphml --partition scae_partitions.json --explain --saliency --saliency-top-pair --outdir scae_inspect --cluster <clustere_num>`
-    - `align_partitions.py` heuristically infers HiTOP/RDoC labels from node attributes when explicit maps are not supplied, so every derived metric (global alignment scores, enrichment CSV/JSON, coverage fractions) inherits those heuristics—rerunning the script is the authoritative way to reproduce the values reported in the Results tables.
+    - `align_partitions.py` heuristically infers HiTOP/RDoC labels from node attributes when explicit maps are not supplied, so every derived metric (global alignment scores, enrichment CSV/JSON, coverage fractions) inherits those heuristics - rerunning the script is the authoritative way to reproduce the values reported in the Results tables.
 - Regenerate the "Baseline Psychiatric Label Coverage" section via `python3.10 analysis/baseline_label_coverage.py --graph data/ikgraph.graphml --min-psy-score 0.33 --psy-include-neighbors 0`, which writes the intermediate JSON/CSV plus a Markdown table to `out/baseline_label_coverage.md`.
 
 ### Calibration
@@ -1160,7 +1199,7 @@ Much earlier plateauing reflects the same global step vs epoch number as with th
 </p>
 <p align="center"><em>
 Hinge penalty that keeps the full graph’s assignment entropy above the 5.5-nat (7.93-bit) floor.
-Because the main run trains on a single graph, that graph never quite reaches the target, so the loss hovers at a small non-zero value rather than spiking—documenting the constant gentle push to keep assignments diffuse.
+Because the main run trains on a single graph, that graph never quite reaches the target, so the loss hovers at a small non-zero value rather than spiking-documenting the constant gentle push to keep assignments diffuse.
 There’s only one giant graph so once assignments sharpen on that graph, the single entropy value sits just below the floor and the hinge never fully releases.
 </em></p>
 <p align="center">
@@ -1191,7 +1230,7 @@ Levels off at a slightly higher plateau, signaling that the collapsed solution p
     <img src="plots/neg_logit_mean.png"/>
 </p>
 <p align="center"><em>
-Begins near 0.24 and climbs steadily across training—ending around 0.42, essentially overlapping the positive-logit mean—showing how the decoder gradually tightens its calibration band as the latent clusters stabilize.
+Begins near 0.24 and climbs steadily across training-ending around 0.42, essentially overlapping the positive-logit mean-showing how the decoder gradually tightens its calibration band as the latent clusters stabilize.
 </em></p>
 <p align="center">
     <b>Stability Test Negative Logit Mean</b>
@@ -1264,7 +1303,7 @@ Oscillates between roughly 1113 and 1206 with no intermediate values due to the 
     <img src="plots/pos_logit_mean.png"/>
 </p>
 <p align="center"><em>
-Begins near 0.24 and climbs steadily across training—ending around 0.42, essentially overlapping the positive-logit mean—showing how the decoder gradually tightens its calibration band as the latent clusters stabilize.
+Begins near 0.24 and climbs steadily across training-ending around 0.42, essentially overlapping the positive-logit mean-showing how the decoder gradually tightens its calibration band as the latent clusters stabilize.
 </em></p>
 <p align="center">
     <b>Stability Test Positive Logit Mean</b>
