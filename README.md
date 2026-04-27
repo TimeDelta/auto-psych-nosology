@@ -653,7 +653,7 @@ Gini coefficient: 0.686602
 
 | **Metric** | **HiTOP / RDoC References** | **Target** | **Value (Mean ± SD [90 % CI])** |
 | ---------- | ---------------------------------- | ---------- | ------------------------------- |
-| **Adjusted Rand Index (bootstrap)** | HiTOP = 0.164 / RDoC = 0.022 | ≥ 0.85 of full-graph ARI (**HiTOP** 0.112 ⇒ target ≥0.095; **RDoC** 0.038 ⇒ target ≥0.032 | **HiTOP**: 0.164; **RDoC**: 0.022 |
+| **Adjusted Rand Index (bootstrap)** | HiTOP = 0.164 / RDoC = 0.022 | ≥ 0.85 of full-graph ARI (**HiTOP** 0.112 ⇒ target ≥0.095; **RDoC** 0.038 ⇒ target ≥0.032 | **HiTOP**: 0.164; **RDoC**: 0.022) |
 | **Node-Weighted Coherence 90 % CI width** | 0.1607 ± 1.2e-5 | ≤ 0.15 | 2.3e-5 |
 | **Gate Entropy Stability** | Graph-wide | Lower is better | 0.885 ± <1e-3 bits (node-weighted gate entropy derived from cluster masses 41,690 and 18,096) |
 | **Effective Cluster Count Variance** | Graph-wide | Lower is better | 1.85 ± <1e-3 (computed as 2^H; no across-bootstrap variance observed) |
@@ -834,7 +834,7 @@ While the learned partitions exhibit moderate semantic coherence and statistical
 
 Under the subgraph-bootstrap robustness test, the model converged deterministically to a trivial low-complexity solution: two macro-clusters by mass, with hard argmax assignments dominated by a single realized cluster.
 This outcome is notable because the subgraph regime was introduced to test whether similar structure would remain identifiable when training moved away from a single fixed graph, not simply to manufacture stable results.
-Although the implementation still included some stability-oriented safeguards, the repeated collapse to the same coarse partition suggests that the dominant recoverable signal in the graph itself is low-complexity rather than richly mesoscale.
+Although the implementation still included some stability-oriented safeguards, the collapse happening again to the same coarse partition suggests that the dominant recoverable signal in the graph itself is low-complexity rather than richly mesoscale.
 
 ### Evidence of Structural Insufficiency in the Knowledge Graph
 #### Degenerate Solutions as Optimal Representations
@@ -897,7 +897,7 @@ The subgraph-bootstrap experiments were intended as a perturbation-based robustn
 Because the model was trained across partially overlapping sampled subgraphs rather than only on a single fixed graph, one reasonable expectation was that, if the graph contained robust mesoscale organization, the recovered partitions would remain broadly similar while showing some variability across runs.
 The methods section explicitly motivates this procedure as a way to reduce overfitting to idiosyncratic topology and estimate replication reliability on partially overlapping realizations of the same graph.
 
-Instead, the model converged repeatedly to the same low-complexity solution.
+Instead, the model converged twice to the same low-complexity solution.
 This result is more informative than simple reproducibility.
 It suggests that once the graph is perturbed away from the single fixed training instance, the richer partition does not remain identifiable, whereas the trivial coarse solution does.
 In this context, the observed reproducibility is better interpreted as evidence that the graph is underconstrained and that its most robust signal is a low-complexity one, not as evidence that the model successfully recovered meaningful higher-order structure.
