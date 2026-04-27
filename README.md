@@ -793,8 +793,8 @@ How many pairwise cluster interactions are contributing to reconstruction. Has t
 </p>
 <p align="center"><em>
 Has the exact same shape as the stability test run expected cluster count but with a different magnitude.
-</p>
-</em><p align="center">
+</em></p>
+<p align="center">
     <b>Sparsity Warmup Factor</b>
     <img src="plots/sparsity_warmup_factor.png"/>
 </p>
