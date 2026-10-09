@@ -1,5 +1,4 @@
 # Automated Psychiatric Nosology via Representation-Learning-Based Partitioning of Knowledge Graph
-
 ## Table of Contents
 - [Abstract](#abstract)
 - [Introduction](#introduction)
