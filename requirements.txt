@@ -5,6 +5,7 @@ networkx
 obonet
 orjson
 pandas
+pyarrow
 polars>=1.0
 pre-commit
 pydantic

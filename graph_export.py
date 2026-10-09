@@ -22,8 +22,23 @@ def _clean_str(value: Any) -> str:
     return value.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
 
+def _json_default(value: Any) -> Any:
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+    except ImportError:
+        pass
+    return str(value)
+
+
 def _json_clean(obj: Any) -> str:
-    return _clean_str(json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str))
+    return _clean_str(
+        json.dumps(obj, ensure_ascii=False, sort_keys=True, default=_json_default)
+    )
 
 
 def _coerce_for_graphml(value: Any) -> Any:
@@ -44,10 +59,10 @@ def _coerce_for_graphml(value: Any) -> Any:
         return value
     if isinstance(value, (bytes, bytearray)):
         return _clean_str(value.decode("utf-8", "ignore"))
-    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):
-        return _json_clean(list(value))
     if isinstance(value, dict):
         return _json_clean(value)
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):
+        return _json_clean(list(value))
     if isinstance(value, type):
         return value.__name__
     return _clean_str(str(value))

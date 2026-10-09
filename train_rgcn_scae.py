@@ -38,6 +38,7 @@ from torch_geometric.utils import k_hop_subgraph
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+from relation_schema import resolve_edge_relation
 from self_compressing_auto_encoders import (
     NodeAttributeDeepSetEncoder,
     OnlineTrainer,
@@ -594,20 +595,26 @@ def load_multiplex_graph(
                 embedding_tensor = torch.from_numpy(text_embeddings_np[idx]).clone()
                 attr_dict[_NAME_TEXT_EMBED_ATTR] = embedding_tensor
 
-    relation_index: Dict[str, int] = {}
-    edge_pairs: List[Tuple[int, int]] = []
-    edge_type_ids: List[int] = []
-    edge_weights: List[float] = []
     node_index: Dict[str, int] = {
         node_id: idx for idx, node_id in enumerate(node_ids_ordered)
     }
-
+    relation_names = sorted(
+        {
+            resolve_edge_relation(attributes)
+            for source, target, attributes in edges
+            if source in node_index and target in node_index
+        }
+    )
+    relation_index: Dict[str, int] = {
+        relation_name: index for index, relation_name in enumerate(relation_names)
+    }
+    edge_pairs: List[Tuple[int, int]] = []
+    edge_type_ids: List[int] = []
+    edge_weights: List[float] = []
     for src, dst, attrs in edges:
         if src not in node_index or dst not in node_index:
             continue
-        predicate = attrs.get("predicate", "rel")
-        if predicate not in relation_index:
-            relation_index[predicate] = len(relation_index)
+        predicate = resolve_edge_relation(attrs)
         edge_pairs.append((node_index[src], node_index[dst]))
         edge_type_ids.append(relation_index[predicate])
         weight_value = attrs.get("weight")
