@@ -1,5 +1,10 @@
 # Automated Psychiatric Nosology via Representation-Learning-Based Partitioning of Knowledge Graph
 
+The physiology-graph adapter and relation-handling options are documented in
+[docs/physiology_adapter.md](docs/physiology_adapter.md). It imports a pinned
+`mechanistic-pathway-learning` graph, preserves source identifiers and evidence
+fields and distinguishes recorded signs in the R-GCN's relation vocabulary.
+This integration has not produced a new nosology result.
 ## Table of Contents
 - [Abstract](#abstract)
 - [Introduction](#introduction)
