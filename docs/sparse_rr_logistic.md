@@ -12,7 +12,9 @@ physiology project's signed propagation and complex-handling operators.
 For a perturbation feature matrix X, train-only feature means mu and scales sigma,
 the standardized features are Z = (X - mu) / sigma. The prediction is
 
-$$P(Y_{ps}=1)=\operatorname{sigmoid}(b_s+[ZB]_{ps}).$$
+$$
+P(Y_{ps}=1)=\frac{1}{1+e^{-(b_s+[ZB]_{ps})}}.
+$$
 
 B has one row per named graph feature and one column per symptom. It can be
 decomposed after fitting as B = U Sigma V^T to inspect shared response factors.
