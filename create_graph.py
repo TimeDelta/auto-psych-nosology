@@ -19,6 +19,7 @@ from augment_graph_with_ontologies import (
     GraphAugmenter,
     load_ontology_bundle,
 )
+from graph_quality import summarize_graph_quality
 from nosology_filters import should_drop_nosology_node
 from psychiatry_scoring import (
     PsychiatricRelevanceScorer,
@@ -247,9 +248,9 @@ class ExtractionConfig:
     metadata_truncate: int = 750
     neighbor_hops: int = 1
     include_reverse_edges: bool = False
-    relation_role_constraints: Mapping[
-        str, tuple[Sequence[str], Sequence[str]]
-    ] | None = None
+    relation_role_constraints: (
+        Mapping[str, tuple[Sequence[str], Sequence[str]]] | None
+    ) = None
 
     psychiatric_mondo_ids: Sequence[str] | None = None
     psychiatric_group_labels: Sequence[str] | None = None
@@ -421,9 +422,29 @@ class EntityRelationExtractor:
     def build_subgraph(self) -> tuple[pl.DataFrame, pl.DataFrame]:
         """Return nodes and edges restricted to psychiatric domains."""
 
+        if self.config.neighbor_hops < 1:
+            raise ValueError("neighbor_hops must be at least 1")
         if self._using_ikraph:
-            return self._build_ikraph_subgraph()
-        return self._build_primekg_subgraph()
+            nodes_df, edges_df = self._build_ikraph_subgraph()
+        else:
+            nodes_df, edges_df = self._build_primekg_subgraph()
+        if nodes_df.is_empty() or edges_df.is_empty():
+            return nodes_df.head(0), edges_df.head(0)
+        # Filter edges too: NetworkX otherwise recreates deleted diagnosis nodes.
+        retained_node_ids = nodes_df.select("node_index")
+        edges_df = edges_df.join(
+            retained_node_ids, left_on="source_index", right_on="node_index", how="semi"
+        ).join(
+            retained_node_ids, left_on="target_index", right_on="node_index", how="semi"
+        )
+        connected_node_ids = pl.concat(
+            [
+                edges_df.select(pl.col("source_index").alias("node_index")),
+                edges_df.select(pl.col("target_index").alias("node_index")),
+            ]
+        ).unique()
+        nodes_df = nodes_df.join(connected_node_ids, on="node_index", how="semi")
+        return nodes_df, edges_df
 
     def _build_primekg_subgraph(self) -> tuple[pl.DataFrame, pl.DataFrame]:
         disease_features = self._load_disease_features()
@@ -611,9 +632,11 @@ class EntityRelationExtractor:
                         "node_index": node_index,
                         "node_id": mondo_id or str(node_index),
                         "name": display_name,
-                        "mondo_id": mondo_id
-                        if mondo_id and mondo_id.startswith("MONDO")
-                        else None,
+                        "mondo_id": (
+                            mondo_id
+                            if mondo_id and mondo_id.startswith("MONDO")
+                            else None
+                        ),
                         "mondo_name": display_name,
                         "group_name_bert": node_subtype,
                         "mondo_definition": official,
@@ -664,6 +687,7 @@ class EntityRelationExtractor:
             return nodes_df
         if "psy_score" not in nodes_df.columns:
             return nodes_df
+        nodes_df = nodes_df.with_columns(pl.col("psy_score").alias("psy_score_direct"))
         positive_scores = nodes_df.select("node_index", "psy_score").filter(
             pl.col("psy_score") > 0
         )
@@ -716,20 +740,40 @@ class EntityRelationExtractor:
                 | (pl.col("neighbor_psy_max").fill_null(0.0) >= neighbor_threshold)
             ).alias("is_psychiatric"),
         )
-        nodes_df = nodes_df.drop(
-            [
-                column
-                for column in (
-                    "neighbor_psy_mean",
-                    "neighbor_psy_max",
-                    "neighbor_psy_count",
-                )
-                if column in nodes_df.columns
-            ]
+        nodes_df = nodes_df.rename(
+            {
+                "neighbor_psy_mean": "psy_score_neighbor_mean",
+                "neighbor_psy_max": "psy_score_neighbor_max",
+                "neighbor_psy_count": "psy_neighbor_count",
+            }
         )
         return nodes_df
 
     def _collect_ikraph_edges(
+        self, psych_indices: Iterable[int]
+    ) -> tuple[pl.DataFrame, set[int]]:
+        """Expand seed neighborhoods with streamed passes over source edge files."""
+        visited_nodes = {int(node_index) for node_index in psych_indices}
+        frontier_nodes = set(visited_nodes)
+        edge_tables = []
+        for _ in range(self.config.neighbor_hops):
+            if not frontier_nodes:
+                break
+            incident_edges, touched_nodes = self._collect_ikraph_incident_edges(
+                frontier_nodes
+            )
+            if not incident_edges.is_empty():
+                edge_tables.append(incident_edges)
+            frontier_nodes = touched_nodes - visited_nodes
+            visited_nodes.update(touched_nodes)
+        if not edge_tables:
+            return self._empty_edges(), visited_nodes
+        edges_df = pl.concat(edge_tables, how="diagonal_relaxed").unique(
+            subset=["source_file", "source_record_index"], maintain_order=True
+        )
+        return edges_df, visited_nodes
+
+    def _collect_ikraph_incident_edges(
         self, psych_indices: Iterable[int]
     ) -> tuple[pl.DataFrame, set[int]]:
         psych_set = {int(idx) for idx in psych_indices if idx is not None}
@@ -746,14 +790,21 @@ class EntityRelationExtractor:
         edge_rows: list[dict[str, object]] = []
 
         if self._ikraph_db_path is not None:
-            for entry in iter_json_array(self._ikraph_db_path):
+            for source_record_index, entry in enumerate(
+                iter_json_array(self._ikraph_db_path)
+            ):
                 src = self._safe_int(entry.get("node_one_id"))
                 dst = self._safe_int(entry.get("node_two_id"))
                 if src is None or dst is None:
                     continue
                 if src not in psych_set and dst not in psych_set:
                     continue
-                relation_id = str(entry.get("relationship_type"))
+                record_id = entry.get("id") or entry.get("relID")
+                record_parts = str(record_id or "").split(".")
+                relation_id = str(
+                    entry.get("relationship_type")
+                    or (record_parts[2] if len(record_parts) >= 6 else "unknown")
+                )
                 relation_info = relation_lookup.get(relation_id, {})
                 relation_name = str(relation_info.get("name", relation_id))
                 relation_key = relation_name.lower()
@@ -764,25 +815,39 @@ class EntityRelationExtractor:
                         "relation": relation_key,
                         "display_relation": relation_name,
                         "source_index": src,
-                        "source_id": entry.get("node_one_id") or str(src),
+                        "source_id": str(src),
                         "source_type": entry.get("node_one_type"),
                         "source_name": entry.get("node_one_name"),
-                        "source_dataset": entry.get("source") or "iKraph_DB",
+                        "source_dataset": entry.get("source")
+                        or (record_parts[5] if len(record_parts) >= 6 else "iKraph_DB"),
                         "target_index": dst,
-                        "target_id": entry.get("node_two_id") or str(dst),
+                        "target_id": str(dst),
                         "target_type": entry.get("node_two_type"),
                         "target_name": entry.get("node_two_name"),
-                        "target_dataset": entry.get("source") or "iKraph_DB",
+                        "target_dataset": entry.get("source")
+                        or (record_parts[5] if len(record_parts) >= 6 else "iKraph_DB"),
                         "probability": entry.get("prob"),
                         "score": entry.get("score"),
-                        "edge_source": entry.get("source") or "iKraph_DB",
-                        "direction": entry.get("direction"),
+                        "edge_source": entry.get("source")
+                        or (record_parts[5] if len(record_parts) >= 6 else "iKraph_DB"),
+                        "direction": entry.get("direction")
+                        or (record_parts[4] if len(record_parts) >= 6 else None),
+                        "correlation": entry.get("correlation")
+                        or (record_parts[3] if len(record_parts) >= 6 else None),
+                        "relation_id": relation_id,
+                        "relation_precision": relation_info.get("precision"),
+                        "source_file": self._ikraph_db_path.name,
+                        "source_record_index": source_record_index,
+                        "source_record_id": record_id,
+                        "source_record_json": json.dumps(entry, ensure_ascii=False),
                     }
                 )
                 touched_nodes.update((src, dst))
 
         if self._ikraph_pubmed_path is not None:
-            for entry in iter_json_array(self._ikraph_pubmed_path):
+            for source_record_index, entry in enumerate(
+                iter_json_array(self._ikraph_pubmed_path)
+            ):
                 composite_id = entry.get("id") or ""
                 parts = composite_id.split(".")
                 if len(parts) < 6:
@@ -825,9 +890,9 @@ class EntityRelationExtractor:
                         "target_type": None,
                         "target_name": None,
                         "target_dataset": "iKraph_PubMed",
-                        "probability": max(probability_values)
-                        if probability_values
-                        else None,
+                        "probability": (
+                            max(probability_values) if probability_values else None
+                        ),
                         "score": max(score_values) if score_values else None,
                         "edge_source": "iKraph_PubMed",
                         "direction": parts[4],
@@ -835,13 +900,19 @@ class EntityRelationExtractor:
                         "method": parts[5],
                         "evidence_count": len(stats),
                         "novelty_hits": novelty_hits,
+                        "relation_id": relation_id,
+                        "relation_precision": relation_info.get("precision"),
+                        "source_file": self._ikraph_pubmed_path.name,
+                        "source_record_index": source_record_index,
+                        "source_record_id": composite_id,
+                        "source_record_json": json.dumps(entry, ensure_ascii=False),
                     }
                 )
                 touched_nodes.update((src, dst))
 
         if not edge_rows:
             return self._empty_edges(), touched_nodes
-        edges_df = pl.DataFrame(edge_rows).with_columns(
+        edges_df = pl.from_dicts(edge_rows, infer_schema_length=None).with_columns(
             pl.col("source_index").cast(pl.Int64),
             pl.col("target_index").cast(pl.Int64),
         )
@@ -918,7 +989,9 @@ class EntityRelationExtractor:
     ) -> pl.DataFrame:
         if not lookup or column not in df.columns:
             return df
-        mapped = pl.col(index_column).map_dict(lookup, return_dtype=pl.Utf8)
+        mapped = pl.col(index_column).replace_strict(
+            lookup, default=None, return_dtype=pl.Utf8
+        )
         return df.with_columns(
             pl.when(pl.col(column).is_null() | (pl.col(column) == ""))
             .then(mapped)
@@ -1003,6 +1076,10 @@ class EntityRelationExtractor:
 
         scalar_attrs = (
             "psy_score",
+            "psy_score_direct",
+            "psy_score_neighbor_mean",
+            "psy_score_neighbor_max",
+            "psy_neighbor_count",
             "psy_evidence",
             "ontology_flag",
             "group_flag",
@@ -1045,17 +1122,19 @@ class EntityRelationExtractor:
         for row in edges_df.to_dicts():
             src = str(row["source_index"])
             dst = str(row["target_index"])
+            if src not in graph or dst not in graph:
+                raise ValueError(
+                    f"Edge endpoint missing from retained node table: {src} -> {dst}"
+                )
             attributes = {
-                "relation": row.get("relation", ""),
-                "display_relation": row.get("display_relation", ""),
-                "source_type": row.get("source_type", ""),
-                "target_type": row.get("target_type", ""),
-                "source_name": row.get("source_name", ""),
-                "target_name": row.get("target_name", ""),
+                attribute_name: attribute_value
+                for attribute_name, attribute_value in row.items()
+                if attribute_name not in {"source_index", "target_index"}
+                and attribute_value is not None
             }
             graph.add_edge(src, dst, **attributes)
             if self.config.include_reverse_edges:
-                graph.add_edge(dst, src, **attributes)
+                graph.add_edge(dst, src, **{**attributes, "synthetic_reverse": True})
         return graph
 
     # ------------------------------------------------------------------
@@ -1106,12 +1185,14 @@ class EntityRelationExtractor:
         metadata_struct = pl.struct([pl.col(col) for col in available_text_cols])
         grouped = grouped.with_columns(
             metadata_struct.map_elements(
-                lambda s: json.dumps(
-                    {k: v for k, v in s.items() if v not in (None, "")},
-                    ensure_ascii=False,
-                )
-                if any(v not in (None, "") for v in s.values())
-                else None,
+                lambda s: (
+                    json.dumps(
+                        {k: v for k, v in s.items() if v not in (None, "")},
+                        ensure_ascii=False,
+                    )
+                    if any(v not in (None, "") for v in s.values())
+                    else None
+                ),
                 return_dtype=pl.Utf8,
             ).alias("disease_metadata")
         )
@@ -1159,12 +1240,14 @@ class EntityRelationExtractor:
         metadata_struct = pl.struct([pl.col(col) for col in textual_columns])
         grouped = grouped.with_columns(
             metadata_struct.map_elements(
-                lambda s: json.dumps(
-                    {k: v for k, v in s.items() if v not in (None, "")},
-                    ensure_ascii=False,
-                )
-                if any(v not in (None, "") for v in s.values())
-                else None,
+                lambda s: (
+                    json.dumps(
+                        {k: v for k, v in s.items() if v not in (None, "")},
+                        ensure_ascii=False,
+                    )
+                    if any(v not in (None, "") for v in s.values())
+                    else None
+                ),
                 return_dtype=pl.Utf8,
             ).alias("drug_metadata")
         )
@@ -1216,12 +1299,14 @@ class EntityRelationExtractor:
         )
         grouped = grouped.with_columns(
             metadata_struct.map_elements(
-                lambda s: json.dumps(
-                    {k: v for k, v in s.items() if v not in (None, "")},
-                    ensure_ascii=False,
-                )
-                if any(v not in (None, "") for v in s.values())
-                else None,
+                lambda s: (
+                    json.dumps(
+                        {k: v for k, v in s.items() if v not in (None, "")},
+                        ensure_ascii=False,
+                    )
+                    if any(v not in (None, "") for v in s.values())
+                    else None
+                ),
                 return_dtype=pl.Utf8,
             ).alias("protein_metadata")
         )
@@ -1272,12 +1357,14 @@ class EntityRelationExtractor:
             metadata_struct = pl.struct([pl.col(col) for col in value_cols])
             grouped = grouped.with_columns(
                 metadata_struct.map_elements(
-                    lambda s: json.dumps(
-                        {k: v for k, v in s.items() if v not in (None, "")},
-                        ensure_ascii=False,
-                    )
-                    if any(v not in (None, "") for v in s.values())
-                    else None,
+                    lambda s: (
+                        json.dumps(
+                            {k: v for k, v in s.items() if v not in (None, "")},
+                            ensure_ascii=False,
+                        )
+                        if any(v not in (None, "") for v in s.values())
+                        else None
+                    ),
                     return_dtype=pl.Utf8,
                 ).alias("dna_metadata")
             )
@@ -1287,11 +1374,35 @@ class EntityRelationExtractor:
         return grouped
 
     def _collect_relevant_edges(self, psych_indices: Iterable[int]) -> pl.DataFrame:
+        visited_nodes = {int(node_index) for node_index in psych_indices}
+        frontier_nodes = set(visited_nodes)
+        edge_tables = []
+        for _ in range(self.config.neighbor_hops):
+            if not frontier_nodes:
+                break
+            incident_edges = self._collect_primekg_incident_edges(frontier_nodes)
+            if incident_edges.is_empty():
+                break
+            edge_tables.append(incident_edges)
+            touched_nodes = set(incident_edges["source_index"].to_list()) | set(
+                incident_edges["target_index"].to_list()
+            )
+            frontier_nodes = touched_nodes - visited_nodes
+            visited_nodes.update(touched_nodes)
+        if not edge_tables:
+            return self._empty_edges()
+        return pl.concat(edge_tables, how="diagonal_relaxed").unique(
+            subset=["source_record_index"], maintain_order=True
+        )
+
+    def _collect_primekg_incident_edges(
+        self, psych_indices: Iterable[int]
+    ) -> pl.DataFrame:
         psych_series = pl.Series(list(psych_indices), dtype=pl.Int64)
         edges_lazy = pl.scan_csv(
             self.config.kg_path,
             infer_schema_length=0,
-            dtypes={
+            schema_overrides={
                 "x_id": pl.Utf8,
                 "y_id": pl.Utf8,
                 "x_name": pl.Utf8,
@@ -1303,10 +1414,10 @@ class EntityRelationExtractor:
                 "relation": pl.Utf8,
                 "display_relation": pl.Utf8,
             },
-        )
-        filter_expr = pl.col("x_index").cast(pl.Int64).is_in(psych_series) | pl.col(
-            "y_index"
-        ).cast(pl.Int64).is_in(psych_series)
+        ).with_row_index("source_record_index")
+        filter_expr = pl.col("x_index").cast(pl.Int64).is_in(
+            psych_series.implode()
+        ) | pl.col("y_index").cast(pl.Int64).is_in(psych_series.implode())
         if self.config.allowed_relations:
             filter_expr = filter_expr & pl.col("relation").is_in(
                 sorted(self.config.allowed_relations)
@@ -1317,7 +1428,7 @@ class EntityRelationExtractor:
                 pl.col("x_index").cast(pl.Int64),
                 pl.col("y_index").cast(pl.Int64),
             )
-            .collect(streaming=True)
+            .collect(engine="streaming")
         )
         if collected.is_empty():
             return self._empty_edges()
@@ -1334,6 +1445,10 @@ class EntityRelationExtractor:
                 "y_name": "target_name",
                 "y_source": "target_dataset",
             }
+        )
+        renamed = renamed.with_columns(
+            pl.lit(self.config.kg_path.name).alias("source_file"),
+            pl.lit("PrimeKG").alias("edge_source"),
         )
         return self._enforce_relation_constraints(renamed)
 
@@ -1554,9 +1669,9 @@ class PipelineConfig:
             kg_path=self.kg_path,
             data_dir=self.data_dir,
             ikraph_root=self.ikraph_dir,
-            allowed_relations=set(self.allowed_relations)
-            if self.allowed_relations
-            else None,
+            allowed_relations=(
+                set(self.allowed_relations) if self.allowed_relations else None
+            ),
             psychiatric_patterns=patterns or tuple(),
             metadata_truncate=self.metadata_truncate,
             neighbor_hops=self.neighbor_hops,
@@ -1682,10 +1797,15 @@ class KnowledgeGraphPipeline:
         nodes_df, edges_df = extractor.build_subgraph()
         summary = {"n_nodes": nodes_df.height, "n_edges": edges_df.height}
         if nodes_df.is_empty() or edges_df.is_empty():
-            logger.warning("No subgraph produced; skipping serialization.")
-            return summary
+            logger.warning(
+                "No connected subgraph survived filtering; writing empty artifacts."
+            )
 
         graph = extractor.to_networkx(nodes_df, edges_df)
+        summary = {
+            "n_nodes": graph.number_of_nodes(),
+            "n_edges": graph.number_of_edges(),
+        }
 
         relation_priors = {
             **RELATION_PRIOR_DEFAULT,
@@ -1743,6 +1863,11 @@ class KnowledgeGraphPipeline:
         edges_path = output_prefix.with_suffix(".rels.parquet")
         graph_path = output_prefix.with_suffix(".graphml")
         weighted_path = output_prefix.with_suffix(".weighted.graphml")
+        quality_report = summarize_graph_quality(graph)
+        quality_report["neighbor_hops"] = config.neighbor_hops
+        output_prefix.with_suffix(".quality.json").write_text(
+            json.dumps(quality_report, indent=2, sort_keys=True), encoding="utf-8"
+        )
 
         nodes_df.write_parquet(nodes_path)
         edges_df.write_parquet(edges_path)
@@ -1913,6 +2038,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum characters to retain for long text fields",
     )
     parser.add_argument(
+        "--neighbor-hops",
+        type=int,
+        default=PipelineConfig.neighbor_hops,
+        help="Number of streamed neighborhood-expansion passes around psychiatric seeds (default: 1). Use 2 to include biomedical links beyond diagnosis hubs.",
+    )
+    parser.add_argument(
         "--include-reverse",
         action="store_true",
         help="Also add reverse edges to the directed graph",
@@ -2078,6 +2209,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         allowed_relations=args.allowed_relations,
         psychiatric_patterns=args.psychiatric_patterns,
+        neighbor_hops=args.neighbor_hops,
         include_reverse_edges=args.include_reverse,
         metadata_truncate=args.metadata_truncate,
         ontology_terms=args.ontology_terms,

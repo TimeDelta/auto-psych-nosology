@@ -17,6 +17,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GraphNorm, MessagePassing, RGCNConv, global_mean_pool
 from torch_geometric.utils import degree, negative_sampling, softmax
 
+from partition_stability import PartitionStabilityTracker
 from utility import generate_random_string
 
 
@@ -1859,6 +1860,8 @@ class SelfCompressingRGCNAutoEncoder(nn.Module):
             )
 
         gate_vals = cluster_gate_values.squeeze()
+        if gate_vals.dim() == 0:
+            gate_vals = gate_vals.unsqueeze(0)
         if gate_vals.dim() != 1 or gate_vals.numel() != assignments.size(1):
             raise ValueError(
                 "cluster_gate_values must broadcast to [num_clusters] matching assignments."
@@ -2223,87 +2226,98 @@ class OnlineTrainer:
         self.dataset.clear()
         self._node_sizes.clear()
 
-    def _compute_realized_clusters(
+    def _compute_realized_partition(
         self,
         min_cluster_size: int,
         eval_batch_size: int = 1,
-    ) -> int:
-        """Run a full eval pass to count clusters with assigned nodes post-argmax."""
+    ) -> torch.Tensor:
+        """Evaluate fixed-order labels with the same rules as partition export.
 
+        For ego-net training, repeated nodes remain separate sample occurrences.
+        This diagnostic measures training convergence, not bootstrap stability.
+        """
         if not self.dataset:
-            return 0
-
-        min_cluster = max(1, int(min_cluster_size))
-        was_training = self.model.training
-        device = self.device
+            return torch.empty(0, dtype=torch.long)
 
         eval_loader = DataLoader(
             self.dataset,
             batch_size=max(1, int(eval_batch_size)),
             shuffle=False,
-            pin_memory=device.type == "cuda",
+            pin_memory=self.device.type == "cuda",
         )
-
-        with torch.no_grad():
+        was_training = self.model.training
+        partition_labels: List[torch.Tensor] = []
+        try:
             self.model.eval()
-            gate_eval = self.model.cluster_gate(training=False).detach().to(device)
-            active_mask = gate_eval >= self.model.active_gate_threshold
-            if torch.count_nonzero(active_mask) == 0:
-                active_mask[gate_eval.argmax()] = True
+            with torch.no_grad():
+                gate_values = self.model.cluster_gate(training=False).detach()
+                for batch in eval_loader:
+                    partition_labels.extend(
+                        self._evaluate_batch_partition(
+                            batch, gate_values, max(1, int(min_cluster_size))
+                        )
+                    )
+        finally:
+            self.model.train(was_training)
+        return torch.cat(partition_labels)
 
-            counts = torch.zeros(
-                self.model.num_clusters, device=device, dtype=torch.long
+    def _evaluate_batch_partition(
+        self, batch: Data, gate_values: torch.Tensor, min_cluster_size: int
+    ) -> List[torch.Tensor]:
+        """Apply export masking and size pruning independently to each graph."""
+        batch = batch.to(self.device)
+        positional = None
+        for candidate in (
+            "positional_encodings",
+            "laplacian_positional_encoding",
+            "laplacian_eigvecs",
+        ):
+            if hasattr(batch, candidate):
+                positional = getattr(batch, candidate)
+                break
+
+        node_ids = None
+        for candidate in (
+            "global_node_ids",
+            "node_ids",
+            "original_node_ids",
+            "node_names",
+        ):
+            if hasattr(batch, candidate):
+                node_ids = getattr(batch, candidate)
+                break
+
+        _, assignments, _ = self.model(
+            node_types=batch.node_types,
+            edge_index=batch.edge_index,
+            batch=batch.batch,
+            node_attributes=getattr(batch, "node_attributes", None),
+            node_attr_embedding=getattr(batch, "node_attr_embedding", None),
+            edge_type=getattr(batch, "edge_type", None),
+            negative_sampling_ratio=0.0,
+            positional_encodings=positional,
+            edge_weight=getattr(batch, "edge_weight", None),
+            node_ids=node_ids,
+        )
+        partition_labels = []
+        for graph_index in range(batch.num_graphs):
+            graph_assignments = assignments[
+                batch.ptr[graph_index] : batch.ptr[graph_index + 1]
+            ]
+            partition = self.model.hard_partition(
+                graph_assignments,
+                gate_values,
+                gate_threshold=self.model.active_gate_threshold,
+                min_cluster_size=min_cluster_size,
             )
+            partition_labels.append(partition.node_to_cluster)
+        return partition_labels
 
-            for batch in eval_loader:
-                batch = batch.to(device)
-
-                positional = None
-                for candidate in (
-                    "positional_encodings",
-                    "laplacian_positional_encoding",
-                    "laplacian_eigvecs",
-                ):
-                    if hasattr(batch, candidate):
-                        positional = getattr(batch, candidate)
-                        break
-
-                node_ids = None
-                for candidate in (
-                    "global_node_ids",
-                    "node_ids",
-                    "original_node_ids",
-                    "node_names",
-                ):
-                    if hasattr(batch, candidate):
-                        node_ids = getattr(batch, candidate)
-                        break
-
-                _, assignments, _ = self.model(
-                    node_types=batch.node_types,
-                    edge_index=batch.edge_index,
-                    batch=batch.batch,
-                    node_attributes=getattr(batch, "node_attributes", None),
-                    node_attr_embedding=getattr(batch, "node_attr_embedding", None),
-                    edge_type=getattr(batch, "edge_type", None),
-                    negative_sampling_ratio=0.0,
-                    positional_encodings=positional,
-                    edge_weight=getattr(batch, "edge_weight", None),
-                    node_ids=node_ids,
-                )
-
-                labels = assignments.argmax(dim=1)
-                batch_counts = torch.bincount(labels, minlength=self.model.num_clusters)
-                counts += batch_counts.to(device=device, dtype=torch.long)
-
-        realized_mask = counts >= min_cluster
-        realized_mask &= active_mask.to(device)
-        realized_count = int(realized_mask.sum().item())
-
-        if was_training:
-            self.model.train()
-
-        return realized_count
+    def _compute_realized_clusters(
+        self, min_cluster_size: int, eval_batch_size: int = 1
+    ) -> int:
+        labels = self._compute_realized_partition(min_cluster_size, eval_batch_size)
+        return int(torch.unique(labels).numel())
 
     def train(
         self,
@@ -2322,6 +2336,8 @@ class OnlineTrainer:
         min_epochs: int = 0,
         start_epoch: int = 0,
         realized_cluster_min_size: int = 1,
+        partition_stability_min_ari: float = 0.99,
+        partition_stability_min_clusters: int = 2,
     ) -> List[Dict[str, float]]:
         if max_epochs <= 0:
             raise ValueError("max epochs must be a positive integer.")
@@ -2334,6 +2350,11 @@ class OnlineTrainer:
         self.early_stop_reason = None
         self.last_run_epochs = 0
         initial_history_len = len(self.history)
+        partition_tracker = PartitionStabilityTracker(
+            window=stability_window if stability_metric else 0,
+            minimum_ari=partition_stability_min_ari,
+            minimum_clusters=partition_stability_min_clusters,
+        )
 
         pin_memory = self.device.type == "cuda"
         loader_kwargs = {"pin_memory": pin_memory}
@@ -2492,8 +2513,8 @@ class OnlineTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             averaged_metrics = {k: v / batch_count for k, v in metric_sums.items()}
-            realized_count = self._compute_realized_clusters(realized_cluster_min_size)
-            averaged_metrics["realized_active_clusters"] = float(realized_count)
+            node_labels = self._compute_realized_partition(realized_cluster_min_size)
+            averaged_metrics.update(partition_tracker.update(node_labels.numpy()))
             averaged_metrics["epoch"] = float(epoch)
             averaged_metrics["run_epoch"] = float(epoch - start_epoch)
             self.history.append(averaged_metrics)
@@ -2513,6 +2534,7 @@ class OnlineTrainer:
 
             if (
                 stability_metric
+                and partition_tracker.is_stable
                 and stability_window > 0
                 and epoch >= max(min_epochs, stability_window)
             ):
@@ -2537,7 +2559,11 @@ class OnlineTrainer:
                             ) <= stability_relative_tolerance
                         if within_abs and within_rel:
                             self.early_stop_epoch = epoch
-                            self.early_stop_reason = f"{stability_metric} stable for last {stability_window} epochs"
+                            self.early_stop_reason = (
+                                f"{stability_metric} and partition membership stable "
+                                f"for last {max(2, stability_window)} epochs "
+                                f"(minimum ARI={averaged_metrics['partition_window_min_ari']:.4f})"
+                            )
                             if verbose:
                                 print(
                                     f"[EARLY STOP] {self.early_stop_reason} (span={span:.4f})"

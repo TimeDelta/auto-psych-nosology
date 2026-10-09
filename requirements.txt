@@ -5,10 +5,13 @@ networkx
 obonet
 orjson
 pandas
-polars
+polars>=1.0
 pre-commit
 pydantic
 python-dotenv
+scikit-learn
+scipy
 sentence-transformers
 torch
+torch-geometric
 tqdm

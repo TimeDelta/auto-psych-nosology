@@ -184,8 +184,12 @@ def _filter_graph(graph_path: str, output_path: Optional[str]) -> None:
     ext = path.split(".")[-1].lower()
     if ext == "graphml":
         graph = nx.read_graphml(path)
-    elif ext in {"gexf", "gpickle", "pkl"}:
-        graph = getattr(nx, f"read_{ext}")(path)
+    elif ext == "gexf":
+        graph = nx.read_gexf(path)
+    elif ext in {"gpickle", "pickle", "pkl"}:
+        from graph_io import read_pickled_graph
+
+        graph = read_pickled_graph(path)
     else:
         raise ValueError(
             "Unsupported graph format. Use GraphML, GEXF, or networkx pickles."

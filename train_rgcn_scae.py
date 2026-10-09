@@ -630,9 +630,11 @@ def load_multiplex_graph(
     data = Data(
         node_types=torch.tensor(node_type_ids, dtype=torch.long),
         edge_index=edge_index,
-        edge_type=torch.tensor(edge_type_ids, dtype=torch.long)
-        if edge_type_ids
-        else torch.empty((0,), dtype=torch.long),
+        edge_type=(
+            torch.tensor(edge_type_ids, dtype=torch.long)
+            if edge_type_ids
+            else torch.empty((0,), dtype=torch.long)
+        ),
     )
     if edge_weights:
         data.edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
@@ -729,9 +731,11 @@ def _apply_node_mask(graph: MultiplexGraph, mask: torch.Tensor) -> MultiplexGrap
     new_data = Data(
         node_types=graph.data.node_types[keep_idx],
         edge_index=new_edge_index.contiguous(),
-        edge_type=new_edge_type.contiguous()
-        if new_edge_type.numel()
-        else torch.empty((0,), dtype=torch.long),
+        edge_type=(
+            new_edge_type.contiguous()
+            if new_edge_type.numel()
+            else torch.empty((0,), dtype=torch.long)
+        ),
     )
     if new_edge_weight is not None:
         new_data.edge_weight = new_edge_weight
@@ -1379,6 +1383,8 @@ def train_scae_on_graph(
     mlflow_last_logged_step: Optional[int] = None,
     mlflow_tracker_path: Optional[Path] = None,
     calibration_epochs: int = 0,
+    partition_stability_min_ari: float = 0.99,
+    partition_stability_min_clusters: int = 2,
 ) -> Tuple[
     SelfCompressingRGCNAutoEncoder,
     PartitionResult,
@@ -1423,9 +1429,9 @@ def train_scae_on_graph(
     regularizer_sources = {
         "entropy_weight": "user" if entropy_weight is not None else "auto",
         "dirichlet_weight": "user" if dirichlet_weight is not None else "auto",
-        "embedding_norm_weight": "user"
-        if embedding_norm_weight is not None
-        else "auto",
+        "embedding_norm_weight": (
+            "user" if embedding_norm_weight is not None else "auto"
+        ),
         "kld_weight": "user" if kld_weight is not None else "auto",
         "entropy_eps": "user" if entropy_eps is not None else "auto",
     }
@@ -1856,7 +1862,6 @@ def train_scae_on_graph(
         }
 
     if total_epochs_available > 0:
-        remaining_min_epochs = max(0, int(min_epochs) - int(start_epoch))
         history = trainer.train(
             max_epochs=total_epochs_available,
             batch_size=max(1, int(batch_size)),
@@ -1865,15 +1870,17 @@ def train_scae_on_graph(
             bucket_by_size=node_budget is None,
             node_budget=node_budget,
             on_epoch_end=epoch_callback_for_trainer,
-            stability_metric="realized_active_clusters"
-            if cluster_stability_window > 0
-            else None,
+            stability_metric=(
+                "realized_active_clusters" if cluster_stability_window > 0 else None
+            ),
             stability_window=cluster_stability_window,
             stability_tolerance=cluster_stability_tolerance,
             stability_relative_tolerance=cluster_stability_relative_tolerance,
-            min_epochs=remaining_min_epochs,
+            min_epochs=min_epochs,
             start_epoch=start_epoch,
             realized_cluster_min_size=min_cluster_size,
+            partition_stability_min_ari=partition_stability_min_ari,
+            partition_stability_min_clusters=partition_stability_min_clusters,
         )
     else:
         if verbose:
@@ -1965,9 +1972,9 @@ def train_scae_on_graph(
         "total_epochs": trainer.total_epochs_trained,
         "resume_used": used_resume,
         "start_epoch": start_epoch,
-        "checkpoint_path": str(checkpoint_path)
-        if checkpoint_path is not None
-        else None,
+        "checkpoint_path": (
+            str(checkpoint_path) if checkpoint_path is not None else None
+        ),
         "mlflow_run_id": mlflow_run_id,
         "mlflow_last_logged_step": mlflow_last_logged_step,
         "regularizer_config": {
@@ -1983,6 +1990,13 @@ def train_scae_on_graph(
         "calibration_summary": calibration_summary,
         "effective_learning_rate": effective_learning_rate,
         "gate_threshold": gate_threshold,
+        "early_stop_reason": trainer.early_stop_reason,
+        "partition_stability_config": {
+            "window": cluster_stability_window,
+            "minimum_ari": partition_stability_min_ari,
+            "minimum_clusters": partition_stability_min_clusters,
+            "evaluation_scope": "fixed training samples",
+        },
     }
 
     return model, partition, history, training_summary
@@ -2334,7 +2348,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--cluster-stability-window",
         type=int,
         default=20,
-        help="Number of trailing epochs used to test realized_active_clusters stability (post-argmax) for early stopping (0 disables).",
+        help="Trailing epochs required for cluster-count and hard-membership stability (0 disables early stopping).",
     )
     parser.add_argument(
         "--cluster-stability-tol",
@@ -2347,6 +2361,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Relative tolerance (fraction of the mean) allowed for realized_active_clusters across the window.",
+    )
+    parser.add_argument(
+        "--partition-stability-min-ari",
+        type=float,
+        default=0.99,
+        help="Minimum adjusted Rand index between the latest hard partition and every earlier partition in the stopping window.",
+    )
+    parser.add_argument(
+        "--partition-stability-min-clusters",
+        type=int,
+        default=2,
+        help="Minimum occupied clusters throughout the stopping window (use 1 to permit single-cluster convergence).",
     )
     parser.add_argument(
         "--dirichlet-alpha",
@@ -2539,6 +2565,15 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         parser.error("--min-epochs must be less than or equal to --max-epochs")
     if args.cluster_stability_window < 0:
         parser.error("--cluster-stability-window must be non-negative")
+    if (
+        not math.isfinite(args.partition_stability_min_ari)
+        or not -1.0 <= args.partition_stability_min_ari <= 1.0
+    ):
+        parser.error(
+            "--partition-stability-min-ari must be finite and between -1 and 1"
+        )
+    if args.partition_stability_min_clusters < 1:
+        parser.error("--partition-stability-min-clusters must be at least 1")
     if (
         args.cluster_stability_window > 0
         and args.cluster_stability_window > args.max_epochs
@@ -2771,13 +2806,13 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "device": args.device or "auto",
                     "learning_rate": args.lr,
                     "batch_size": args.batch_size,
-                    "node_budget": args.node_budget
-                    if args.node_budget is not None
-                    else "",
+                    "node_budget": (
+                        args.node_budget if args.node_budget is not None else ""
+                    ),
                     "negative_sampling_ratio": args.negative_sampling,
-                    "max_negatives": args.max_negatives
-                    if args.max_negatives is not None
-                    else "",
+                    "max_negatives": (
+                        args.max_negatives if args.max_negatives is not None else ""
+                    ),
                     "gate_threshold": args.gate_threshold,
                     "min_cluster_size": args.min_cluster_size,
                     "entropy_weight_arg": (
@@ -2787,21 +2822,23 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     ),
                     "mixed_precision": args.mixed_precision,
                     "grad_accum_steps": args.grad_accum,
-                    "max_grad_norm": args.max_grad_norm
-                    if args.max_grad_norm is not None
-                    else "",
+                    "max_grad_norm": (
+                        args.max_grad_norm if args.max_grad_norm is not None else ""
+                    ),
                     "cache_node_attributes": not args.no_attr_cache,
                     "cuda_empty_cache": args.cuda_empty_cache,
                     "gradient_checkpointing": args.gradient_checkpointing,
-                    "pos_edge_chunk": pos_edge_chunk
-                    if pos_edge_chunk is not None
-                    else "",
-                    "neg_edge_chunk": neg_edge_chunk
-                    if neg_edge_chunk is not None
-                    else "",
+                    "pos_edge_chunk": (
+                        pos_edge_chunk if pos_edge_chunk is not None else ""
+                    ),
+                    "neg_edge_chunk": (
+                        neg_edge_chunk if neg_edge_chunk is not None else ""
+                    ),
                     "cluster_stability_window": args.cluster_stability_window,
                     "cluster_stability_tol": args.cluster_stability_tol,
                     "cluster_stability_rel_tol": args.cluster_stability_rel_tol,
+                    "partition_stability_min_ari": args.partition_stability_min_ari,
+                    "partition_stability_min_clusters": args.partition_stability_min_clusters,
                     "dirichlet_weight_arg": (
                         args.dirichlet_weight
                         if args.dirichlet_weight is not None
@@ -2828,14 +2865,18 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                     "effective_num_clusters": effective_num_clusters,
                     "dirichlet_alpha_arg": dirichlet_alpha_param or "auto",
                     "text_encoder_model": text_encoder_model or "none",
-                    "text_encoder_device": args.text_encoder_device
-                    if args.text_encoder_device is not None
-                    else "auto",
+                    "text_encoder_device": (
+                        args.text_encoder_device
+                        if args.text_encoder_device is not None
+                        else "auto"
+                    ),
                     "text_encoder_batch_size": args.text_encoder_batch_size,
                     "text_encoder_normalize": args.text_encoder_normalize,
-                    "text_encoder_projection_dim": text_encoder_projection_dim
-                    if text_encoder_projection_dim is not None
-                    else 0,
+                    "text_encoder_projection_dim": (
+                        text_encoder_projection_dim
+                        if text_encoder_projection_dim is not None
+                        else 0
+                    ),
                     "text_embedding_cache": text_embedding_cache_param_value,
                 }
             )
@@ -2873,6 +2914,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             cluster_stability_window=args.cluster_stability_window,
             cluster_stability_tolerance=args.cluster_stability_tol,
             cluster_stability_relative_tolerance=args.cluster_stability_rel_tol,
+            partition_stability_min_ari=args.partition_stability_min_ari,
+            partition_stability_min_clusters=args.partition_stability_min_clusters,
             lr=args.lr,
             negative_sampling_ratio=args.negative_sampling,
             gate_threshold=args.gate_threshold,

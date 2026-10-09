@@ -28,6 +28,7 @@ Example usage (assuming CSVs with appropriate columns):
 
 The script prints a short summary of added nodes/edges for sanity checking.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,6 +43,8 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import networkx as nx
 
+from graph_io import read_pickled_graph
+
 try:
     import pandas as pd  # type: ignore
 except ImportError:  # pragma: no cover - pandas optional
@@ -54,9 +57,9 @@ except ImportError:  # pragma: no cover - pandas optional
 _graph_readers = {
     ".graphml": nx.read_graphml,
     ".gexf": nx.read_gexf,
-    ".gpickle": nx.read_gpickle,
-    ".pickle": nx.read_gpickle,
-    ".pkl": nx.read_gpickle,
+    ".gpickle": read_pickled_graph,
+    ".pickle": read_pickled_graph,
+    ".pkl": read_pickled_graph,
 }
 
 

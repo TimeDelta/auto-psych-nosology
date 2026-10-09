@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Summarize how much psychiatric signal remains inside a Graph slice."""
+
 from __future__ import annotations
 
 import argparse
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any, List, Tuple
 
 import networkx as nx
+
+from graph_io import read_pickled_graph
 
 GRAPHML_NS = "{http://graphml.graphdrawing.org/xmlns}"
 
@@ -81,7 +84,7 @@ def _load_nodes_edges(
     if ext == ".gexf":
         graph = nx.read_gexf(graph_path)
     elif ext in {".gpickle", ".pkl"}:
-        graph = nx.read_gpickle(graph_path)
+        graph = read_pickled_graph(graph_path)
     else:
         raise ValueError(
             f"Unsupported graph format for {graph_path}. Use GraphML, GEXF, or gpickle."

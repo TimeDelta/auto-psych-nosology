@@ -71,7 +71,9 @@ def load_graph(
         graph = nx.read_gexf(p)
         return _ensure_canonical_labels(graph)
     if ext in {".gpickle", ".pickle", ".pkl"}:
-        graph = nx.read_gpickle(p)
+        from graph_io import read_pickled_graph
+
+        graph = read_pickled_graph(p)
         return _ensure_canonical_labels(graph)
     if ext in {".json"}:
         graph = _read_json_node_link(p)
