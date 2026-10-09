@@ -365,7 +365,11 @@ Assignment entropy, cluster usage, gate samples, reconstruction losses, and time
 The trainer orchestrates the preceding mechanisms while enforcing practical guardrails.
 Mini-batches are constructed by a budget-aware sampler that limits the number of nodes admitted per step, so even pathological subgraphs remain tractable.
 Gradient accumulation, gradient clipping, and optional mixed precision provide additional numerical headroom.
-Stability-aware stopping criteria monitor sliding windows of the principal metrics-usually the number of active clusters-and halt the run once those metrics stay within prescribed absolute and relative bounds.
+The stopping rule requires both a stable occupied-cluster count and stable hard memberships over a trailing window.
+The latest partition must have an adjusted Rand index (ARI) of at least 0.99 with every earlier partition in the window, and every partition must contain at least two occupied clusters by default.
+This comparison ignores cluster label permutations, detects accumulated membership drift and prevents a constant single-cluster solution from triggering the stability stop.
+Diagnostics apply the same inactive-gate masking and minimum-size reassignment as partition export.
+These are checks of convergence on fixed training samples; they do not establish reproducibility across independently fitted or resampled graphs.
 Checkpointing is performed atomically alongside optional MLflow logging, enabling deterministic recovery and rigorous experiment tracking.
 
 Collectively, these interventions ensure that the self-compressing RGCN maintains stable dynamics across the multiplex psychopathology graph while remaining verifiable under standard academic reporting conventions.
@@ -1053,7 +1057,7 @@ This work therefore reframes the challenge of automated psychiatric nosology: su
 
 ## Appendix
 ### Code Notes
-- Install project requirements via `pip3.10 install -r requirements.txt`.
+- Install project requirements via `pip3.10 install -r requirements.txt`; use `pip3.10 install -r requirements-dev.txt` for tests and formatting tools.
 - Download the main data for the knowledge graph from https://zenodo.org/records/14851275/files/iKraph_full.tar.gz?download=1.
 - If you want to include ontology augmentation (not used in final experiment), run
 ```
@@ -1074,6 +1078,11 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
 --ontology-annotation-term-column hpo=term
 ```
 - Run `python3.10 create_graph.py --ikraph-dir iKraph_full --output-prefix ikgraph` to create the graph before psych-relevance filtering.
+- To retain biomedical links beyond diagnosis hubs, add `--neighbor-hops 2`. Each hop makes another streamed pass over the source edge files and follows an undirected neighborhood for selection while preserving the original endpoint order and raw direction attributes in the directed output. The default remains one hop. Repeated discovery of the same source record does not duplicate it; distinct records and relation types remain separate edges. More hops increase runtime and may admit unrelated biology, so compare the graph reports before selecting a setting.
+- Graph construction now filters incident edges whenever a node is removed and removes resulting isolates from both tables and GraphML. Missing endpoints raise an error instead of becoming placeholder nodes. A degenerate build writes empty artifacts and a report so files from a previous run cannot masquerade as new results. This correction can substantially change historical graphs that depended on inadvertently reintroduced diagnosis nodes; the counts and results above require rebuilding to assess the effect.
+- iKraph exports retain available `probability`, `score`, `direction`, `correlation`, `method`, `evidence_count` and `relation_precision` fields, plus `source_file`, zero-based `source_record_index`, available `source_record_id` and the original `source_record_json`. Source records retain their raw evidence tuples without treating record counts as independent study counts. PrimeKG edges retain their source filename and zero-based row index. Synthetic reverse edges are marked explicitly. The weighted undirected projection remains a relevance-based summary and does not preserve direction or validate causal claims; use the multiplex GraphML and edge table for evidence inspection.
+- Each build writes `<output-prefix>.quality.json` with final graph counts, component sizes, node/relation distributions, isolated nodes, self-loops, nosology-screen hits, synthetic reverse counts and evidence-field coverage. This is an integrity audit, not an estimate of extraction accuracy. Clinical evidence strength, species/context applicability, duplicate publications, conflicting findings and indirect diagnosis leakage still require separate evaluation.
+- Nodes retain `psy_score_direct`, `psy_score_neighbor_mean`, `psy_score_neighbor_max` and `psy_neighbor_count` alongside the existing `psy_score`, so inherited neighborhood relevance can be distinguished from a node's own scoring evidence. Seed selection and propagated relevance still depend on diagnoses: removing named diagnosis nodes does not make extraction independent of existing categories.
 - Run `python3.10 psy_filter_snapshot.py data/ikgraph.graphml --graphml-out data/ikgraph.filtered.graphml` to get final graph for training.
 - MLflow is used for optional experiment tracking.
     - Enable tracking with MLflow by adding `--mlflow` (plus optional `--mlflow-tracking-uri`, `--mlflow-experiment`, `--mlflow-run-name`, and repeated `--mlflow-tag KEY=VALUE` flags) to `train_rgcn_scae.py`, which logs parameters, per-epoch metrics, and uploads the generated `partition.json` artifact as well as the trained model .pt file.
@@ -1089,6 +1098,11 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
         - **gate_entropy_bits** and **gate_entropy_loss** track how evenly decoder gates remain active.
         - **num_active_clusters** records the eval-mode gate count that matches the saved `partition.json`; **expected_active_clusters** is the summed HardConcrete $L_0$ expectation.
         - **realized_active_clusters** runs a full argmax pass and counts clusters that actually win nodes after enforcing `--min-cluster-size`.
+        - **partition_ari** compares the latest hard memberships with the previous epoch, ignoring cluster label permutations; it is absent until a comparison is available.
+        - **partition_window_min_ari** is the minimum ARI between the latest partition and all earlier partitions in the trailing stopping window.
+        - **largest_cluster_fraction**, **partition_entropy** (nats) and **effective_num_clusters** (`exp(partition_entropy)`) report hard-partition imbalance.
+        - **partition_collapsed** is 1 when only one hard cluster is occupied. High soft-assignment or gate entropy does not rule out this failure.
+        - **partition_stability_ready** is 1 when the membership and minimum-cluster checks pass; the count tolerance and `--min-epochs` must also pass before training stops.
         - **num_active_clusters_stochastic** retains the raw training-mode gate count when needing to debug EMA smoothing or gating noise.
         - **negative_confidence_weight** shows the entropy-driven reweighting applied when `--neg-entropy-scale > 0`.
         - **num_negatives** counts sampled negative edges that survived the per-graph cap.
@@ -1099,7 +1113,8 @@ to prepare the data used for augmenting the graph to prevent degeneracy after re
     - Pass `--checkpoint-path PATH.pt` to automatically persist model weights, optimizer state, history, and run metadata at the end of training (and optionally every `--checkpoint-every N` epochs).
     - Resume an interrupted or completed run with `--resume-from-checkpoint --checkpoint-path PATH.pt`; add `--reset-optimizer` to reload only the model weights while reinitializing the optimizer.
     - Checkpoints store a signature of the graph/config and cumulative epoch counters so continued training logs consistent metrics (including MLflow) instead of restarting from epoch 1.
-- Training stops early when the requested stability metric (realized_active_clusters by default) stays within tolerance for a sliding window of epochs. Pass `--cluster-stability-window` (number of epochs), `--cluster-stability-tolerance` (absolute span), and optionally `--cluster-stability-relative-tolerance` when calling `train_rgcn_scae.py`; once the chosen `stability_metric` (defaults to `realized_active_clusters`) varies less than both thresholds after `--min-epochs`, the run halts and records the stop epoch/reason in the history log.
+- Training stops early only when the occupied-cluster count stays within `--cluster-stability-tol` and `--cluster-stability-rel-tol`, membership ARI meets `--partition-stability-min-ari` (default 0.99) across the full `--cluster-stability-window`, and every partition has at least `--partition-stability-min-clusters` occupied clusters (default 2). A one-epoch window still requires two observations. Use `--cluster-stability-window 0` to disable early stopping or `--partition-stability-min-clusters 1` to permit single-cluster convergence explicitly. Collapsed runs otherwise continue to the epoch budget and retain collapse diagnostics. The ARI cutoff is a configurable convergence tolerance, not a threshold for biological validity.
+- Resumed runs collect a fresh membership window and respect `--min-epochs` as an absolute cumulative epoch count. Training summaries retain the stopping configuration and reason. For ego-net training, diagnostics evaluate a fixed ordered collection of samples; repeated nodes count as separate sample occurrences and cluster-size pruning applies within each sample. Window storage is proportional to the number of epochs times the number of evaluated node occurrences. These metrics do not replace independent bootstrap refitting or out-of-sample evaluation. Historical results and plots below predate these stopping-rule changes and require new runs to assess their effect.
 - Run `python3.10 -m pytest` from the repository root to execute the regression tests for the extraction pipeline and training utilities.
 - To compute results for a particular partitioning method, run `python3.10 align_partitions.py --graph data/ikgraph.filtered.graphml --partition <partitions_file>.json --prop-depth 1` and `python3.10 inspect_cluster.py --graph data/ikgraph.filtered.graphml --partition scae_partitions.json --explain --saliency --saliency-top-pair --outdir scae_inspect --cluster <clustere_num>`
     - `align_partitions.py` heuristically infers HiTOP/RDoC labels from node attributes when explicit maps are not supplied, so every derived metric (global alignment scores, enrichment CSV/JSON, coverage fractions) inherits those heuristics - rerunning the script is the authoritative way to reproduce the values reported in the Results tables.
