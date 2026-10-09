@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1152pt" height="648pt" viewBox="0 0 1152 648" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.8, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 648
+L 1152 648
+L 1152 0
+L 0 0
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 63.36 250.776
+L 288 250.776
+Q 301.824 250.776 301.824 243
+L 301.824 126.36
+Q 301.824 118.584 288 118.584
+L 63.36 118.584
+Q 49.536 118.584 49.536 126.36
+L 49.536 243
+Q 49.536 250.776 63.36 250.776
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eef4ff; stroke: #2358a5; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 351.36 250.776
+L 570.24 250.776
+Q 584.064 250.776 584.064 243
+L 584.064 126.36
+Q 584.064 118.584 570.24 118.584
+L 351.36 118.584
+Q 337.536 118.584 337.536 126.36
+L 337.536 243
+Q 337.536 250.776 351.36 250.776
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #f3f0fa; stroke: #655092; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 633.6 250.776
+L 852.48 250.776
+Q 866.304 250.776 866.304 243
+L 866.304 126.36
+Q 866.304 118.584 852.48 118.584
+L 633.6 118.584
+Q 619.776 118.584 619.776 126.36
+L 619.776 243
+Q 619.776 250.776 633.6 250.776
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #f3f0fa; stroke: #655092; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 915.84 250.776
+L 1088.64 250.776
+Q 1102.464 250.776 1102.464 243
+L 1102.464 126.36
+Q 1102.464 118.584 1088.64 118.584
+L 915.84 118.584
+Q 902.016 118.584 902.016 126.36
+L 902.016 243
+Q 902.016 250.776 915.84 250.776
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #f3f0fa; stroke: #655092; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 789.12 445.176
+L 1088.64 445.176
+Q 1102.464 445.176 1102.464 437.4
+L 1102.464 314.28
+Q 1102.464 306.504 1088.64 306.504
+L 789.12 306.504
+Q 775.296 306.504 775.296 314.28
+L 775.296 437.4
+Q 775.296 445.176 789.12 445.176
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #f3f0fa; stroke: #655092; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 426.24 445.176
+L 714.24 445.176
+Q 728.064 445.176 728.064 437.4
+L 728.064 314.28
+Q 728.064 306.504 714.24 306.504
+L 426.24 306.504
+Q 412.416 306.504 412.416 314.28
+L 412.416 437.4
+Q 412.416 445.176 426.24 445.176
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #f3f0fa; stroke: #655092; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 63.36 445.176
+L 351.36 445.176
+Q 365.184 445.176 365.184 437.4
+L 365.184 314.28
+Q 365.184 306.504 351.36 306.504
+L 63.36 306.504
+Q 49.536 306.504 49.536 314.28
+L 49.536 437.4
+Q 49.536 445.176 63.36 445.176
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #fff6e7; stroke: #a76615; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 307.280391 184.68
+Q 319.680771 184.68 330.068691 184.68
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 323.268691 181.28
+L 330.068691 184.68
+L 323.268691 188.08
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 589.520391 184.68
+Q 601.920771 184.68 612.308691 184.68
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 605.508691 181.28
+L 612.308691 184.68
+L 605.508691 188.08
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 871.760391 184.68
+Q 884.160771 184.68 894.548691 184.68
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 887.748691 181.28
+L 894.548691 184.68
+L 887.748691 188.08
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 1002.24 254.722852
+Q 1002.24 278.642189 1002.24 300.549064
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 1005.64 293.749064
+L 1002.24 300.549064
+L 998.84 293.749064
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 769.836797 375.84
+Q 751.677011 375.84 735.529687 375.84
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 742.329687 379.24
+L 735.529687 375.84
+L 742.329687 372.44
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 406.956797 375.84
+Q 388.797011 375.84 372.649687 375.84
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 379.449687 379.24
+L 372.649687 375.84
+L 379.449687 372.44
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 63.36 574.776
+L 1088.64 574.776
+Q 1102.464 574.776 1102.464 567
+L 1102.464 495.72
+Q 1102.464 487.944 1088.64 487.944
+L 63.36 487.944
+Q 49.536 487.944 49.536 495.72
+L 49.536 567
+Q 49.536 574.776 63.36 574.776
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #fff0ef; stroke: #a64238; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="line2d_1">
+    <path d="M 51.84 87.48
+L 1094.4 87.48
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #d7e0e7; stroke-linecap: square"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 25px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #152b40" x="51.84" y="38.88" transform="rotate(-0 51.84 38.88)">Current nosology graph autoencoder</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 13px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #4e6275" x="51.84" y="68.04" transform="rotate(-0 51.84 68.04)">This documents the existing implementation. Its reconstruction target is graph edges, not symptom evidence.</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #4e6275" x="1094.4" y="32.4" transform="rotate(-0 1094.4 32.4)">CURRENT CODE / REVISIONS PENDING</text>
+   </g>
+   <g id="text_4">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2358a5" x="72.576" y="158.381812" transform="rotate(-0 72.576 158.381812)">Graph inputs</text>
+   </g>
+   <g id="text_5">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 186.670125)">Node types and attributes</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 203.298844)">Edges and relation categories</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 219.927562)">Sampled ego-net batches</text>
+   </g>
+   <g id="text_6">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #655092" x="360.576" y="158.381812" transform="rotate(-0 360.576 158.381812)">R-GCN encoder</text>
+   </g>
+   <g id="text_7">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 186.670125)">Relation-specific messages</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 203.298844)">Node embeddings</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 219.927562)">Latent regularization</text>
+   </g>
+   <g id="text_8">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #655092" x="642.816" y="158.272437" transform="rotate(-0 642.816 158.272437)">Prototype scores</text>
+   </g>
+   <g id="text_9">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(642.816 186.290203)">Embedding/prototype similarity</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(642.816 202.226059)">Cluster-gate adjustments</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(642.816 218.161914)">Temperature scaling</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #655092" x="925.056" y="158.381812" transform="rotate(-0 925.056 158.381812)">Sinkhorn</text>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(925.056 186.670125)">Balanced soft</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(925.056 203.298844)">node-cluster</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(925.056 219.927562)">assignments</text>
+   </g>
+   <g id="text_12">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #655092" x="798.336" y="346.301812" transform="rotate(-0 798.336 346.301812)">Relational decoder</text>
+   </g>
+   <g id="text_13">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 374.590125)">Cluster interactions per relation</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 391.218844)">Low-rank matrices + gates</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 407.847562)">Absent-edge biases</text>
+   </g>
+   <g id="text_14">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #655092" x="435.456" y="346.301812" transform="rotate(-0 435.456 346.301812)">Edge reconstruction</text>
+   </g>
+   <g id="text_15">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(435.456 374.590125)">Observed-edge BCE</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(435.456 391.218844)">+ sampled-negative BCE</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(435.456 407.847562)">Relation reweighting</text>
+   </g>
+   <g id="text_16">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a76615" x="72.576" y="346.301812" transform="rotate(-0 72.576 346.301812)">Composite training loss</text>
+   </g>
+   <g id="text_17">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 374.590125)">Reconstruction + L0 penalties</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 391.218844)">Entropy/usage controls</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 407.847562)">Embedding/batch consistency</text>
+   </g>
+   <g id="text_18">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a64238" x="72.576" y="527.741813" transform="rotate(-0 72.576 527.741813)">Accepted revisions remain separate</text>
+   </g>
+   <g id="text_19">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #253e52" x="72.576" y="555.270281" transform="rotate(-0 72.576 555.270281)">Repair gates, balancing, decoder range and negative sampling; establish symptom-evidence compression and a common model code.</text>
+   </g>
+   <g id="text_20">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #4e6275" x="51.84" y="609.864375" transform="rotate(-0 51.84 609.864375)">A stable node partition or accurate adjacency reconstruction does not by itself establish a psychiatric nosology.</text>
+   </g>
+   <g id="text_21">
+    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #768899" x="1128.96" y="631.8" transform="rotate(-0 1128.96 631.8)">auto-psych-nosology | architecture documentation</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p3f362ef3f9">
+   <rect x="0" y="0" width="1152" height="648"/>
+  </clipPath>
+ </defs>
+</svg>

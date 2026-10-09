@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1152pt" height="648pt" viewBox="0 0 1152 648" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.8, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 648
+L 1152 648
+L 1152 0
+L 0 0
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 63.36 263.736
+L 288 263.736
+Q 301.824 263.736 301.824 255.96
+L 301.824 139.32
+Q 301.824 131.544 288 131.544
+L 63.36 131.544
+Q 49.536 131.544 49.536 139.32
+L 49.536 255.96
+Q 49.536 263.736 63.36 263.736
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eef4ff; stroke: #2358a5; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 351.36 263.736
+L 570.24 263.736
+Q 584.064 263.736 584.064 255.96
+L 584.064 139.32
+Q 584.064 131.544 570.24 131.544
+L 351.36 131.544
+Q 337.536 131.544 337.536 139.32
+L 337.536 255.96
+Q 337.536 263.736 351.36 263.736
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 633.6 263.736
+L 852.48 263.736
+Q 866.304 263.736 866.304 255.96
+L 866.304 139.32
+Q 866.304 131.544 852.48 131.544
+L 633.6 131.544
+Q 619.776 131.544 619.776 139.32
+L 619.776 255.96
+Q 619.776 263.736 633.6 263.736
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 915.84 263.736
+L 1088.64 263.736
+Q 1102.464 263.736 1102.464 255.96
+L 1102.464 139.32
+Q 1102.464 131.544 1088.64 131.544
+L 915.84 131.544
+Q 902.016 131.544 902.016 139.32
+L 902.016 255.96
+Q 902.016 263.736 915.84 263.736
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 307.280391 197.64
+Q 319.680771 197.64 330.068691 197.64
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 323.268691 194.24
+L 330.068691 197.64
+L 323.268691 201.04
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 589.520391 197.64
+Q 601.920771 197.64 612.308691 197.64
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 605.508691 194.24
+L 612.308691 197.64
+L 605.508691 201.04
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 871.760391 197.64
+Q 884.160771 197.64 894.548691 197.64
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 887.748691 194.24
+L 894.548691 197.64
+L 887.748691 201.04
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 63.36 503.496
+L 288 503.496
+Q 301.824 503.496 301.824 495.72
+L 301.824 346.68
+Q 301.824 338.904 288 338.904
+L 63.36 338.904
+Q 49.536 338.904 49.536 346.68
+L 49.536 495.72
+Q 49.536 503.496 63.36 503.496
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eef4ff; stroke: #2358a5; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 351.36 503.496
+L 696.96 503.496
+Q 710.784 503.496 710.784 495.72
+L 710.784 346.68
+Q 710.784 338.904 696.96 338.904
+L 351.36 338.904
+Q 337.536 338.904 337.536 346.68
+L 337.536 495.72
+Q 337.536 503.496 351.36 503.496
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #fff6e7; stroke: #a76615; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 777.6 503.496
+L 1088.64 503.496
+Q 1102.464 503.496 1102.464 495.72
+L 1102.464 346.68
+Q 1102.464 338.904 1088.64 338.904
+L 777.6 338.904
+Q 763.776 338.904 763.776 346.68
+L 763.776 495.72
+Q 763.776 503.496 777.6 503.496
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 307.280391 421.2
+Q 319.680771 421.2 330.068691 421.2
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 323.268691 417.8
+L 330.068691 421.2
+L 323.268691 424.6
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 526.030752 336.258468
+Q 619.197719 301.320856 710.480359 267.089865
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #a76615; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 702.919501 266.293986
+L 710.480359 267.089865
+L 705.30714 272.661024
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #a76615; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #a76615; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 977.241006 266.071009
+Q 800.640046 301.319991 626.01262 336.175062
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #a76615; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 633.346587 338.17829
+L 626.01262 336.175062
+L 632.015583 331.509825
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #a76615; stroke-dasharray: 6.66,2.88; stroke-dashoffset: 0; stroke: #a76615; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 796.656094 266.595798
+Q 863.998916 301.319441 929.553056 335.120795
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 925.067378 328.982498
+L 929.553056 335.120795
+L 921.951012 335.026359
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_1">
+    <path d="M 51.84 87.48
+L 1094.4 87.48
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #d7e0e7; stroke-linecap: square"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 25px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #152b40" x="51.84" y="38.88" transform="rotate(-0 51.84 38.88)">Sparse reduced-rank logistic baseline</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 13px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #4e6275" x="51.84" y="68.04" transform="rotate(-0 51.84 68.04)">Shared response factors from physiology-derived perturbation features; no learned perturbation-ID embeddings.</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #4e6275" x="1094.4" y="32.4" transform="rotate(-0 1094.4 32.4)">IMPLEMENTED IN THIS CHANGE</text>
+   </g>
+   <g id="text_4">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2358a5" x="72.576" y="171.341813" transform="rotate(-0 72.576 171.341813)">Frozen features X</text>
+   </g>
+   <g id="text_5">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 199.630125)">Upstream physiology operator</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 216.258844)">Perturbation + graph context</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 232.887562)">Named node/state channels</text>
+   </g>
+   <g id="text_6">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="360.576" y="171.341813" transform="rotate(-0 360.576 171.341813)">Normalization Z</text>
+   </g>
+   <g id="text_7">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 199.630125)">Means/scales from training</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 216.258844)">rows with included evidence</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 232.887562)">Dense or CSR matrix</text>
+   </g>
+   <g id="text_8">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="642.816" y="171.341813" transform="rotate(-0 642.816 171.341813)">Shared coefficients B</text>
+   </g>
+   <g id="text_9">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(642.816 199.630125)">logits = Z B + intercepts</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(642.816 216.258844)">One column per symptom</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(642.816 232.887562)">Sparse rows, reduced rank</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="925.056" y="171.341813" transform="rotate(-0 925.056 171.341813)">Sigmoid</text>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(925.056 199.630125)">Per-symptom</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(925.056 216.258844)">probabilities</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(925.056 232.887562)">for new perturbations</text>
+   </g>
+   <g id="text_12">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2358a5" x="72.576" y="378.701813" transform="rotate(-0 72.576 378.701813)">Evidence Y, M, w</text>
+   </g>
+   <g id="text_13">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 406.990125)">Binary symptom targets Y</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 423.618844)">Explicit inclusion mask M</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 440.247563)">Nonnegative weights w</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 456.876281)">Predefined leakage groups</text>
+   </g>
+   <g id="text_14">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a76615" x="360.576" y="378.701813" transform="rotate(-0 360.576 378.701813)">Fitting objective</text>
+   </g>
+   <g id="text_15">
+    <text style="font-size: 13px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 407.749969)">Masked binary log loss</text>
+    <text style="font-size: 13px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 425.764414)">+ row-group penalty</text>
+    <text style="font-size: 13px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 443.778859)">+ nuclear-norm penalty</text>
+    <text style="font-size: 13px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(360.576 461.793305)">+ optional ridge penalty</text>
+   </g>
+   <g id="text_16">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="786.816" y="378.701813" transform="rotate(-0 786.816 378.701813)">Factor interpretation</text>
+   </g>
+   <g id="text_17">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(786.816 406.610203)">Post-fit SVD: B = U diag(s) V^T</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(786.816 422.546059)">U: feature-factor loadings</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(786.816 438.481914)">V: symptom-factor loadings</text>
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(786.816 454.41777)">No unique biological mechanism implied</text>
+   </g>
+   <g id="text_18">
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #a76615" transform="translate(468.29625 296.602188)">proximal gradient</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; fill: #a76615" transform="translate(462.347812 307.8)">+ joint Dykstra prox</text>
+   </g>
+   <g id="text_19">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #4e6275" transform="translate(51.84 593.691563)">Solid arrows: prediction/data flow. Dashed arrows: fitting feedback.</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #4e6275" transform="translate(51.84 609.864375)">Missing targets are not automatic negatives; test labels do not select the model.</text>
+   </g>
+   <g id="text_20">
+    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #768899" x="1128.96" y="631.8" transform="rotate(-0 1128.96 631.8)">auto-psych-nosology | architecture documentation</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p3f362ef3f9">
+   <rect x="0" y="0" width="1152" height="648"/>
+  </clipPath>
+ </defs>
+</svg>

@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1152pt" height="648pt" viewBox="0 0 1152 648" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.8, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 648
+L 1152 648
+L 1152 0
+L 0 0
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 63.36 205.416
+L 380.16 205.416
+Q 393.984 205.416 393.984 197.64
+L 393.984 119.88
+Q 393.984 112.104 380.16 112.104
+L 63.36 112.104
+Q 49.536 112.104 49.536 119.88
+L 49.536 197.64
+Q 49.536 205.416 63.36 205.416
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eef4ff; stroke: #2358a5; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 466.56 205.416
+L 771.84 205.416
+Q 785.664 205.416 785.664 197.64
+L 785.664 119.88
+Q 785.664 112.104 771.84 112.104
+L 466.56 112.104
+Q 452.736 112.104 452.736 119.88
+L 452.736 197.64
+Q 452.736 205.416 466.56 205.416
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eef4ff; stroke: #2358a5; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 63.36 373.896
+L 362.88 373.896
+Q 376.704 373.896 376.704 366.12
+L 376.704 255.96
+Q 376.704 248.184 362.88 248.184
+L 63.36 248.184
+Q 49.536 248.184 49.536 255.96
+L 49.536 366.12
+Q 49.536 373.896 63.36 373.896
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 432 373.896
+L 708.48 373.896
+Q 722.304 373.896 722.304 366.12
+L 722.304 255.96
+Q 722.304 248.184 708.48 248.184
+L 432 248.184
+Q 418.176 248.184 418.176 255.96
+L 418.176 366.12
+Q 418.176 373.896 432 373.896
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 789.12 373.896
+L 1088.64 373.896
+Q 1102.464 373.896 1102.464 366.12
+L 1102.464 255.96
+Q 1102.464 248.184 1088.64 248.184
+L 789.12 248.184
+Q 775.296 248.184 775.296 255.96
+L 775.296 366.12
+Q 775.296 373.896 789.12 373.896
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 789.12 535.896
+L 1088.64 535.896
+Q 1102.464 535.896 1102.464 528.12
+L 1102.464 424.44
+Q 1102.464 416.664 1088.64 416.664
+L 789.12 416.664
+Q 775.296 416.664 775.296 424.44
+L 775.296 528.12
+Q 775.296 535.896 789.12 535.896
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 432 535.896
+L 708.48 535.896
+Q 722.304 535.896 722.304 528.12
+L 722.304 424.44
+Q 722.304 416.664 708.48 416.664
+L 432 416.664
+Q 418.176 416.664 418.176 424.44
+L 418.176 528.12
+Q 418.176 535.896 432 535.896
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 63.36 535.896
+L 362.88 535.896
+Q 376.704 535.896 376.704 528.12
+L 376.704 424.44
+Q 376.704 416.664 362.88 416.664
+L 63.36 416.664
+Q 49.536 416.664 49.536 424.44
+L 49.536 528.12
+Q 49.536 535.896 63.36 535.896
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #eff9f6; stroke: #137761; stroke-width: 1.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 213.12 209.358105
+Q 213.12 226.797317 213.12 242.224067
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 216.52 235.424067
+L 213.12 242.224067
+L 209.72 235.424067
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 620.101055 207.616882
+Q 472.322543 226.79967 326.539748 245.723398
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 333.720846 248.219762
+L 326.539748 245.723398
+L 332.845498 241.476338
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 382.163906 311.04
+Q 397.442459 311.04 410.70855 311.04
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 403.90855 307.64
+L 410.70855 311.04
+L 403.90855 314.44
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 727.759688 311.04
+Q 748.800342 311.04 767.828535 311.04
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 761.028535 307.64
+L 767.828535 311.04
+L 761.028535 314.44
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 944.64 377.838105
+Q 944.64 395.277317 944.64 410.704067
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 948.04 403.904067
+L 944.64 410.704067
+L 941.24 403.904067
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 769.840312 476.28
+Q 748.799658 476.28 729.771465 476.28
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 736.571465 479.68
+L 729.771465 476.28
+L 736.571465 472.88
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_16">
+    <path d="M 412.716094 476.28
+Q 397.437541 476.28 384.17145 476.28
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 390.97145 479.68
+L 384.17145 476.28
+L 390.97145 472.88
+z
+" clip-path="url(#p3f362ef3f9)" style="fill: #536c81; stroke: #536c81; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_1">
+    <path d="M 51.84 87.48
+L 1094.4 87.48
+" clip-path="url(#p3f362ef3f9)" style="fill: none; stroke: #d7e0e7; stroke-linecap: square"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 25px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #152b40" x="51.84" y="38.88" transform="rotate(-0 51.84 38.88)">Mechanistic pathway module architecture</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 13px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #4e6275" x="51.84" y="68.04" transform="rotate(-0 51.84 68.04)">Implemented in mechanistic-pathway-learning; the graph adapter does not port this model into the nosology trainer.</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #4e6275" x="1094.4" y="32.4" transform="rotate(-0 1094.4 32.4)">UPSTREAM MODEL / COMPARATIVE CANDIDATE</text>
+   </g>
+   <g id="text_4">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2358a5" x="72.576" y="151.901813" transform="rotate(-0 72.576 151.901813)">Physiology graph + context</text>
+   </g>
+   <g id="text_5">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #253e52" x="72.576" y="179.810203" transform="rotate(-0 72.576 179.810203)">Relations, signs, compartments and context</text>
+   </g>
+   <g id="text_6">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2358a5" x="475.776" y="151.901813" transform="rotate(-0 475.776 151.901813)">Localized perturbation</text>
+   </g>
+   <g id="text_7">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #253e52" x="475.776" y="180.190125" transform="rotate(-0 475.776 180.190125)">Target nodes, direction and magnitude</text>
+   </g>
+   <g id="text_8">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="72.576" y="287.981813" transform="rotate(-0 72.576 287.981813)">Physiology encoder</text>
+   </g>
+   <g id="text_9">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 316.270125)">Relational message passing</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 332.898844)">or signed linear response</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 349.527562)">Upstream biological operators</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="441.216" y="287.981813" transform="rotate(-0 441.216 287.981813)">Node-state field</text>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(441.216 316.270125)">Perturbation response by node</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(441.216 332.898844)">Keep location and state channels</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(441.216 349.527562)">Absolute or difference reading</text>
+   </g>
+   <g id="text_12">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="798.336" y="287.981813" transform="rotate(-0 798.336 287.981813)">Sparse module pooling</text>
+   </g>
+   <g id="text_13">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 316.270125)">Learn support over graph nodes</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 332.898844)">Supports may overlap</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 349.527562)">Weighted sum or mean</text>
+   </g>
+   <g id="text_14">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="798.336" y="456.461813" transform="rotate(-0 798.336 456.461813)">Module activations</text>
+   </g>
+   <g id="text_15">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 484.750125)">Readout + sigmoid per module</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 501.378844)">One activation profile</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(798.336 518.007563)">for each perturbation</text>
+   </g>
+   <g id="text_16">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="441.216" y="456.461813" transform="rotate(-0 441.216 456.461813)">Noisy-OR head</text>
+   </g>
+   <g id="text_17">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(441.216 484.750125)">Module-symptom links</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(441.216 501.378844)">+ symptom-specific leak</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(441.216 518.007563)">Combine multiple contributions</text>
+   </g>
+   <g id="text_18">
+    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #137761" x="72.576" y="456.461813" transform="rotate(-0 72.576 456.461813)">Symptom probabilities</text>
+   </g>
+   <g id="text_19">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 484.750125)">Evidence-based fitting</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 501.378844)">Support/link penalties</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #253e52" transform="translate(72.576 518.007563)">Separate held-out evaluation</text>
+   </g>
+   <g id="text_20">
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #4e6275" transform="translate(51.84 593.691563)">Several modules can contribute to one symptom; one module can contribute to several symptoms.</text>
+    <text style="font-size: 12px; font-family: 'DejaVu Sans'; fill: #4e6275" transform="translate(51.84 609.864375)">Learned supports and predictions require validation before being interpreted as causal pathways.</text>
+   </g>
+   <g id="text_21">
+    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #768899" x="1128.96" y="631.8" transform="rotate(-0 1128.96 631.8)">auto-psych-nosology | architecture documentation</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p3f362ef3f9">
+   <rect x="0" y="0" width="1152" height="648"/>
+  </clipPath>
+ </defs>
+</svg>

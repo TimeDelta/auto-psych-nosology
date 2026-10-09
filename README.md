@@ -536,6 +536,12 @@ The final partitioning is derived from running the full knowledge graph through 
 This procedure reframes training as an information-theoretic compression task applied repeatedly to partially overlapping realizations of the same knowledge manifold, allowing estimation of replication reliability and consensus structure while reducing overfitting to any single instantiation.
 
 #### Comparison
+
+The sparse reduced-rank logistic baseline, frozen feature/evidence input contract
+and explanatory architecture figures are documented in
+[docs/sparse_rr_logistic.md](docs/sparse_rr_logistic.md). Its validation uses
+synthetic correctness fixtures; fitting the final research graph remains pending.
+
 Together, SBM offers a likelihood-grounded categorical perspective, while RGCN-SCAE furnishes a continuous latent manifold amenable to downstream regression or spectrum analysis.
 The two approaches are treated as triangulating evidence: concordant structure across them increases confidence in emergent transdiagnostic clusters, whereas divergences highlight fronts for qualitative review.
 
